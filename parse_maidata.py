@@ -2,9 +2,12 @@ import re
 
 def parse_note_time(file_path:str,level:int)->list:
     pattern = f'&inote_{level}=(.*?)E'
+    pattern_level=f'&lv_{level}=(.*?)'
 
     with open(file_path, "r",encoding="utf-8") as f:
         text = f.read()
+    matches = re.findall(pattern_level, text)
+    print(f'level {level}: {matches[0]}')
     matches = re.findall(pattern, text,re.DOTALL)
     # print(matches[0])
     track = matches[0]
@@ -23,6 +26,8 @@ def parse_note_time(file_path:str,level:int)->list:
 
     for count, line in enumerate(track.splitlines(), start=1):
         # print(f"第{count},{line}")
+        if line=='':
+            continue
         matches = re.match(pattern, line)
         beat = int(matches.group(1))
         note = matches.group(2)
