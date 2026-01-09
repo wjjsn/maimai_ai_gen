@@ -63,12 +63,58 @@ def get_level(file_path:str,level:int)->float:
         print(f"未找到歌曲: {title}")
         return 0
 
+def format_maidata(text:str):
+    # 1. 预处理：删除 &inote_x= 后面的换行，确保前缀与内容接通
+    text = re.sub(r'(&inote_\d+=)\n+', r'\1', text)
+    
+    lines = text.splitlines()
+    temp_result = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # 规则 A：'E' 和 '&' 开头的行先入列
+        if line == 'E' or line.startswith('&'):
+            temp_result.append(line)
+            continue
+            
+        # 规则 B：处理包含大括号的行
+        if '{' in line:
+            # 拆分大括号前的内容（如 (200)）和大括号后的内容
+            parts = re.split(r'(?=\{)', line, maxsplit=1)
+            prefix, bracket_part = parts[0], parts[1]
+            
+            if prefix:
+                # 如果有前缀，必须合并到上一行
+                if temp_result:
+                    temp_result[-1] += prefix
+                else:
+                    temp_result.append(prefix)
+            
+            # 关键判断：如果上一行是 & 开头的行，且还没有大括号，则合并
+            if temp_result and temp_result[-1].startswith('&') and '{' not in temp_result[-1]:
+                temp_result[-1] += bracket_part
+            else:
+                # 否则，大括号必须换行（保证一行最多一个大括号）
+                temp_result.append(bracket_part)
+        else:
+            # 规则 C：纯杂质（逗号、括号等），合并到上一行
+            if temp_result:
+                temp_result[-1] += line
+            else:
+                temp_result.append(line)
+
+    return "\n".join(temp_result)
+
 def parse_note_time(file_path:str,level:int)->list:
     pattern = f'&inote_{level}=(.*?)E'
     pattern_level=f'&lv_{level}=(.*)'
 
     with open(file_path, "r",encoding="utf-8") as f:
         text = f.read()
+    text=format_maidata(text)
     matches = re.findall(pattern_level, text)
     print(f'level {level}: {matches[0]}')
     matches = re.findall(pattern, text,re.DOTALL)
