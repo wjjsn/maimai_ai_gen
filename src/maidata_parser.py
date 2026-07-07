@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 
+import torch
+
 
 # ── Note ──────────────────────────────────────────────────────────────────
 
@@ -727,6 +729,170 @@ class compiler:
 
         return self.chart
 
+    # ── eval ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _update_extremes(extremes: dict[str, dict[str, int]], key: str, value: int) -> None:
+        slot = extremes.get(key)
+        if slot is None:
+            extremes[key] = {"min": value, "max": value}
+            return
+        if value < slot["min"]:
+            slot["min"] = value
+        if value > slot["max"]:
+            slot["max"] = value
+
+    def _eval_collect_note(self, note: Note, extremes: dict[str, dict[str, int]]) -> None:
+        t = note.type
+        if t == NoteType.SLIDE:
+            for seg in note.data:
+                self._update_extremes(extremes, "wait_duration", seg.wait_duration)
+                self._update_extremes(extremes, "trace_duration", seg.trace_duration)
+        elif t == NoteType.HOLD:
+            self._update_extremes(extremes, "holdTime", note.data.holdTime)
+        elif t == NoteType.TOUCH_HOLD:
+            if note.data.holdTime is not None:
+                self._update_extremes(extremes, "holdTime", note.data.holdTime)
+
+    def eval(self, text: str) -> dict[str, dict[str, int]]:
+        chart = self.parse(text)
+        extremes: dict[str, dict[str, int]] = {}
+        for level in chart.all_levels:
+            if level is None:
+                continue
+            prev_idx: int | None = None
+            for frame in level.frames:
+                for note in frame.notes:
+                    self._eval_collect_note(note, extremes)
+                if prev_idx is not None:
+                    self._update_extremes(extremes, "frame_gap", frame.frame_idx - prev_idx)
+                prev_idx = frame.frame_idx
+        return extremes
+
+    # ── tensor export ─────────────────────────────────────────────────────
+
+    # Slot layout (13 columns):
+    #   0  Δt            (int)  relative time in frames
+    #   1  NoteType      (int)  NoteType enum value
+    #   2  Lane          (int)  TapType enum value for TAP/HOLD/SLIDE start
+    #   3  TouchType     (int)  TouchType enum value; 0 if not touch
+    #   4  holdTime      (int)  HOLD / TOUCH_HOLD duration in frames; 0 otherwise
+    #   5  SlideShape    (int)  SlideShape enum value; 0 if not slide
+    #   6  wait_duration (int)  slide segment wait in frames; 0 otherwise
+    #   7  trace_duration (int) slide segment trace in frames; 0 otherwise
+    #   8  start_lane    (int)  TapType enum value; 0 if not slide
+    #   9  end_lane      (int)  TapType enum value; 0 if not slide
+    #   10 middle_lane   (int)  TapType enum value; 0 if not GrandV
+    #   11 slide_features (int) packed bools:
+    #         bit0 isClockwise-cw   (1<<0)
+    #         bit1 isClockwise-ccw  (1<<1)
+    #         bit2 isForceStar      (1<<2)
+    #         bit3 isFakeRotate     (1<<3)
+    #         bit4 isSlideBreak     (1<<4)
+    #         bit5 isSlideNoHead    (1<<5)
+    #   12 modifiers     (int)  packed bools:
+    #         bit0 isBreak   (1<<0)
+    #         bit1 isEx      (1<<1)
+    _SLOT_DIMS = 13
+
+    @staticmethod
+    def _pack_slide_features(seg) -> int:
+        v = 0
+        if seg.isClockwise is True:
+            v |= 1 << 0
+        elif seg.isClockwise is False:
+            v |= 1 << 1
+        if seg.isForceStar:
+            v |= 1 << 2
+        if seg.isFakeRotate:
+            v |= 1 << 3
+        if seg.isSlideBreak:
+            v |= 1 << 4
+        if seg.isSlideNoHead:
+            v |= 1 << 5
+        return v
+
+    @staticmethod
+    def _pack_modifiers(note) -> int:
+        v = 0
+        if note.isBreak:
+            v |= 1 << 0
+        if note.isEx:
+            v |= 1 << 1
+        return v
+
+    def _note_to_slots(self, note, delta_t: int) -> list[list[int]]:
+        """Convert a Note into one or more slot rows. Slides expand per segment."""
+        n_type = note.type.value
+        modifiers = self._pack_modifiers(note)
+
+        if note.type == NoteType.TAP:
+            return [[delta_t, n_type, note.data.value, 0, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+
+        if note.type == NoteType.HOLD:
+            return [[
+                delta_t, n_type,
+                note.data.lane.value,
+                0, note.data.holdTime,
+                0, 0, 0, 0, 0, 0, 0, modifiers,
+            ]]
+
+        if note.type == NoteType.TOUCH:
+            return [[delta_t, n_type, 0, note.data.Touch_area.value, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+
+        if note.type == NoteType.TOUCH_HOLD:
+            ht = note.data.holdTime if note.data.holdTime is not None else 0
+            return [[
+                delta_t, n_type,
+                0, note.data.Touch_area.value,
+                ht, 0, 0, 0, 0, 0, 0, 0, modifiers,
+            ]]
+
+        if note.type == NoteType.SLIDE:
+            rows: list[list[int]] = []
+            for seg in note.data:
+                rows.append([
+                    delta_t, n_type,
+                    seg.start_lane.value,
+                    0, 0,
+                    seg.shape.value,
+                    seg.wait_duration, seg.trace_duration,
+                    seg.start_lane.value, seg.end_lane.value,
+                    seg.middle_lane.value if seg.middle_lane is not None else 0,
+                    self._pack_slide_features(seg),
+                    modifiers,
+                ])
+            return rows
+
+        return []
+
+    def to_tensor(self, level_idx: int = 4) -> torch.Tensor:
+        """
+        Export a single level to a [N, 13] int64 tensor. See _SLOT_DIMS for layout.
+
+        level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
+        Returns an empty [0, 13] tensor if the level is missing or has no notes.
+        Δt is computed per-frame: 0 for the first note in each frame, and
+        `frame.frame_idx - prev_frame.frame_idx` for subsequent frames.
+        """
+        if not (0 <= level_idx < len(self.chart.all_levels)):
+            raise ValueError(f"level_idx {level_idx} out of range")
+        level = self.chart.all_levels[level_idx]
+        if level is None:
+            return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
+
+        rows: list[list[int]] = []
+        prev_idx: int | None = None
+        for frame in level.frames:
+            delta = 0 if prev_idx is None else frame.frame_idx - prev_idx
+            for note in frame.notes:
+                rows.extend(self._note_to_slots(note, delta))
+            prev_idx = frame.frame_idx
+
+        if not rows:
+            return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
+        return torch.tensor(rows, dtype=torch.int64)
+
     # ── note-to-text reconstruction ───────────────────────────────────────
 
     # TapType value -> lane number string
@@ -947,6 +1113,7 @@ def main():
     charts_dir = Path(__file__).resolve().parent.parent / "charts"
     tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
     found = errors = 0
+    overall: dict[str, dict[str, int]] = {}
     for chart_dir, _dirs, files in charts_dir.walk():
         if "maidata.txt" not in files:
             continue
@@ -955,17 +1122,27 @@ def main():
         try:
             text = (chart_dir / "maidata.txt").read_text(encoding="utf-8")
             parser = compiler(hop_length=512, sample_rate=44100)
-            parser.parse(text)
+            extremes = parser.eval(text)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(parser.generate(), encoding="utf-8")
             found += 1
-            print(f"[{found}] {rel} -> {out_path}")
+            for key, slot in extremes.items():
+                cur = overall.get(key)
+                if cur is None:
+                    overall[key] = dict(slot)
+                else:
+                    if slot["min"] < cur["min"]:
+                        cur["min"] = slot["min"]
+                    if slot["max"] > cur["max"]:
+                        cur["max"] = slot["max"]
+            print(f"[{found}] {rel} -> {out_path}  eval={extremes}")
         except Exception as e:
             import traceback
             errors += 1
             print(f"[ERR] {rel}: {e}")
             traceback.print_exc()
     print(f"\nDone: {found} parsed, {errors} errors")
+    print(f"Overall extremes per field: {overall}")
 
 
 if __name__ == "__main__":
