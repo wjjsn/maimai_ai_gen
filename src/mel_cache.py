@@ -27,11 +27,13 @@ def process_one(chart_dir: Path, rel_path: str) -> Path:
     if out.exists():
         return out
     waveform, sr = torchaudio.load(str(chart_dir / "track.mp3"))
+    if waveform.shape[0] > 1:
+         waveform = torch.mean(waveform, dim=0, keepdim=True)
     if sr != 22050:
         waveform = torchaudio.functional.resample(waveform, sr, 22050)
     mel = transform(waveform)
-    log_mel = torch.log(mel + 1e-6).numpy()
-    print(f"    ┌形状: {log_mel.shape}")
+    log_mel = torch.log(mel + 1e-6).squeeze(0).T.numpy()
+    print(f"    ┌形状: {log_mel.shape}=(n_mels`梅尔频带数`, T`时间`)")
     np.save(out, log_mel)
     return out
 
