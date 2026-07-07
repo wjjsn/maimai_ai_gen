@@ -31,12 +31,13 @@ def process_one(chart_dir: Path, rel_path: str) -> Path:
         waveform = torchaudio.functional.resample(waveform, sr, 22050)
     mel = transform(waveform)
     log_mel = torch.log(mel + 1e-6).numpy()
+    print(f"    ┌形状: {log_mel.shape}")
     np.save(out, log_mel)
     return out
 
 
 def main():
-    CACHE_DIR.mkdir(exist_ok=True)
+    CACHE_DIR.mkdir(exist_ok=True, parents=True)
     found = 0
     skipped = 0
     for chart_dir, _dirs, files in CHARTS_DIR.walk():
