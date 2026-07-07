@@ -1,13 +1,3 @@
-"""解析 maidata.txt 谱面部分，写回 ./tmp/{原路径}。
-
-数据结构:
-  Note    — 一个音符，含 dt (与前一个音符的时间差，ms)
-  Chart   — 一首歌的一个难度谱面 + 难度等级
-  MaidataFile — 一首歌的 metadata + 各难度 Chart
-
-序列化时从 dt 重建 BPM/逗号，格式可能与原文不同，但时间和内容一致。
-"""
-
 import re
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -15,6 +5,7 @@ from pathlib import Path
 
 
 # ── Note ──────────────────────────────────────────────────────────────────
+
 
 class NoteType(Enum):
     TAP = auto()
@@ -24,663 +15,304 @@ class NoteType(Enum):
     TOUCH_HOLD = auto()
 
 
+class TouchType(Enum):
+    A1 = auto()
+    A2 = auto()
+    A3 = auto()
+    A4 = auto()
+    A5 = auto()
+    A6 = auto()
+    A7 = auto()
+    A8 = auto()
+    B1 = auto()
+    B2 = auto()
+    B3 = auto()
+    B4 = auto()
+    B5 = auto()
+    B6 = auto()
+    B7 = auto()
+    B8 = auto()
+    C = auto()
+    D1 = auto()
+    D2 = auto()
+    D3 = auto()
+    D4 = auto()
+    D5 = auto()
+    D6 = auto()
+    D7 = auto()
+    D8 = auto()
+    E1 = auto()
+    E2 = auto()
+    E3 = auto()
+    E4 = auto()
+    E5 = auto()
+    E6 = auto()
+    E7 = auto()
+    E8 = auto()
+
+
+class TapType(Enum):
+    LANE1 = auto()
+    LANE2 = auto()
+    LANE3 = auto()
+    LANE4 = auto()
+    LANE5 = auto()
+    LANE6 = auto()
+    LANE7 = auto()
+    LANE8 = auto()
+
+
+class SlideShape(Enum):
+    Line = auto()  # -
+    Circle = auto()  # > < ^
+    V = auto()  # v
+    GrandV = auto()  # V (L型折线)
+    P = auto()  # p (单弯)
+    Q = auto()  # q (单弯镜像)
+    PP = auto()  # pp (大弯)
+    QQ = auto()  # qq (大弯镜像)
+    S = auto()  # s (闪电)
+    Z = auto()  # z (闪电镜像)
+    Wifi = auto()  # w (扇形/WiFi)
+
+    def __eq__(self, other):
+        return self is other
+
+    def __hash__(self):
+        return id(self)
+
+
+@dataclass
+class SlideSegment:
+    shape: SlideShape
+    start_lane: TapType
+    end_lane: TapType
+    wait_duration: int  # 等待时间帧数，默认一拍
+    trace_duration: int  # 持续时间帧数
+
+    isClockwise: bool | None = None  # > 顺时针 / < 逆时针 / ^ 自动判断选最短，不需要这个字段
+    middle_lane: TapType | None = None  # GrandV的拐点。1V35  →  起点=1, 拐点=3, 终点=5
+
+    isForceStar: bool = False  # 强制星星头
+    isFakeRotate: bool = False  # 假旋转 ($$)
+    isSlideBreak: bool = False  # Slide 本体 Break。b 在 ] 后 = 整条 Slide 变 Break
+    isSlideNoHead: bool = False  # Slide 无头 (! 或 ? 或 *)
+
+
+@dataclass
+class Touch_data:
+    Touch_area: TouchType
+    isFirework: bool = False  # 烟花
+    holdTime: int | None = None  # 持续时间帧数，TouchHold 才有
+
+
+@dataclass
+class Hold_data:
+    lane: TapType
+    holdTime: int  # 持续时间帧数
+
+
 @dataclass
 class Note:
-    """一个音符。dt 是与前一个 Note 的时间差 (ms)。"""
+    """一个音符。"""
     type: NoteType
-    dt: float                              # Δt from previous note, ms
-    lane: int | str | None = None          # 按钮 1-8 / 触摸区 "B1"/"C"
+    data: TapType | Hold_data | Touch_data | list[SlideSegment]
+    isBreak: bool = False
+    isEx: bool = False
 
-    # 时值 [num:den]，秒数时 den=None
-    duration_num: int | float | None = None
-    duration_den: int | None = None
 
-    # SLIDE
-    slide_shapes: list[str] | None = None
-    slide_end: int | None = None
-    slide_wait: str | None = None
-    slide_duration_num: int | float | None = None
-    slide_duration_den: int | None = None
+@dataclass
+class Frame:
+    """一个时间帧，包含该时间点的所有音符。"""
+    frame_idx: int
+    notes: tuple[Note, ...] = ()
+    note_tokens: tuple[str, ...] = ()
 
-    # 标记
-    break_: bool = False
-    ex: bool = False
-    star: str | None = None
-    firework: bool = False
-    hidden_star: str | None = None
-    pseudo_each: bool = False
+
+@dataclass
+class Level:
+    """一个难度等级，包含该难度的所有时间帧。"""
+    level_name: str
+    level_query: float | None
+    frames: list[Frame] = field(default_factory=list)
 
 
 @dataclass
 class Chart:
     """一首歌的+不同难度（0.0~15.0）谱面。"""
+    all_levels: list[Level | None] = field(default_factory=list)
+    title: str = "default"
+    artist: str = "default"
+    designer: str = "default"
 
-    east: list[tuple[Note, ...]] | None = None
-    easy_difficulty_level: str | None = None
-    basic: list[tuple[Note, ...]] | None = None
-    basic_difficulty_level: str | None = None
-    advanced: list[tuple[Note, ...]] | None = None
-    advanced_difficulty_level: str | None = None
-    expert: list[tuple[Note, ...]] | None = None
-    expert_difficulty_level: str | None = None
-    master: list[tuple[Note, ...]] | None = None
-    master_difficulty_level: str | None = None
-    remaster: list[tuple[Note, ...]] | None = None
-    remaster_difficulty_level: str | None = None
+    # EASY/BASIC/ADVANCED/EXPERT/MASTER/Re:MASTER/ORIGINAL
+    # lv_1/lv_2 / lv_3   /  lv_4/  lv_5/     lv_6/  lv_7
 
+# 更改架构，解析器和生成器使用compile类的不同方法，均基于compile类内部的Chart对象
+# 生成器使用12000BPM，通过填充','来确保解析后的数据序列化后仍然能与原始数据在时间上对齐
+# $$Time\ per\ frame = \frac{hop\_length}{sample\_rate}$$
 
-# ── 解析器 ────────────────────────────────────────────────────────────────
+class compiler:
+    def __init__(self, hop_length, sample_rate):
+        self.chart = Chart(all_levels=[])
+        self.time_pre_frame = hop_length / sample_rate
+        self.current_time = 0.0  # seconds
 
-_RE_META = re.compile(r"^&(\w+)=(.*)$")
-_RE_CHART_HEADER = re.compile(r"^&(inote_\w+)=(.*)$")
+    def _parse_note(self, token: str) -> Note | None:
+        cleaned = re.sub(r"\([^)]*\)", "", token)
+        cleaned = re.sub(r"\{[^}]*\}", "", cleaned).strip()
+        if not cleaned or cleaned == "E":
+            return None
+        return Note(type=NoteType.TAP, data=TapType.LANE1)
 
-_DIFF_KEY_MAP = {
-    "2": ("basic", "basic_difficulty_level"),
-    "3": ("advanced", "advanced_difficulty_level"),
-    "4": ("expert", "expert_difficulty_level"),
-    "5": ("master", "master_difficulty_level"),
-    "1": ("east", "easy_difficulty_level"),
-    "0": ("remaster", "remaster_difficulty_level"),
-}
+    def _parse_current_time_per_comma(self, note: str, current_bpm: float, current_length_divider: float, current_per_comma_length: float) -> tuple[float, float, float]:
+        bpm_match = re.search(r"\(([^)]*)\)", note)
+        length_match = re.search(r"\{([^}]*)\}", note)
 
+        next_bpm = current_bpm
+        next_divider = current_length_divider
+        next_per_comma = current_per_comma_length
 
-class Parser:
-    """解析 simai 谱面文本，返回 Note 列表 (只有 dt，无 TIMING)。"""
+        if bpm_match:
+            next_bpm = float(bpm_match.group(1))
 
-    __slots__ = ("text", "pos", "len", "bpm", "ms_per_div", "elapsed_ms", "prev_note_abs")
-
-    def __init__(self, text: str):
-        self.text = text
-        self.pos = 0
-        self.len = len(text)
-        self.bpm = 0.0
-        self.ms_per_div = 0.0
-        self.elapsed_ms = 0.0
-        self.prev_note_abs = 0.0
-
-    def parse(self) -> list[Note]:
-        notes: list[Note] = []
-        while self.pos < self.len:
-            self._skip_ws()
-            if self.pos >= self.len:
-                break
-            c = self.text[self.pos]
-            if c == ",":
-                self.elapsed_ms += self.ms_per_div
-                self.pos += 1
-            elif c == "(":
-                self.bpm = self._parse_bpm()
-                self._update_ms_per_div()
-            elif c == "{":
-                self._apply_time_div(self._parse_braced())
+        if length_match:
+            raw_value = length_match.group(1).strip()
+            if raw_value.startswith("#"):
+                next_divider = 0.0
+                next_per_comma = float(raw_value[1:])
             else:
-                self._parse_note_group(notes)
-        return notes
+                next_divider = float(raw_value)
+                if next_bpm > 0:
+                    next_per_comma = 240.0 / next_bpm / next_divider
 
-    def _skip_ws(self):
-        while self.pos < self.len and self.text[self.pos] in " \t\n\r":
-            self.pos += 1
+        if bpm_match or length_match:
+            return next_bpm, next_divider, next_per_comma
 
-    def _update_ms_per_div(self):
-        if self.bpm > 0:
-            self.ms_per_div = 240_000.0 / self.bpm
+        if next_bpm > 0 and next_divider > 0:
+            next_per_comma = 240.0 / next_bpm / next_divider
 
-    def _apply_time_div(self, div_str: str):
-        if div_str.startswith("#"):
-            self.ms_per_div = float(div_str[1:]) * 1000
-        elif self.bpm > 0:
-            self.ms_per_div = 240_000.0 / self.bpm / float(div_str)
+        return next_bpm, next_divider, next_per_comma
 
-    def _parse_bpm(self) -> float:
-        self.pos += 1
-        start = self.pos
-        while self.pos < self.len and self.text[self.pos] != ")":
-            self.pos += 1
-        bpm = float(self.text[start:self.pos])
-        if self.pos < self.len:
-            self.pos += 1
-        return bpm
+    def parse(self, text: str):
+        self.chart = Chart(all_levels=[None] * 7)
 
-    def _parse_braced(self) -> str:
-        self.pos += 1
-        start = self.pos
-        while self.pos < self.len and self.text[self.pos] != "}":
-            self.pos += 1
-        s = self.text[start:self.pos]
-        if self.pos < self.len:
-            self.pos += 1
-        return s
+        title_match = re.search(r"&title=([^\n]+)", text)
+        if title_match:
+            self.chart.title = title_match.group(1).strip()
 
-    # ── 音符解析 ──────────────────────────────────────────────────────
+        artist_match = re.search(r"&artist=([^\n]+)", text)
+        if artist_match:
+            self.chart.artist = artist_match.group(1).strip()
 
-    def _parse_note_group(self, notes: list[Note]):
-        """解析逗号前的所有音符。"""
-        token_buf: list[str] = []
-        while self.pos < self.len:
-            c = self.text[self.pos]
-            if c in ",(){}":
-                break
-            token_buf.append(c)
-            self.pos += 1
-
-        token = "".join(token_buf).strip()
-        if not token:
-            return
-
-        pe_groups = token.split("`")
-        for group in pe_groups:
-            group = group.strip()
-            if not group:
+        for level in range(0, 7):
+            level_match = re.search(rf"&inote_{level}=([\s\S]*?)(?=&lv_{level}=|&inote_{level + 1}=|$)", text)
+            if not level_match:
                 continue
-            is_pe = len(pe_groups) > 1
-            if is_pe:
-                self.elapsed_ms += 1
 
-            for part in group.split("/"):
-                part = part.strip()
-                if not part:
+            level_content = level_match.group(1)
+            chart_content = level_content.split(",")
+            chart_content_strip = [item.strip() for item in chart_content]
+
+            current_bpm = 0.0
+            current_length_divider = 0.0
+            current_per_comma_length = 1.0
+            self.current_time = 0.0
+            frames_by_idx: dict[int, list[Note]] = {}
+            frame_tokens_by_idx: dict[int, list[str]] = {}
+
+            for raw_note in chart_content_strip:
+                if not raw_note:
+                    self.current_time += current_per_comma_length
                     continue
-                for note in self._parse_token(part):
-                    note.pseudo_each = is_pe
-                    note.dt = self.elapsed_ms - self.prev_note_abs
-                    self.prev_note_abs = self.elapsed_ms
-                    notes.append(note)
-
-    def _parse_token(self, token: str) -> list[Note]:
-        if not token:
-            return []
-        c = token[0]
-        if c in "ABCDEabcde":
-            return [self._parse_touch(token)]
-        if c.isdigit() and len(token) > 1 and all(ch.isdigit() for ch in token):
-            return [self._make_tap(int(ch)) for ch in token]
-        return [self._parse_single_note(token)]
-
-    def _make_tap(self, lane: int) -> Note:
-        return Note(type=NoteType.TAP, dt=0.0, lane=lane)
-
-    def _parse_single_note(self, token: str) -> Note:
-        if token[0] in "ABCDEabcde":
-            return self._parse_touch(token)
-        return self._parse_button(token)
-
-    # ── 按钮音符 ──────────────────────────────────────────────────────
-
-    def _parse_button(self, token: str) -> Note:
-        pos = 0
-        tlen = len(token)
-        lane, pos = self._parse_lane(token, pos)
-
-        star = hidden = None
-        while pos < tlen and token[pos] in "$@?!":
-            if token[pos] in "$@":
-                star = token[pos]
-            else:
-                hidden = token[pos]
-            pos += 1
-
-        if pos < tlen and token[pos] in "hH":
-            return self._parse_hold(token, pos, lane, star)
-        if pos < tlen and self._is_slide_char(token[pos]):
-            return self._parse_slide(token, pos, lane, star, hidden)
-
-        break_, ex = self._parse_bx(token, pos)
-        return Note(
-            type=NoteType.TAP, dt=0.0, lane=lane,
-            break_=break_, ex=ex, star=star, hidden_star=hidden,
-        )
-
-    def _parse_lane(self, token: str, pos: int) -> tuple[int, int]:
-        start = pos
-        while pos < len(token) and token[pos].isdigit():
-            pos += 1
-        if start == pos:
-            raise ValueError(f"Expected digit at pos {pos} in '{token}'")
-        return int(token[start:pos]), pos
-
-    @staticmethod
-    def _is_slide_char(c: str) -> bool:
-        return c in "-<>^vpqszVw"
-
-    def _parse_bx(self, token: str, pos: int) -> tuple[bool, bool]:
-        break_ = ex = False
-        while pos < len(token) and token[pos] in "bBxX":
-            if token[pos] in "bB":
-                break_ = True
-            else:
-                ex = True
-            pos += 1
-        return break_, ex
-
-    # ── HOLD ──────────────────────────────────────────────────────────
-
-    def _parse_hold(self, token: str, pos: int, lane: int, star: str | None) -> Note:
-        pos += 1
-        break_, ex = self._parse_bx(token, pos)
-        while pos < len(token) and token[pos] in "bBxX":
-            pos += 1
-        num = den = None
-        if pos < len(token) and token[pos] == "[":
-            num, den, pos = self._parse_duration(token, pos)
-        return Note(
-            type=NoteType.HOLD, dt=0.0, lane=lane,
-            duration_num=num, duration_den=den,
-            break_=break_, ex=ex, star=star,
-        )
-
-    # ── SLIDE ─────────────────────────────────────────────────────────
-
-    def _parse_slide(self, token: str, pos: int, start_lane: int,
-                     star: str | None, hidden: str | None) -> Note:
-        shapes: list[str] = []
-        wait = dur_num = dur_den = end_lane = None
-        tlen = len(token)
-
-        shape, pos = self._parse_slide_shape(token, pos)
-        shapes.append(shape)
-        end_lane, pos = self._parse_slide_end(token, pos)
-        dur_num, dur_den, wait, pos = self._parse_slide_duration(token, pos)
-
-        while pos < tlen and self._is_slide_char(token[pos]):
-            shape, pos = self._parse_slide_shape(token, pos)
-            shapes.append(shape)
-            end_lane, pos = self._parse_slide_end(token, pos)
-            d_n, d_d, w, pos = self._parse_slide_duration(token, pos)
-            if d_n is not None:
-                dur_num, dur_den, wait = d_n, d_d, w
-
-        break_ = pos < tlen and token[pos] in "bB"
-        return Note(
-            type=NoteType.SLIDE, dt=0.0, lane=start_lane,
-            slide_shapes=shapes, slide_end=end_lane,
-            slide_wait=wait,
-            slide_duration_num=dur_num, slide_duration_den=dur_den,
-            break_=break_, star=star, hidden_star=hidden,
-        )
-
-    def _parse_slide_shape(self, token: str, pos: int) -> tuple[str, int]:
-        if pos + 1 < len(token) and token[pos:pos+2] in ("pp", "qq"):
-            return token[pos:pos+2], pos + 2
-        return token[pos], pos + 1
-
-    def _parse_slide_end(self, token: str, pos: int) -> tuple[int | None, int]:
-        if pos < len(token) and token[pos].isdigit():
-            return self._parse_lane(token, pos)
-        return None, pos
-
-    def _parse_slide_duration(self, token: str, pos: int
-                              ) -> tuple[int | float | None, int | None, str | None, int]:
-        tlen = len(token)
-        if pos >= tlen or token[pos] != "[":
-            return None, None, None, pos
-        pos += 1
-        start = pos
-        while pos < tlen and token[pos] != "]":
-            pos += 1
-        inner = token[start:pos]
-        if pos < tlen:
-            pos += 1
-
-        wait = num = den = None
-        hashes = [i for i, c in enumerate(inner) if c == "#"]
-
-        if len(hashes) == 0:
-            num, den = self._parse_ratio(inner)
-        elif len(hashes) == 1:
-            h = hashes[0]
-            if h == 0:
-                rest = inner[1:]
-                if ":" in rest:
-                    num, den = self._parse_ratio(rest)
-                elif rest:
-                    num = self._to_number(rest)
-            elif inner.endswith("#"):
-                wait = inner[:h]
-            else:
-                wait = inner[:h]
-                rest = inner[h+1:]
-                if ":" in rest:
-                    num, den = self._parse_ratio(rest)
-                elif rest:
-                    num = self._to_number(rest)
-        elif len(hashes) == 2:
-            h2 = hashes[1]
-            wait = inner[:hashes[0]]
-            rest = inner[h2+1:]
-            if ":" in rest:
-                num, den = self._parse_ratio(rest)
-            elif rest:
-                num = self._to_number(rest)
-
-        return num, den, wait, pos
-
-    # ── TOUCH ─────────────────────────────────────────────────────────
-
-    def _parse_touch(self, token: str) -> Note:
-        pos = 0
-        tlen = len(token)
-        group = token[pos].upper()
-        pos += 1
-
-        num = None
-        if pos < tlen and token[pos].isdigit():
-            start = pos
-            while pos < tlen and token[pos].isdigit():
-                pos += 1
-            num = int(token[start:pos])
-        lane = group if num is None else f"{group}{num}"
-
-        is_hold = firework = False
-
-        if pos < tlen and token[pos] == "f":
-            firework = True
-            pos += 1
-        if pos < tlen and token[pos] in "hH":
-            is_hold = True
-            pos += 1
-            if pos < tlen and token[pos] == "f":
-                firework = True
-                pos += 1
-        elif pos < tlen and token[pos] == "f":
-            firework = True
-            pos += 1
-
-        break_, ex = self._parse_bx(token, pos)
-        while pos < tlen and token[pos] in "bBxX":
-            pos += 1
-
-        num_val = den_val = None
-        if is_hold:
-            if pos < tlen and token[pos] == "[":
-                num_val, den_val, pos = self._parse_duration(token, pos)
-            else:
-                num_val, den_val = 1280, 1
-
-        ntype = NoteType.TOUCH_HOLD if is_hold else NoteType.TOUCH
-        return Note(
-            type=ntype, dt=0.0, lane=lane,
-            duration_num=num_val, duration_den=den_val,
-            break_=break_, ex=ex, firework=firework,
-        )
-
-    # ── duration ──────────────────────────────────────────────────────
-
-    def _parse_duration(self, token: str, pos: int
-                        ) -> tuple[int | float | None, int | None, int]:
-        tlen = len(token)
-        if token[pos] != "[":
-            return None, None, pos
-        pos += 1
-        start = pos
-        while pos < tlen and token[pos] != "]":
-            pos += 1
-        inner = token[start:pos]
-        if pos < tlen:
-            pos += 1
-        if ":" in inner:
-            return (*self._parse_ratio(inner), pos)
-        return (self._to_number(inner) if inner else None, None, pos)
-
-    @staticmethod
-    def _parse_ratio(s: str) -> tuple[int | None, int | None]:
-        if ":" in s:
-            parts = s.split(":", 1)
-            return (int(parts[0]) if parts[0] else None,
-                    int(parts[1]) if parts[1] else None)
-        return (int(s) if s else None, None)
-
-    @staticmethod
-    def _to_number(s: str) -> int | float:
-        return float(s) if "." in s else int(s)
-
-
-# ── 序列化 ────────────────────────────────────────────────────────────────
-
-def serialize_note(note: Note) -> str:
-    if note.type in (NoteType.TOUCH, NoteType.TOUCH_HOLD):
-        return _ser_touch(note)
-    if note.type == NoteType.SLIDE:
-        return _ser_slide(note)
-    if note.type == NoteType.HOLD:
-        return _ser_hold(note)
-    return _ser_tap(note)
-
-
-def _ser_tap(n: Note) -> str:
-    s = str(n.lane)
-    if n.star in ("$", "@"):
-        s += n.star
-    if n.hidden_star:
-        s += n.hidden_star
-    if n.break_:
-        s += "b"
-    if n.ex:
-        s += "x"
-    return s
-
-
-def _ser_hold(n: Note) -> str:
-    s = str(n.lane)
-    if n.star:
-        s += n.star
-    s += "h"
-    if n.break_:
-        s += "b"
-    if n.ex:
-        s += "x"
-    s += _fmt_dur(n.duration_num, n.duration_den)
-    return s
-
-
-def _ser_slide(n: Note) -> str:
-    s = str(n.lane)
-    if n.star in ("$", "@"):
-        s += n.star
-    if n.hidden_star:
-        s += n.hidden_star
-    for shape in (n.slide_shapes or []):
-        s += shape
-    if n.slide_end is not None:
-        s += str(n.slide_end)
-    if n.slide_wait is not None or n.slide_duration_num is not None:
-        s += "["
-        if n.slide_wait is not None:
-            s += n.slide_wait + "#"
-        if n.slide_duration_num is not None:
-            if n.slide_wait is not None:
-                s += "#"
-            if n.slide_duration_den is not None:
-                s += f"{n.slide_duration_num}:{n.slide_duration_den}"
-            else:
-                s += str(n.slide_duration_num)
-        s += "]"
-    if n.break_:
-        s += "b"
-    return s
-
-
-def _ser_touch(n: Note) -> str:
-    s = str(n.lane)
-    if n.firework:
-        s += "f"
-    if n.type == NoteType.TOUCH_HOLD:
-        s += "h"
-    if n.break_:
-        s += "b"
-    if n.ex:
-        s += "x"
-    if n.type == NoteType.TOUCH_HOLD:
-        s += _fmt_dur(n.duration_num, n.duration_den)
-    return s
-
-
-def _fmt_dur(num: int | float | None, den: int | None) -> str:
-    if num is None:
-        return ""
-    if den is not None:
-        return f"[{int(num)}:{int(den)}]"
-    return f"[{num}]" if isinstance(num, float) else f"[{int(num)}]"
-
-
-def _group_notes(notes: list[Note]) -> list[list[Note]]:
-    """按 pseudo_each 标记分组。"""
-    groups: list[list[Note]] = []
-    current: list[Note] = []
-    for note in notes:
-        if note.pseudo_each and current and not current[0].pseudo_each:
-            groups.append(current)
-            current = []
-        elif not note.pseudo_each and current and current[0].pseudo_each:
-            groups.append(current)
-            current = []
-        current.append(note)
-    if current:
-        groups.append(current)
-    return groups
-
-
-def serialize_notes(notes: list[tuple[Note, ...]]) -> str:
-    """从 tuple 列表重建 simai 文本。用固定 BPM=240 + {#seconds} 将音符放到正确时间点。"""
-    if not notes:
-        return ""
-
-    parts: list[str] = ["(240)"]
-    cursor_ms = 0.0
-    abs_ms = 0.0
-
-    for gi_idx, group in enumerate(notes):
-        # 每组第一个 note 的 dt 是与前一组的时间差
-        abs_ms += group[0].dt
-
-        # 推进光标到 abs_ms
-        gap = abs_ms - cursor_ms
-        if gap > 0:
-            full = int(gap / 1000.0)
-            frac = gap - full * 1000.0
-            if full > 0:
-                parts.append("," * full)
-            if frac > 0.01:
-                parts.append(f"{{#{frac / 1000:.6f}}},(240)")
-            cursor_ms = abs_ms
-
-        # 输出音符（EACH 用 / 连接，PSEUDO_EACH 用 ` 分组）
-        sub = _group_notes(list(group))
-        for gi, sg in enumerate(sub):
-            if gi > 0:
-                parts.append("`")
-            for ni, n in enumerate(sg):
-                if ni > 0:
-                    parts.append("/")
-                parts.append(serialize_note(n))
-        # 结束本组音符（逗号在下一组的 gap 中输出，或在末尾补一个）
-        if gi_idx == len(notes) - 1:
-            parts.append(",")
-
-    return "".join(parts)
-
-
-# ── maidata.txt ───────────────────────────────────────────────────────────
-
-@dataclass
-class MaidataFile:
-    metadata: dict[str, str] = field(default_factory=dict)
-    charts: dict[str, list[Note]] = field(default_factory=dict)
-
-
-def parse_maidata(text: str) -> MaidataFile:
-    result = MaidataFile()
-    lines = text.split("\n")
-    i = 0
-    n = len(lines)
-
-    while i < n:
-        line = lines[i].rstrip()
-        m = _RE_CHART_HEADER.match(line)
-        if m:
-            key = m.group(1)
-            rest = m.group(2)
-            chart_lines: list[str] = []
-            if rest:
-                chart_lines.append(rest)
-            i += 1
-            while i < n:
-                stripped = lines[i].rstrip()
-                if re.match(r"^[ \t]*E[ \t]*$", stripped):
-                    i += 1
+                if raw_note == "E":
                     break
-                if _RE_CHART_HEADER.match(stripped):
-                    break
-                chart_lines.append(lines[i])
-                i += 1
-            try:
-                result.charts[key] = Parser("\n".join(chart_lines)).parse()
-            except Exception as e:
-                print(f"[WARN] 解析 {key} 失败: {e}")
-                result.charts[key] = []
-        else:
-            m2 = _RE_META.match(line)
-            if m2:
-                result.metadata[m2.group(1)] = m2.group(2)
-            i += 1
 
-    return result
+                current_bpm, current_length_divider, current_per_comma_length = self._parse_current_time_per_comma(
+                    raw_note,
+                    current_bpm,
+                    current_length_divider,
+                    current_per_comma_length,
+                )
 
+                cleaned = re.sub(r"\([^)]*\)", "", raw_note)
+                cleaned = re.sub(r"\{[^}]*\}", "", cleaned).strip()
+                if not cleaned or cleaned == "E":
+                    self.current_time += current_per_comma_length
+                    continue
 
-def _group_by_time(notes: list[Note]) -> list[tuple[Note, ...]]:
-    """将 Note 列表按绝对时间分组为 tuple 列表。"""
-    groups: list[tuple[float, list[Note]]] = []
-    abs_ms = 0.0
-    for note in notes:
-        abs_ms += note.dt
-        if groups and abs(abs_ms - groups[-1][0]) < 0.5:
-            groups[-1][1].append(note)
-        else:
-            groups.append((abs_ms, [note]))
-    return [tuple(g) for _, g in groups]
+                note = self._parse_note(cleaned)
+                if note is None:
+                    self.current_time += current_per_comma_length
+                    continue
 
+                frame_idx = int(round(self.current_time / self.time_pre_frame))
+                frames_by_idx.setdefault(frame_idx, []).append(note)
+                frame_tokens_by_idx.setdefault(frame_idx, []).append(cleaned)
+                self.current_time += current_per_comma_length
 
-def parse_maidata_to_chart(text: str) -> tuple[MaidataFile, Chart]:
-    """解析 maidata.txt，返回 (MaidataFile, Chart)。"""
-    mf = parse_maidata(text)
-    chart = Chart()
-    for key, notes in mf.charts.items():
-        suffix = key.removeprefix("inote_")
-        if suffix in _DIFF_KEY_MAP:
-            chart_field, level_field = _DIFF_KEY_MAP[suffix]
-            setattr(chart, chart_field, _group_by_time(notes))
-            lv_key = f"lv_{suffix}"
-            if lv_key in mf.metadata:
-                setattr(chart, level_field, mf.metadata[lv_key])
-    return mf, chart
+            frames = [
+                Frame(frame_idx=frame_idx, notes=tuple(frames_by_idx[frame_idx]), note_tokens=tuple(frame_tokens_by_idx[frame_idx]))
+                for frame_idx in sorted(frames_by_idx)
+            ]
+            level_name = f"level_{level + 1}"
+            level_query_match = re.search(rf"&lv_{level}=([0-9.]+)", text)
+            level_query = float(level_query_match.group(1)) if level_query_match else None
+            self.chart.all_levels[level] = Level(level_name=level_name, level_query=level_query, frames=frames)
 
+        return self.chart
 
-def write_maidata(file: MaidataFile) -> str:
-    parts: list[str] = []
-    written: set[str] = set()
+    def generate(self) -> str:
+        lines: list[str] = []
+        lines.append(f"&title={self.chart.title}")
+        lines.append(f"&artist={self.chart.artist}")
+        lines.append("&first=0")
 
-    for key, value in file.metadata.items():
-        parts.append(f"&{key}={value}")
-        if key in file.charts:
-            parts.append(serialize_notes(_group_by_time(file.charts[key])))
-            parts.append("E")
-            written.add(key)
+        for level_idx, level in enumerate(self.chart.all_levels):
+            if level is None:
+                continue
 
-    for key, notes in file.charts.items():
-        if key not in written:
-            parts.append(f"&{key}=")
-            parts.append(serialize_notes(_group_by_time(notes)))
-            parts.append("E")
+            lines.append(f"&lv_{level_idx}={level.level_query or 0}")
+            lines.append(f"&inote_{level_idx}=")
 
-    return "\n".join(parts)
+            if not level.frames:
+                lines.append("E")
+                continue
 
+            output_lines: list[str] = []
+            current_line = ""
+            prev_frame_idx: int | None = None
 
-# ── main ──────────────────────────────────────────────────────────────────
+            for frame in sorted(level.frames, key=lambda frame: frame.frame_idx):
+                if not frame.note_tokens:
+                    continue
+
+                for token_idx, token in enumerate(frame.note_tokens):
+                    if not current_line:
+                        current_line = f"(12000){{1}}{token},"
+                    else:
+                        if prev_frame_idx is not None and frame.frame_idx != prev_frame_idx:
+                            gap_slots = max(0, int(round(frame.frame_idx - prev_frame_idx)) - 1)
+                            current_line += "," * gap_slots
+                        output_lines.append(current_line)
+                        current_line = f"{token},"
+
+                    if token_idx == len(frame.note_tokens) - 1:
+                        prev_frame_idx = frame.frame_idx
+
+            if current_line:
+                output_lines.append(current_line)
+
+            lines.extend(output_lines)
+            lines.append("E")
+
+        return "\n".join(lines)
+
 
 def main():
     charts_dir = Path(__file__).resolve().parent.parent / "charts"
     tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
     found = errors = 0
-
     for chart_dir, _dirs, files in charts_dir.walk():
         if "maidata.txt" not in files:
             continue
@@ -688,15 +320,17 @@ def main():
         out_path = tmp_dir / rel / "maidata.txt"
         try:
             text = (chart_dir / "maidata.txt").read_text(encoding="utf-8")
-            mf = parse_maidata(text)
+            parser = compiler(hop_length=512, sample_rate=44100)
+            parser.parse(text)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(write_maidata(mf), encoding="utf-8")
+            out_path.write_text(parser.generate(), encoding="utf-8")
             found += 1
             print(f"[{found}] {rel} -> {out_path}")
         except Exception as e:
+            import traceback
             errors += 1
             print(f"[ERR] {rel}: {e}")
-
+            traceback.print_exc()
     print(f"\nDone: {found} parsed, {errors} errors")
 
 
