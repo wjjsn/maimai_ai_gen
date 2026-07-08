@@ -791,8 +791,9 @@ class compiler:
     #         bit4 isSlideBreak     (1<<4)
     #         bit5 isSlideNoHead    (1<<5)
     #   12 modifiers     (int)  packed bools:
-    #         bit0 isBreak   (1<<0)
-    #         bit1 isEx      (1<<1)
+    #         bit0 isBreak     (1<<0)
+    #         bit1 isEx        (1<<1)
+    #         bit2 isFirework  (1<<2)
     _SLOT_DIMS = 13
 
     @staticmethod
@@ -819,6 +820,8 @@ class compiler:
             v |= 1 << 0
         if note.isEx:
             v |= 1 << 1
+        if note.type in (NoteType.TOUCH, NoteType.TOUCH_HOLD) and note.data.isFirework:
+            v |= 1 << 2
         return v
 
     def _note_to_slots(self, note, delta_t: int) -> list[list[int]]:
@@ -850,9 +853,10 @@ class compiler:
 
         if note.type == NoteType.SLIDE:
             rows: list[list[int]] = []
-            for seg in note.data:
+            for i, seg in enumerate(note.data):
+                d = delta_t if i == 0 else 0
                 rows.append([
-                    delta_t, n_type,
+                    d, n_type,
                     seg.start_lane.value,
                     0, 0,
                     seg.shape.value,
@@ -873,7 +877,7 @@ class compiler:
         level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
         Returns an empty [0, 13] tensor if the level is missing or has no notes.
         Δt encoding:
-          - First note in chart: 0
+          - First note in chart: frame index of its frame
           - First note in each subsequent frame: frame_gap from previous frame
           - Simultaneous notes (same frame, index > 0): 0
         """
@@ -886,7 +890,7 @@ class compiler:
         rows: list[list[int]] = []
         prev_idx: int | None = None
         for frame in level.frames:
-            frame_delta = 0 if prev_idx is None else frame.frame_idx - prev_idx
+            frame_delta = frame.frame_idx if prev_idx is None else frame.frame_idx - prev_idx
             for i_note, note in enumerate(frame.notes):
                 # First note in frame carries the time gap; simultaneous
                 # notes (same frame) get Δt=0 so the decoder learns they
@@ -898,6 +902,142 @@ class compiler:
         if not rows:
             return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
         return torch.tensor(rows, dtype=torch.int64)
+
+    # ── tensor import ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _unpack_slide_features(v: int) -> dict:
+        return {
+            "isClockwise": True if v & (1 << 0) else (False if v & (1 << 1) else None),
+            "isForceStar": bool(v & (1 << 2)),
+            "isFakeRotate": bool(v & (1 << 3)),
+            "isSlideBreak": bool(v & (1 << 4)),
+            "isSlideNoHead": bool(v & (1 << 5)),
+        }
+
+    @staticmethod
+    def _unpack_modifiers(v: int) -> dict:
+        return {
+            "isBreak": bool(v & (1 << 0)),
+            "isEx": bool(v & (1 << 1)),
+            "isFirework": bool(v & (1 << 2)),
+        }
+
+    def parse_from_tensor(self, tensor: torch.Tensor, level_idx: int = 4, title: str = "generated", artist: str | None = None, level_query: float | None = None) -> "compiler":
+        """
+        Import a [N, 13] int64 tensor into the compiler's chart at level_idx.
+        Inverse of to_tensor(). Returns self for chaining: parser.parse_from_tensor(t).generate()
+        
+        If chart already exists, preserves title/artist unless overridden.
+        """
+        if tensor.ndim != 2 or tensor.shape[1] != self._SLOT_DIMS:
+            raise ValueError(f"Expected tensor shape [N, {self._SLOT_DIMS}], got {tensor.shape}")
+
+        if not (0 <= level_idx < 7):
+            raise ValueError(f"level_idx {level_idx} out of range 0..6")
+
+        rows = tensor.tolist()
+        frames_by_idx: dict[int, list[Note]] = {}
+        frame_time_by_idx: dict[int, float] = {}
+
+        current_frame_idx = 0
+        i = 0
+        n = len(rows)
+
+        while i < n:
+            row = rows[i]
+            dt, note_type_val = row[0], row[1]
+            current_frame_idx += dt
+            note_type = NoteType(note_type_val)
+            modifiers = self._unpack_modifiers(row[12])
+            is_firework = modifiers.pop("isFirework", False)
+
+            if note_type == NoteType.TAP:
+                lane = TapType(row[2])
+                note = Note(note_type, lane, **modifiers)
+                frames_by_idx.setdefault(current_frame_idx, []).append(note)
+                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                i += 1
+
+            elif note_type == NoteType.HOLD:
+                lane = TapType(row[2])
+                hold_time = row[4]
+                note = Note(note_type, Hold_data(lane, hold_time), **modifiers)
+                frames_by_idx.setdefault(current_frame_idx, []).append(note)
+                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                i += 1
+
+            elif note_type == NoteType.TOUCH:
+                touch_area = TouchType(row[3])
+                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework), **modifiers)
+                frames_by_idx.setdefault(current_frame_idx, []).append(note)
+                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                i += 1
+
+            elif note_type == NoteType.TOUCH_HOLD:
+                touch_area = TouchType(row[3])
+                hold_time = row[4] if row[4] > 0 else None
+                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_time), **modifiers)
+                frames_by_idx.setdefault(current_frame_idx, []).append(note)
+                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                i += 1
+
+            elif note_type == NoteType.SLIDE:
+                r = rows[i]
+                sf = self._unpack_slide_features(r[11])
+                shape = SlideShape(r[5])
+                start_lane = TapType(r[8])
+                end_lane = TapType(r[9])
+                middle_lane = TapType(r[10]) if r[10] != 0 else None
+                seg = SlideSegment(
+                    shape=shape,
+                    start_lane=start_lane,
+                    end_lane=end_lane,
+                    wait_duration=r[6],
+                    trace_duration=r[7],
+                    isClockwise=sf["isClockwise"],
+                    middle_lane=middle_lane,
+                    isForceStar=sf["isForceStar"],
+                    isFakeRotate=sf["isFakeRotate"],
+                    isSlideBreak=sf["isSlideBreak"],
+                    isSlideNoHead=sf["isSlideNoHead"],
+                )
+                note = Note(note_type, [seg], **modifiers)
+                frames_by_idx.setdefault(current_frame_idx, []).append(note)
+                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                i += 1
+
+            else:
+                i += 1
+
+        frames = [
+            Frame(
+                frame_idx=idx,
+                notes=tuple(frames_by_idx[idx]),
+                time_sec=frame_time_by_idx[idx],
+            )
+            for idx in sorted(frames_by_idx)
+        ]
+
+        # Preserve existing chart metadata if available
+        if self.chart is not None:
+            chart_title = self.chart.title if title == "generated" else title
+            chart_artist = self.chart.artist if artist is None else artist
+        else:
+            chart_title = title
+            chart_artist = artist or "default"
+
+        if self.chart is None or self.chart.all_levels == []:
+            self.chart = Chart(all_levels=[None] * 7, title=chart_title, artist=chart_artist)
+        elif len(self.chart.all_levels) <= level_idx:
+            self.chart.all_levels.extend([None] * (level_idx + 1 - len(self.chart.all_levels)))
+
+        self.chart.all_levels[level_idx] = Level(
+            level_name=f"level_{level_idx + 1}",
+            level_query=level_query if level_query is not None else 0.0,
+            frames=frames,
+        )
+        return self
 
     # ── note-to-text reconstruction ───────────────────────────────────────
 
@@ -1116,9 +1256,12 @@ class compiler:
 # ── batch tool ────────────────────────────────────────────────────────────
 
 def main():
+    import difflib
+
     charts_dir = Path(__file__).resolve().parent.parent / "charts"
     tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
     found = errors = 0
+    diffs = 0
     overall: dict[str, dict[str, int]] = {}
     for chart_dir, _dirs, files in charts_dir.walk():
         if "maidata.txt" not in files:
@@ -1130,7 +1273,6 @@ def main():
             parser = compiler(hop_length=512, sample_rate=44100)
             extremes = parser.eval(text)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(parser.generate(), encoding="utf-8")
             found += 1
             for key, slot in extremes.items():
                 cur = overall.get(key)
@@ -1141,13 +1283,63 @@ def main():
                         cur["min"] = slot["min"]
                     if slot["max"] > cur["max"]:
                         cur["max"] = slot["max"]
-            print(f"[{found}] {rel} -> {out_path}  eval={extremes}")
+
+            # ── parse vs parse_from_tensor 全 level 对比 ──
+            title = parser.chart.title
+            artist = parser.chart.artist
+            text_a = parser.generate()
+            tensors: dict[int, tuple[torch.Tensor, float]] = {}
+            for li in range(7):
+                lv = parser.chart.all_levels[li]
+                if lv is not None:
+                    t = parser.to_tensor(level_idx=li)
+                    tensors[li] = (t, lv.level_query)
+            parser.chart = None
+            for li, (t, lq) in tensors.items():
+                parser.parse_from_tensor(t, level_idx=li, title=title, artist=artist, level_query=lq)
+            text_b = parser.generate()
+            out_path.write_text(text_b, encoding="utf-8")
+
+            # 过滤仅逗号数量不同的行
+            a_lines = text_a.splitlines()
+            b_lines = text_b.splitlines()
+            max_len = max(len(a_lines), len(b_lines))
+            a_lines += [''] * (max_len - len(a_lines))
+            b_lines += [''] * (max_len - len(b_lines))
+            filtered_a: list[str] = []
+            filtered_b: list[str] = []
+            has_real_diff = False
+            for la, lb in zip(a_lines, b_lines):
+                if la == lb:
+                    filtered_a.append(la)
+                    filtered_b.append(lb)
+                elif la.rstrip(',') == lb.rstrip(','):
+                    filtered_a.append(la)
+                    filtered_b.append(lb)
+                else:
+                    has_real_diff = True
+                    filtered_a.append(la)
+                    filtered_b.append(lb)
+
+            if has_real_diff:
+                diffs += 1
+                print(f"\n[DIFF] {rel}")
+                diff = difflib.unified_diff(
+                    [l + '\n' for l in filtered_a],
+                    [l + '\n' for l in filtered_b],
+                    fromfile="parse → generate",
+                    tofile="parse → tensor → parse_from_tensor → generate",
+                )
+                for line in diff:
+                    print("  " + line.rstrip())
+
         except Exception as e:
             import traceback
             errors += 1
             print(f"[ERR] {rel}: {e}")
             traceback.print_exc()
-    print(f"\nDone: {found} parsed, {errors} errors")
+
+    print(f"\nDone: {found} parsed, {errors} errors, {diffs} diffs")
     print(f"Overall extremes per field: {overall}")
 
 
