@@ -872,8 +872,10 @@ class compiler:
 
         level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
         Returns an empty [0, 13] tensor if the level is missing or has no notes.
-        Δt is computed per-frame: 0 for the first note in each frame, and
-        `frame.frame_idx - prev_frame.frame_idx` for subsequent frames.
+        Δt encoding:
+          - First note in chart: 0
+          - First note in each subsequent frame: frame_gap from previous frame
+          - Simultaneous notes (same frame, index > 0): 0
         """
         if not (0 <= level_idx < len(self.chart.all_levels)):
             raise ValueError(f"level_idx {level_idx} out of range")
@@ -884,8 +886,12 @@ class compiler:
         rows: list[list[int]] = []
         prev_idx: int | None = None
         for frame in level.frames:
-            delta = 0 if prev_idx is None else frame.frame_idx - prev_idx
-            for note in frame.notes:
+            frame_delta = 0 if prev_idx is None else frame.frame_idx - prev_idx
+            for i_note, note in enumerate(frame.notes):
+                # First note in frame carries the time gap; simultaneous
+                # notes (same frame) get Δt=0 so the decoder learns they
+                # are co-occurring rather than spread across frame_delta.
+                delta = frame_delta if i_note == 0 else 0
                 rows.extend(self._note_to_slots(note, delta))
             prev_idx = frame.frame_idx
 
