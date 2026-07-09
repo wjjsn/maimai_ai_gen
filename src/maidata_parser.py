@@ -1065,19 +1065,39 @@ class compiler:
     }
 
     @staticmethod
-    def _duration_to_notation(seconds: float, bpm: float) -> str:
+    @staticmethod
+    def _beats_to_divider_mult(beats: float) -> tuple[int, int] | None:
+        """Approximate a beat count as (divider, mult) with mult/divider ≈ beats.
+        Returns None if no clean approximation found."""
+        if beats <= 0:
+            return None
+        for d in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1280]:
+            m = beats * d
+            mi = int(round(m))
+            if mi > 0 and abs(m - mi) / max(mi, 1) < 0.02:
+                return d, mi
+        return None
+
+    def _duration_to_notation(self, seconds: float, bpm: float) -> str:
         """Convert duration in seconds to simai [X:Y] notation at given BPM.
-        Tries power-of-2 denominators, falls back to #seconds."""
+        Tries power-of-2 denominators, falls back to computed BPM with [BPM#D:M]."""
         if seconds <= 0:
             return "1:1"
         beats = seconds * bpm / 240.0
-        # tolerance: frame quantization can cause ~0.3 beats of error at 12000 BPM
         for x in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1280]:
             y = beats * x
             yi = int(round(y))
-            if yi > 0 and abs(y - yi) < 0.5:
+            if yi > 0 and abs(y - yi) / max(yi, 1) < 0.02:
                 return f"{x}:{yi}"
-        # fallback: #seconds
+        # fallback: compute a BPM where this duration = 1 beat, find clean D:M
+        implied_bpm = 240.0 / seconds
+        result = self._beats_to_divider_mult(beats)
+        if result is not None:
+            d, m = result
+            bpm_str = f"{implied_bpm:.4f}"
+            bpm_str = bpm_str.rstrip('0').rstrip('.')
+            return f"{bpm_str}#{d}:{m}"
+        # last resort: #seconds
         s = f"{seconds:.6f}"
         s = s.rstrip('0').rstrip('.')
         return f"#{s}"
@@ -1180,15 +1200,26 @@ class compiler:
                 trace_sec = seg.trace_duration * self.time_pre_frame
                 wait_sec = seg.wait_duration * self.time_pre_frame
                 default_wait = 240.0 / bpm  # 1 beat at generation BPM
-                trace_str = self._duration_to_notation(trace_sec, bpm)
-                # strip leading '#' for use inside [wait##trace]
-                trace_val = trace_str.lstrip('#')
                 if abs(wait_sec - default_wait) < 0.005:
+                    # wait = 1 beat at gen BPM, use simple [D:M] notation
+                    trace_str = self._duration_to_notation(trace_sec, bpm)
                     parts.append(f"[{trace_str}]")
                 else:
-                    ws = f"{wait_sec:.6f}"
-                    ws = ws.rstrip('0').rstrip('.')
-                    parts.append(f"[{ws}##{trace_val}]")
+                    # wait ≠ 1 beat at gen BPM: find BPM where wait = 1 beat,
+                    # then express trace at that same BPM.
+                    wait_bpm = 240.0 / wait_sec
+                    trace_beats = trace_sec * wait_bpm / 240.0
+                    # try to find clean D:M for trace at wait_bpm
+                    dm = self._beats_to_divider_mult(trace_beats)
+                    if dm is not None:
+                        d, m = dm
+                        bpm_s = f"{wait_bpm:.4f}".rstrip('0').rstrip('.')
+                        parts.append(f"[{bpm_s}#{d}:{m}]")
+                    else:
+                        # trace can't be expressed as clean beats; use seconds
+                        ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
+                        bpm_s = f"{wait_bpm:.4f}".rstrip('0').rstrip('.')
+                        parts.append(f"[{bpm_s}#{ts}]")
 
             prev_end = seg.end_lane
 
