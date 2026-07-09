@@ -150,6 +150,34 @@ class Chart:
     # lv_1/lv_2 /lv_3   /lv_4/  lv_5/     lv_6/  lv_7
 
 
+# ── Token vocabulary (from doc/token化设计.md) ─────────────────────────────
+
+PAD = 0
+SOS = 1
+EOS = 2
+FRAME_START = 3
+FRAME_END = 4
+TS_BASE = 5          # TS_0 .. TS_2999  →  5 ~ 3004
+LANE_BASE = 3005     # LANE_1 .. LANE_8 → 3005 ~ 3012
+TOUCH_BASE = 3013    # TOUCH_1 .. TOUCH_33 → 3013 ~ 3045
+NOTE_TAP = 3046
+NOTE_TOUCH = 3047
+NOTE_HOLD = 3048
+NOTE_SLIDE = 3049
+SEGMENT_START = 3050
+SEGMENT_END = 3051
+SLIDE_SHAPE_BASE = 3052  # SLIDE_SHAPE_1 .. _11 → 3052 ~ 3062
+IS_BREAK = 3063
+IS_EX = 3064
+IS_FIREWORK = 3065
+IS_CW = 3066
+IS_CCW = 3067
+IS_FORCE_STAR = 3068
+IS_FAKE_ROTATE = 3069
+IS_SLIDE_BREAK = 3070
+IS_SLIDE_NO_HEAD = 3071
+VOCAB_SIZE = 3072
+
 # ── helpers ────────────────────────────────────────────────────────────────
 
 _LANE_MAP = {
@@ -252,7 +280,7 @@ def _touch_hold_length(token: str, bpm: float) -> float | None:
 
 class compiler:
     def __init__(self, hop_length=512, sample_rate=44100):
-        self.chart = Chart(all_levels=[])
+        self.chart = Chart(all_levels=[None] * 7)
         self.current_time = 0.0  # seconds
 
     # ── note parsing ──────────────────────────────────────────────────────
@@ -751,274 +779,326 @@ class compiler:
                 prev_time = frame.time_sec
         return extremes
 
-    # ── tensor export ─────────────────────────────────────────────────────
-
-    # Slot layout (13 columns):
-    #   0  Δt            (int)  relative time in milliseconds
-    #   1  NoteType      (int)  NoteType enum value
-    #   2  Lane          (int)  TapType enum value for TAP/HOLD/SLIDE start
-    #   3  TouchType     (int)  TouchType enum value; 0 if not touch
-    #   4  holdTime      (int)  HOLD / TOUCH_HOLD duration in ms; 0 otherwise
-    #   5  SlideShape    (int)  SlideShape enum value; 0 if not slide
-    #   6  wait_duration (int)  slide segment wait in ms; 0 otherwise
-    #   7  trace_duration (int) slide segment trace in ms; 0 otherwise
-    #   8  start_lane    (int)  TapType enum value; 0 if not slide
-    #   9  end_lane      (int)  TapType enum value; 0 if not slide
-    #   10 middle_lane   (int)  TapType enum value; 0 if not GrandV
-    #   11 slide_features (int) packed bools:
-    #         bit0 isClockwise-cw   (1<<0)
-    #         bit1 isClockwise-ccw  (1<<1)
-    #         bit2 isForceStar      (1<<2)
-    #         bit3 isFakeRotate     (1<<3)
-    #         bit4 isSlideBreak     (1<<4)
-    #         bit5 isSlideNoHead    (1<<5)
-    #   12 modifiers     (int)  packed bools:
-    #         bit0 isBreak     (1<<0)
-    #         bit1 isEx        (1<<1)
-    #         bit2 isFirework  (1<<2)
-    _SLOT_DIMS = 13
+    # ── Token encoding helpers ───────────────────────────────────────────
 
     @staticmethod
-    def _pack_slide_features(seg) -> int:
-        v = 0
-        if seg.isClockwise is True:
-            v |= 1 << 0
-        elif seg.isClockwise is False:
-            v |= 1 << 1
-        if seg.isForceStar:
-            v |= 1 << 2
-        if seg.isFakeRotate:
-            v |= 1 << 3
-        if seg.isSlideBreak:
-            v |= 1 << 4
-        if seg.isSlideNoHead:
-            v |= 1 << 5
-        return v
+    def _ts_token(seconds: float) -> int:
+        """Convert time in seconds to a TS token ID (100 fps).
+
+        Clamps to [0, 2999].  For positive inputs that would round to 0
+        (i.e. < 5 ms), returns TS_1 (0.01 s) to avoid information loss
+        on round-trip (a zero hold-duration would turn a HOLD into a
+        pseudo-hold TAP).
+        """
+        raw = int(round(seconds * 100))
+        if seconds > 0 and raw == 0:
+            raw = 1  # minimum non-zero: 0.01 s
+        return TS_BASE + max(0, min(2999, raw))
 
     @staticmethod
-    def _pack_modifiers(note) -> int:
-        v = 0
-        if note.isBreak:
-            v |= 1 << 0
-        if note.isEx:
-            v |= 1 << 1
-        if note.type in (NoteType.TOUCH, NoteType.TOUCH_HOLD) and note.data.isFirework:
-            v |= 1 << 2
-        return v
+    def _lane_token(lane: TapType) -> int:
+        return LANE_BASE + lane.value - 1
 
-    def _note_to_slots(self, note, delta_ms: int) -> list[list[int]]:
-        """Convert a Note into one or more slot rows. Slides expand per segment."""
-        n_type = note.type.value
-        modifiers = self._pack_modifiers(note)
+    @staticmethod
+    def _touch_token(touch: TouchType) -> int:
+        return TOUCH_BASE + touch.value - 1
 
-        if note.type == NoteType.TAP:
-            return [[delta_ms, n_type, note.data.value, 0, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+    @staticmethod
+    def _shape_token(shape: SlideShape) -> int:
+        return SLIDE_SHAPE_BASE + shape.value - 1
 
-        if note.type == NoteType.HOLD:
-            hold_ms = int(round(note.data.holdTime * 1000))
-            return [[
-                delta_ms, n_type,
-                note.data.lane.value,
-                0, hold_ms,
-                0, 0, 0, 0, 0, 0, 0, modifiers,
-            ]]
+    def _encode_note_tokens(self, note: Note) -> list[int]:
+        """Encode a single Note into a flat list of token IDs.
 
-        if note.type == NoteType.TOUCH:
-            return [[delta_ms, n_type, 0, note.data.Touch_area.value, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+        Encodes only the note payload — the caller is responsible for
+        emitting FRAME_START / FRAME_END / TS_xxx around it.
+        """
+        t = note.type
+        tokens: list[int] = []
 
-        if note.type == NoteType.TOUCH_HOLD:
-            hold_ms = int(round(note.data.holdTime * 1000)) if note.data.holdTime > 0 else 0
-            return [[
-                delta_ms, n_type,
-                0, note.data.Touch_area.value,
-                hold_ms, 0, 0, 0, 0, 0, 0, 0, modifiers,
-            ]]
+        if t == NoteType.TAP:
+            tokens.append(NOTE_TAP)
+            tokens.append(self._lane_token(note.data))
+            if note.isBreak:
+                tokens.append(IS_BREAK)
+            if note.isEx:
+                tokens.append(IS_EX)
 
-        if note.type == NoteType.SLIDE:
-            rows: list[list[int]] = []
-            for i, seg in enumerate(note.data):
-                d = delta_ms if i == 0 else 0
-                wait_ms = int(round(seg.wait_duration * 1000))
-                trace_ms = int(round(seg.trace_duration * 1000))
-                rows.append([
-                    d, n_type,
-                    seg.start_lane.value,
-                    0, 0,
-                    seg.shape.value,
-                    wait_ms, trace_ms,
-                    seg.start_lane.value, seg.end_lane.value,
-                    seg.middle_lane.value if seg.middle_lane is not None else 0,
-                    self._pack_slide_features(seg),
-                    modifiers,
-                ])
-            return rows
+        elif t == NoteType.HOLD:
+            tokens.append(NOTE_HOLD)
+            tokens.append(self._lane_token(note.data.lane))
+            tokens.append(self._ts_token(note.data.holdTime))
+            if note.isBreak:
+                tokens.append(IS_BREAK)
+            if note.isEx:
+                tokens.append(IS_EX)
 
-        return []
+        elif t == NoteType.TOUCH:
+            tokens.append(NOTE_TOUCH)
+            tokens.append(self._touch_token(note.data.Touch_area))
+            if note.data.isFirework:
+                tokens.append(IS_FIREWORK)
+
+        elif t == NoteType.TOUCH_HOLD:
+            tokens.append(NOTE_TOUCH)
+            tokens.append(self._touch_token(note.data.Touch_area))
+            hold_sec = note.data.holdTime if note.data.holdTime > 0 else 0.0
+            tokens.append(self._ts_token(hold_sec))
+            if note.data.isFirework:
+                tokens.append(IS_FIREWORK)
+
+        elif t == NoteType.SLIDE:
+            tokens.append(NOTE_SLIDE)
+            if note.isBreak:
+                tokens.append(IS_BREAK)
+            if note.isEx:
+                tokens.append(IS_EX)
+            for seg in note.data:
+                tokens.append(SEGMENT_START)
+                tokens.append(self._shape_token(seg.shape))
+                tokens.append(self._lane_token(seg.start_lane))
+                tokens.append(self._lane_token(seg.end_lane))
+                if seg.middle_lane is not None:
+                    tokens.append(self._lane_token(seg.middle_lane))
+                tokens.append(self._ts_token(seg.wait_duration))
+                tokens.append(self._ts_token(seg.trace_duration))
+                if seg.isClockwise is True:
+                    tokens.append(IS_CW)
+                elif seg.isClockwise is False:
+                    tokens.append(IS_CCW)
+                if seg.isForceStar:
+                    tokens.append(IS_FORCE_STAR)
+                if seg.isFakeRotate:
+                    tokens.append(IS_FAKE_ROTATE)
+                if seg.isSlideBreak:
+                    tokens.append(IS_SLIDE_BREAK)
+                if seg.isSlideNoHead:
+                    tokens.append(IS_SLIDE_NO_HEAD)
+                tokens.append(SEGMENT_END)
+
+        return tokens
+
+    # ── tensor export (token vocabulary) ──────────────────────────────────
 
     def to_tensor(self, level_idx: int = 4) -> torch.Tensor:
-        """
-        Export a single level to a [N, 13] int64 tensor. See _SLOT_DIMS for layout.
+        """Export a single level to a 1-D int64 token tensor.
+
+        Token encoding follows doc/token化设计.md:
+          <FRAME_START> TS_xxx <note1> <note2> ... <FRAME_END>
 
         level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
-        Returns an empty [0, 13] tensor if the level is missing or has no notes.
-        Δt encoding:
-          - First note in chart: absolute time in ms
-          - First note in each subsequent frame: time gap in ms from previous frame
-          - Simultaneous notes (same frame, index > 0): 0
+        Returns an empty 1-D int64 tensor if the level is missing.
         """
         if not (0 <= level_idx < len(self.chart.all_levels)):
             raise ValueError(f"level_idx {level_idx} out of range")
         level = self.chart.all_levels[level_idx]
         if level is None:
-            return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
+            return torch.zeros((0,), dtype=torch.int64)
 
-        rows: list[list[int]] = []
-        prev_time_ms: int | None = None
+        tokens: list[int] = []
         for frame in level.frames:
-            time_ms = int(round(frame.time_sec * 1000))
-            delta_ms = time_ms if prev_time_ms is None else time_ms - prev_time_ms
-            for i_note, note in enumerate(frame.notes):
-                # First note in frame carries the time gap; simultaneous
-                # notes (same frame) get Δt=0 so the decoder learns they
-                # are co-occurring rather than spread across delta_ms.
-                d = delta_ms if i_note == 0 else 0
-                rows.extend(self._note_to_slots(note, d))
-            prev_time_ms = time_ms
+            tokens.append(FRAME_START)
+            tokens.append(self._ts_token(frame.time_sec))
+            for note in frame.notes:
+                tokens.extend(self._encode_note_tokens(note))
+            tokens.append(FRAME_END)
 
-        if not rows:
-            return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
-        return torch.tensor(rows, dtype=torch.int64)
+        if not tokens:
+            return torch.zeros((0,), dtype=torch.int64)
+        return torch.tensor(tokens, dtype=torch.int64)
 
-    # ── tensor import ───────────────────────────────────────────────────────
+    # ── tensor import (token vocabulary) ────────────────────────────────────
 
-    @staticmethod
-    def _unpack_slide_features(v: int) -> dict:
-        return {
-            "isClockwise": True if v & (1 << 0) else (False if v & (1 << 1) else None),
-            "isForceStar": bool(v & (1 << 2)),
-            "isFakeRotate": bool(v & (1 << 3)),
-            "isSlideBreak": bool(v & (1 << 4)),
-            "isSlideNoHead": bool(v & (1 << 5)),
-        }
+    def parse_from_tensor(
+        self,
+        tensor: torch.Tensor,
+        level_idx: int = 4,
+        title: str = "generated",
+        artist: str | None = None,
+        level_query: float | None = None,
+    ) -> "compiler":
+        """Import a 1-D token tensor into the compiler's chart at level_idx.
 
-    @staticmethod
-    def _unpack_modifiers(v: int) -> dict:
-        return {
-            "isBreak": bool(v & (1 << 0)),
-            "isEx": bool(v & (1 << 1)),
-            "isFirework": bool(v & (1 << 2)),
-        }
-
-    def parse_from_tensor(self, tensor: torch.Tensor, level_idx: int = 4, title: str = "generated", artist: str | None = None, level_query: float | None = None) -> "compiler":
+        Inverse of to_tensor().  Returns self for chaining.
         """
-        Import a [N, 13] int64 tensor into the compiler's chart at level_idx.
-        Inverse of to_tensor(). Returns self for chaining: parser.parse_from_tensor(t).generate()
-        
-        If chart already exists, preserves title/artist unless overridden.
-        """
-        if tensor.ndim != 2 or tensor.shape[1] != self._SLOT_DIMS:
-            raise ValueError(f"Expected tensor shape [N, {self._SLOT_DIMS}], got {tensor.shape}")
-
+        if tensor.ndim != 1:
+            raise ValueError(f"Expected 1-D tensor, got shape {tensor.shape}")
         if not (0 <= level_idx < 7):
             raise ValueError(f"level_idx {level_idx} out of range 0..6")
 
-        rows = tensor.tolist()
-        frames_by_time: dict[float, list[Note]] = {}
-
-        current_time_ms = 0
+        tok = tensor.tolist()
+        frames: list[Frame] = []
         i = 0
-        n = len(rows)
+        n = len(tok)
 
         while i < n:
-            row = rows[i]
-            dt, note_type_val = row[0], row[1]
-            current_time_ms += dt
-            current_time_sec = current_time_ms / 1000.0
-            note_type = NoteType(note_type_val)
-            modifiers = self._unpack_modifiers(row[12])
-            is_firework = modifiers.pop("isFirework", False)
-
-            if note_type == NoteType.TAP:
-                lane = TapType(row[2])
-                note = Note(note_type, lane, **modifiers)
-                frames_by_time.setdefault(current_time_sec, []).append(note)
+            if tok[i] != FRAME_START:
                 i += 1
+                continue
+            i += 1
 
-            elif note_type == NoteType.HOLD:
-                lane = TapType(row[2])
-                hold_sec = row[4] / 1000.0
-                note = Note(note_type, Hold_data(lane, hold_sec), **modifiers)
-                frames_by_time.setdefault(current_time_sec, []).append(note)
+            # ── timestamp ──
+            if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
+                time_sec = (tok[i] - TS_BASE) / 100.0
                 i += 1
-
-            elif note_type == NoteType.TOUCH:
-                touch_area = TouchType(row[3])
-                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework), **modifiers)
-                frames_by_time.setdefault(current_time_sec, []).append(note)
-                i += 1
-
-            elif note_type == NoteType.TOUCH_HOLD:
-                touch_area = TouchType(row[3])
-                hold_sec = row[4] / 1000.0 if row[4] > 0 else 0.0
-                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_sec), **modifiers)
-                frames_by_time.setdefault(current_time_sec, []).append(note)
-                i += 1
-
-            elif note_type == NoteType.SLIDE:
-                # Collect consecutive SLIDE rows at same time, splitting on
-                # chaining (start==prev_end) vs multiple (start==first_start)
-                segs: list[SlideSegment] = []
-                first_start = TapType(rows[i][8])
-                prev_end: TapType | None = None
-                slide_start_i = i
-                while i < n:
-                    r = rows[i]
-                    if r[1] != NoteType.SLIDE.value:
-                        break
-                    if i > slide_start_i and r[0] != 0:
-                        break  # different time
-                    sf = self._unpack_slide_features(r[11])
-                    shape = SlideShape(r[5])
-                    start_lane = TapType(r[8])
-                    end_lane = TapType(r[9])
-                    middle_lane = TapType(r[10]) if r[10] != 0 else None
-                    wait_sec = r[6] / 1000.0
-                    trace_sec = r[7] / 1000.0
-                    # If start != prev_end and start == first_start,
-                    # this is a new slide, not a continuation
-                    if prev_end is not None and start_lane != prev_end and start_lane == first_start:
-                        break
-                    seg = SlideSegment(
-                        shape=shape,
-                        start_lane=start_lane,
-                        end_lane=end_lane,
-                        wait_duration=wait_sec,
-                        trace_duration=trace_sec,
-                        isClockwise=sf["isClockwise"],
-                        middle_lane=middle_lane,
-                        isForceStar=sf["isForceStar"],
-                        isFakeRotate=sf["isFakeRotate"],
-                        isSlideBreak=sf["isSlideBreak"],
-                        isSlideNoHead=sf["isSlideNoHead"],
-                    )
-                    segs.append(seg)
-                    prev_end = end_lane
-                    i += 1
-                note = Note(note_type, segs, **modifiers)
-                frames_by_time.setdefault(current_time_sec, []).append(note)
-
             else:
+                time_sec = 0.0
+
+            # ── notes until FRAME_END ──
+            notes: list[Note] = []
+            while i < n and tok[i] != FRAME_END:
+                t = tok[i]
+
+                if t == NOTE_TAP:
+                    i += 1
+                    lane_tok = tok[i] if i < n else LANE_BASE
+                    lane = TapType(lane_tok - LANE_BASE + 1) if LANE_BASE <= lane_tok < LANE_BASE + 8 else TapType.LANE1
+                    i += 1
+                    is_break = False
+                    is_ex = False
+                    while i < n and tok[i] in (IS_BREAK, IS_EX):
+                        if tok[i] == IS_BREAK:
+                            is_break = True
+                        elif tok[i] == IS_EX:
+                            is_ex = True
+                        i += 1
+                    notes.append(Note(NoteType.TAP, lane, isBreak=is_break, isEx=is_ex))
+
+                elif t == NOTE_HOLD:
+                    i += 1
+                    lane_tok = tok[i] if i < n else LANE_BASE
+                    lane = TapType(lane_tok - LANE_BASE + 1) if LANE_BASE <= lane_tok < LANE_BASE + 8 else TapType.LANE1
+                    i += 1
+                    hold_sec = 0.0
+                    if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
+                        hold_sec = (tok[i] - TS_BASE) / 100.0
+                        i += 1
+                    is_break = False
+                    is_ex = False
+                    while i < n and tok[i] in (IS_BREAK, IS_EX):
+                        if tok[i] == IS_BREAK:
+                            is_break = True
+                        elif tok[i] == IS_EX:
+                            is_ex = True
+                        i += 1
+                    notes.append(Note(NoteType.HOLD, Hold_data(lane, hold_sec), isBreak=is_break, isEx=is_ex))
+
+                elif t == NOTE_TOUCH:
+                    i += 1
+                    touch_tok = tok[i] if i < n else TOUCH_BASE
+                    touch_area = TouchType(touch_tok - TOUCH_BASE + 1) if TOUCH_BASE <= touch_tok < TOUCH_BASE + 33 else TouchType.A1
+                    i += 1
+                    hold_sec = 0.0
+                    if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
+                        hold_sec = (tok[i] - TS_BASE) / 100.0
+                        i += 1
+                    is_firework = False
+                    if i < n and tok[i] == IS_FIREWORK:
+                        is_firework = True
+                        i += 1
+                    if hold_sec > 0:
+                        notes.append(Note(NoteType.TOUCH_HOLD, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_sec)))
+                    else:
+                        notes.append(Note(NoteType.TOUCH, Touch_data(touch_area, isFirework=is_firework)))
+
+                elif t == NOTE_SLIDE:
+                    i += 1
+                    note_break = False
+                    note_ex = False
+                    while i < n and tok[i] in (IS_BREAK, IS_EX):
+                        if tok[i] == IS_BREAK:
+                            note_break = True
+                        elif tok[i] == IS_EX:
+                            note_ex = True
+                        i += 1
+
+                    segments: list[SlideSegment] = []
+                    while i < n and tok[i] == SEGMENT_START:
+                        i += 1
+                        shape_tok = tok[i] if i < n else SLIDE_SHAPE_BASE
+                        shape = SlideShape(shape_tok - SLIDE_SHAPE_BASE + 1) if SLIDE_SHAPE_BASE <= shape_tok < SLIDE_SHAPE_BASE + 11 else SlideShape.Line
+                        i += 1
+
+                        start_lane_tok = tok[i] if i < n else LANE_BASE
+                        start_lane = TapType(start_lane_tok - LANE_BASE + 1) if LANE_BASE <= start_lane_tok < LANE_BASE + 8 else TapType.LANE1
+                        i += 1
+
+                        end_lane_tok = tok[i] if i < n else LANE_BASE
+                        end_lane = TapType(end_lane_tok - LANE_BASE + 1) if LANE_BASE <= end_lane_tok < LANE_BASE + 8 else TapType.LANE1
+                        i += 1
+
+                        # optional middle_lane for GrandV (non-TS, non-SEGMENT_END, non-attribute)
+                        middle_lane = None
+                        if (i < n and LANE_BASE <= tok[i] < LANE_BASE + 8
+                                and shape == SlideShape.GrandV):
+                            middle_lane = TapType(tok[i] - LANE_BASE + 1)
+                            i += 1
+
+                        wait_sec = 0.0
+                        trace_sec = 0.0
+                        if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
+                            wait_sec = (tok[i] - TS_BASE) / 100.0
+                            i += 1
+                        if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
+                            trace_sec = (tok[i] - TS_BASE) / 100.0
+                            i += 1
+
+                        # segment-level attributes (until SEGMENT_END)
+                        is_cw = None
+                        seg_force_star = False
+                        seg_fake_rotate = False
+                        seg_break = False
+                        seg_no_head = False
+                        while i < n and tok[i] != SEGMENT_END:
+                            if tok[i] == IS_CW:
+                                is_cw = True
+                            elif tok[i] == IS_CCW:
+                                is_cw = False
+                            elif tok[i] == IS_FORCE_STAR:
+                                seg_force_star = True
+                            elif tok[i] == IS_FAKE_ROTATE:
+                                seg_fake_rotate = True
+                            elif tok[i] == IS_SLIDE_BREAK:
+                                seg_break = True
+                            elif tok[i] == IS_SLIDE_NO_HEAD:
+                                seg_no_head = True
+                            else:
+                                break  # unexpected token, stop
+                            i += 1
+
+                        # consume SEGMENT_END
+                        if i < n and tok[i] == SEGMENT_END:
+                            i += 1
+
+                        segments.append(SlideSegment(
+                            shape=shape,
+                            start_lane=start_lane,
+                            end_lane=end_lane,
+                            wait_duration=wait_sec,
+                            trace_duration=trace_sec,
+                            isClockwise=is_cw,
+                            middle_lane=middle_lane,
+                            isForceStar=seg_force_star,
+                            isFakeRotate=seg_fake_rotate,
+                            isSlideBreak=seg_break,
+                            isSlideNoHead=seg_no_head,
+                        ))
+
+                    notes.append(Note(NoteType.SLIDE, segments, isBreak=note_break, isEx=note_ex))
+
+                else:
+                    i += 1  # skip unknown tokens
+
+            # consume FRAME_END
+            if i < n and tok[i] == FRAME_END:
                 i += 1
 
-        frames = [
-            Frame(
-                notes=tuple(notes),
-                time_sec=t,
-            )
-            for t, notes in sorted(frames_by_time.items())
-        ]
+            if notes:
+                frames.append(Frame(notes=tuple(notes), time_sec=time_sec))
 
-        # Preserve existing chart metadata if available
+        frames.sort(key=lambda f: f.time_sec)
+
+        # Preserve existing chart metadata
         if self.chart is not None:
             chart_title = self.chart.title if title == "generated" else title
             chart_artist = self.chart.artist if artist is None else artist
@@ -1036,6 +1116,8 @@ class compiler:
             level_query=level_query if level_query is not None else 0.0,
             frames=frames,
         )
+
+        print(f"[parse_from_tensor] level {level_idx}: {len(frames)} frames decoded")
         return self
 
     # ── note-to-text reconstruction ───────────────────────────────────────
@@ -1063,7 +1145,6 @@ class compiler:
         (SlideShape.Wifi, None): "w",
     }
 
-    @staticmethod
     @staticmethod
     def _beats_to_divider_mult(beats: float) -> tuple[int, int] | None:
         """Approximate a beat count as (divider, mult) with mult/divider ≈ beats.
@@ -1288,19 +1369,24 @@ def main():
 
     charts_dir = Path(__file__).resolve().parent.parent / "charts"
     tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
+    flow_a_dir = tmp_dir / "txt2txt"
+    flow_b_dir = tmp_dir / "txt2ternsor2txt"
     found = errors = 0
     diffs = 0
     overall: dict[str, dict[str, int]] = {}
+    diff_files: list[str] = []
     for chart_dir, _dirs, files in charts_dir.walk():
         if "maidata.txt" not in files:
             continue
         rel = chart_dir.relative_to(charts_dir)
-        out_path = tmp_dir / rel / "maidata.txt"
+        path_a = flow_a_dir / rel / "maidata.txt"
+        path_b = flow_b_dir / rel / "maidata.txt"
         try:
             text = (chart_dir / "maidata.txt").read_text(encoding="utf-8")
             parser = compiler(hop_length=512, sample_rate=44100)
             extremes = parser.eval(text)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
+            path_a.parent.mkdir(parents=True, exist_ok=True)
+            path_b.parent.mkdir(parents=True, exist_ok=True)
             found += 1
             for key, slot in extremes.items():
                 cur = overall.get(key)
@@ -1312,10 +1398,13 @@ def main():
                     if slot["max"] > cur["max"]:
                         cur["max"] = slot["max"]
 
-            # ── parse vs parse_from_tensor 全 level 对比 ──
+            # ── flow (a): parse → generate ──
             title = parser.chart.title
             artist = parser.chart.artist
             text_a = parser.generate()
+            path_a.write_text(text_a, encoding="utf-8")
+
+            # ── flow (b): parse → tensor → parse_from_tensor → generate ──
             tensors: dict[int, tuple[torch.Tensor, float]] = {}
             for li in range(7):
                 lv = parser.chart.all_levels[li]
@@ -1326,40 +1415,12 @@ def main():
             for li, (t, lq) in tensors.items():
                 parser.parse_from_tensor(t, level_idx=li, title=title, artist=artist, level_query=lq)
             text_b = parser.generate()
-            out_path.write_text(text_b, encoding="utf-8")
+            path_b.write_text(text_b, encoding="utf-8")
 
-            # 过滤仅逗号数量不同的行
-            a_lines = text_a.splitlines()
-            b_lines = text_b.splitlines()
-            max_len = max(len(a_lines), len(b_lines))
-            a_lines += [''] * (max_len - len(a_lines))
-            b_lines += [''] * (max_len - len(b_lines))
-            filtered_a: list[str] = []
-            filtered_b: list[str] = []
-            has_real_diff = False
-            for la, lb in zip(a_lines, b_lines):
-                if la == lb:
-                    filtered_a.append(la)
-                    filtered_b.append(lb)
-                elif la.rstrip(',') == lb.rstrip(','):
-                    filtered_a.append(la)
-                    filtered_b.append(lb)
-                else:
-                    has_real_diff = True
-                    filtered_a.append(la)
-                    filtered_b.append(lb)
-
-            if has_real_diff:
+            # 对比
+            if text_a != text_b:
                 diffs += 1
-                print(f"\n[DIFF] {rel}")
-                diff = difflib.unified_diff(
-                    [l + '\n' for l in filtered_a],
-                    [l + '\n' for l in filtered_b],
-                    fromfile="parse → generate",
-                    tofile="parse → tensor → parse_from_tensor → generate",
-                )
-                for line in diff:
-                    print("  " + line.rstrip())
+                diff_files.append(str(rel))
 
         except Exception as e:
             import traceback
@@ -1367,7 +1428,15 @@ def main():
             print(f"[ERR] {rel}: {e}")
             traceback.print_exc()
 
+    # 写出 diff 文件列表供子代理分析
+    diff_list_path = Path(__file__).resolve().parent.parent / ".openclaw" / "tmp" / "diff_files.txt"
+    diff_list_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_list_path.write_text("\n".join(diff_files), encoding="utf-8")
+
     print(f"\nDone: {found} parsed, {errors} errors, {diffs} diffs")
+    print(f"Diff file list: {diff_list_path}")
+    print(f"Flow A dir: {flow_a_dir}")
+    print(f"Flow B dir: {flow_b_dir}")
     print(f"Overall extremes per field: {overall}")
 
 
