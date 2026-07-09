@@ -32,7 +32,7 @@ def process_one(chart_dir: Path, rel_path: str) -> Path:
     if sr != 22050:
         waveform = torchaudio.functional.resample(waveform, sr, 22050)
     mel = transform(waveform)
-    log_mel = torch.log(mel + 1e-6).squeeze(0).T.numpy()
+    log_mel = torch.log(mel + 1e-6).squeeze(0).numpy()
     print(f"    ┌形状: {log_mel.shape}=(n_mels`梅尔频带数`, T`时间`)")
     np.save(out, log_mel)
     return out
