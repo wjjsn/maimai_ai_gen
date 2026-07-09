@@ -89,8 +89,8 @@ class SlideSegment:
     shape: SlideShape
     start_lane: TapType
     end_lane: TapType
-    wait_duration: int  # 等待时间帧数，默认一拍
-    trace_duration: int  # 持续时间帧数
+    wait_duration: float = 0.0  # 等待时间（秒），默认一拍
+    trace_duration: float = 0.0  # 持续时间（秒）
 
     isClockwise: bool | None = None  # > 顺时针 / < 逆时针 / ^ 自动判断选最短，不需要这个字段
     middle_lane: TapType | None = None  # GrandV的拐点。1V35  →  起点=1, 拐点=3, 终点=5
@@ -105,13 +105,13 @@ class SlideSegment:
 class Touch_data:
     Touch_area: TouchType
     isFirework: bool = False  # 烟花
-    holdTime: int | None = None  # 持续时间帧数，TouchHold 才有
+    holdTime: float = 0.0  # 持续时间（秒），TouchHold 才有
 
 
 @dataclass
 class Hold_data:
     lane: TapType
-    holdTime: int  # 持续时间帧数
+    holdTime: float = 0.0  # 持续时间（秒）
 
 
 @dataclass
@@ -126,9 +126,8 @@ class Note:
 @dataclass
 class Frame:
     """一个时间帧，包含该时间点的所有音符。"""
-    frame_idx: int
     notes: tuple[Note, ...] = ()
-    time_sec: float = 0.0  # 精确时间（秒），用于生成器对齐
+    time_sec: float = 0.0  # 精确时间（秒）
 
 
 @dataclass
@@ -197,13 +196,6 @@ def _touch_area(s: str) -> TouchType:
     return _TOUCH_MAP.get(s, TouchType.C)
 
 
-def _seconds_to_frames(seconds: float, time_per_frame: float) -> int:
-    """Convert seconds to frame count."""
-    if time_per_frame <= 0:
-        return 0
-    return max(1, int(round(seconds / time_per_frame)))
-
-
 def _length_to_seconds(length_str: str, bpm: float) -> float:
     """
     Parse a simai length specifier like '4:3', '#5.678', '150#2:1', '3##1.5', '3##8:3', '3##160#8:3'
@@ -248,21 +240,19 @@ def _length_to_seconds(length_str: str, bpm: float) -> float:
     return wait_seconds
 
 
-def _touch_hold_length(token: str, bpm: float, time_per_frame: float) -> int | None:
-    """Extract hold length (frames) from a touch-hold token. Returns None for pseudo-hold."""
+def _touch_hold_length(token: str, bpm: float) -> float | None:
+    """Extract hold length (seconds) from a touch-hold token. Returns None for pseudo-hold."""
     m = re.search(r"\[([^\]]+)\]", token)
     if not m:
         return None  # pseudo-hold
-    secs = _length_to_seconds(m.group(1), bpm)
-    return _seconds_to_frames(secs, time_per_frame)
+    return _length_to_seconds(m.group(1), bpm)
 
 
 # ── compiler ──────────────────────────────────────────────────────────────
 
 class compiler:
-    def __init__(self, hop_length, sample_rate):
+    def __init__(self, hop_length=512, sample_rate=44100):
         self.chart = Chart(all_levels=[])
-        self.time_pre_frame = hop_length / sample_rate
         self.current_time = 0.0  # seconds
 
     # ── note parsing ──────────────────────────────────────────────────────
@@ -328,20 +318,21 @@ class compiler:
         is_ex = "x" in token
         m = re.search(r"\[([^\]]+)\]", token)
         if m:
-            secs = _length_to_seconds(m.group(1), bpm)
-            hold_frames = _seconds_to_frames(secs, self.time_pre_frame)
-        else:
-            # pseudo-hold: treated as [1280:1]
-            hold_frames = _seconds_to_frames(
-                240.0 / bpm / 1280.0 if bpm > 0 else 0.0,
-                self.time_pre_frame,
+            hold_sec = _length_to_seconds(m.group(1), bpm)
+            return Note(
+                type=NoteType.HOLD,
+                data=Hold_data(lane=lane, holdTime=hold_sec),
+                isBreak=is_break,
+                isEx=is_ex,
             )
-        return Note(
-            type=NoteType.HOLD,
-            data=Hold_data(lane=lane, holdTime=hold_frames),
-            isBreak=is_break,
-            isEx=is_ex,
-        )
+        else:
+            # pseudo-hold (no bracket): treat as TAP
+            return Note(
+                type=NoteType.TAP,
+                data=lane,
+                isBreak=is_break,
+                isEx=is_ex,
+            )
 
     def _parse_touch(self, token: str, bpm: float) -> Note:
         has_h = "h" in token
@@ -355,17 +346,20 @@ class compiler:
         area = _touch_area(area_str)
 
         if has_h:
-            # TOUCH_HOLD
             m = re.search(r"\[([^\]]+)\]", token)
             if m:
-                secs = _length_to_seconds(m.group(1), bpm)
-                hold_frames = _seconds_to_frames(secs, self.time_pre_frame)
+                # TOUCH_HOLD with bracket
+                hold_sec = _length_to_seconds(m.group(1), bpm)
+                return Note(
+                    type=NoteType.TOUCH_HOLD,
+                    data=Touch_data(Touch_area=area, isFirework=has_f, holdTime=hold_sec),
+                )
             else:
-                hold_frames = None  # pseudo-hold
-            return Note(
-                type=NoteType.TOUCH_HOLD,
-                data=Touch_data(Touch_area=area, isFirework=has_f, holdTime=hold_frames),
-            )
+                # pseudo-touch-hold (no bracket): treat as TOUCH
+                return Note(
+                    type=NoteType.TOUCH,
+                    data=Touch_data(Touch_area=area, isFirework=has_f),
+                )
         else:
             return Note(
                 type=NoteType.TOUCH,
@@ -503,20 +497,20 @@ class compiler:
                 i += 1
 
             # optional [wait##trace] for this segment
-            wait_frames = _seconds_to_frames(240.0 / bpm, self.time_pre_frame) if bpm > 0 else 0
-            trace_frames = 0
+            wait_sec = 240.0 / bpm if bpm > 0 else 0.0
+            trace_sec = 0.0
             if i < n and t[i] == "[":
                 j = t.index("]", i)
                 bracket_content = t[i + 1 : j]
-                wait_frames, trace_frames = self._parse_slide_bracket(bracket_content, bpm)
+                wait_sec, trace_sec = self._parse_slide_bracket(bracket_content, bpm)
                 i = j + 1
 
             seg = SlideSegment(
                 shape=shape,
                 start_lane=cur_start,
                 end_lane=end_lane,
-                wait_duration=wait_frames,
-                trace_duration=trace_frames,
+                wait_duration=wait_sec,
+                trace_duration=trace_sec,
                 isClockwise=is_cw,
                 middle_lane=middle_lane,
                 isForceStar=is_force_star,
@@ -550,12 +544,12 @@ class compiler:
             return 2
         return 1
 
-    def _parse_slide_bracket(self, content: str, bpm: float) -> tuple[int, int]:
+    def _parse_slide_bracket(self, content: str, bpm: float) -> tuple[float, float]:
         """
-        Parse slide bracket content into (wait_frames, trace_frames).
+        Parse slide bracket content into (wait_seconds, trace_seconds).
 
         Formats:
-          [8:3]               -> wait=1 beat @ bpm, trace = (240/bpm/8)*3 frames
+          [8:3]               -> wait=1 beat @ bpm, trace = (240/bpm/8)*3
           [160#8:3]           -> wait=1 beat @ 160, trace = (240/160/8)*3
           [160#2]             -> wait=1 beat @ 160, trace = 2 seconds
           [3##1.5]            -> wait=3 sec, trace=1.5 sec
@@ -566,43 +560,34 @@ class compiler:
             parts = content.split("##", 1)
             wait_sec = float(parts[0]) if parts[0] else 0.0
             trace_rest = parts[1]
-            wait_frames = _seconds_to_frames(wait_sec, self.time_pre_frame)
         else:
             # no explicit wait: 1 beat at current or specified BPM
             if "#" in content and ":" not in content and content.count("#") == 1:
                 # format: BPM#seconds  e.g. 160#2
                 bp_s, sec_s = content.split("#", 1)
                 trace_bpm = float(bp_s)
-                trace_sec = float(sec_s)
-                wait_frames = _seconds_to_frames(240.0 / trace_bpm, self.time_pre_frame)
-                return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+                return 240.0 / trace_bpm, float(sec_s)
 
             if "#" in content:
                 # BPM#divider:mult
                 bp_s, rest = content.split("#", 1)
                 trace_bpm = float(bp_s)
-                wait_frames = _seconds_to_frames(240.0 / trace_bpm, self.time_pre_frame)
-                trace_sec = _length_to_seconds(rest, trace_bpm)
-                return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+                return 240.0 / trace_bpm, _length_to_seconds(rest, trace_bpm)
 
             # plain divider:mult  -> wait = 1 beat at bpm
-            wait_frames = _seconds_to_frames(240.0 / bpm, self.time_pre_frame) if bpm > 0 else 0
-            trace_sec = _length_to_seconds(content, bpm)
-            return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+            wait_sec = 240.0 / bpm if bpm > 0 else 0.0
+            return wait_sec, _length_to_seconds(content, bpm)
 
         # trace_rest: can be '#seconds', 'BPM#divider:mult', or 'divider:mult'
         if trace_rest.startswith("#"):
-            trace_sec = float(trace_rest[1:])
-            return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+            return wait_sec, float(trace_rest[1:])
 
         if "#" in trace_rest:
             bp_s, rest = trace_rest.split("#", 1)
             trace_bpm = float(bp_s)
-            trace_sec = _length_to_seconds(rest, trace_bpm)
-            return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+            return wait_sec, _length_to_seconds(rest, trace_bpm)
 
-        trace_sec = _length_to_seconds(trace_rest, bpm)
-        return wait_frames, _seconds_to_frames(trace_sec, self.time_pre_frame)
+        return wait_sec, _length_to_seconds(trace_rest, bpm)
 
     # ── BPM / length divider tracking ─────────────────────────────────────
 
@@ -674,8 +659,7 @@ class compiler:
             current_length_divider = 0.0
             current_per_comma_length = 1.0
             self.current_time = 0.0
-            frames_by_idx: dict[int, list[Note]] = {}
-            frame_time_by_idx: dict[int, float] = {}
+            frames_by_time: dict[float, list[Note]] = {}
 
             for raw_note in chart_content_strip:
                 # strip comments (|| to end of line)
@@ -707,18 +691,15 @@ class compiler:
                     self.current_time += current_per_comma_length
                     continue
 
-                frame_idx = int(round(self.current_time / self.time_pre_frame))
-                frames_by_idx.setdefault(frame_idx, []).extend(notes)
-                frame_time_by_idx.setdefault(frame_idx, self.current_time)
+                frames_by_time.setdefault(self.current_time, []).extend(notes)
                 self.current_time += current_per_comma_length
 
             frames = [
                 Frame(
-                    frame_idx=frame_idx,
-                    notes=tuple(frames_by_idx[frame_idx]),
-                    time_sec=frame_time_by_idx[frame_idx],
+                    notes=tuple(notes),
+                    time_sec=t,
                 )
-                for frame_idx in sorted(frames_by_idx)
+                for t, notes in sorted(frames_by_time.items())
             ]
             level_name = f"level_{level + 1}"
             level_query_match = re.search(rf"&lv_{level}=([0-9.]+)", text)
@@ -760,26 +741,27 @@ class compiler:
         for level in chart.all_levels:
             if level is None:
                 continue
-            prev_idx: int | None = None
+            prev_time: float | None = None
             for frame in level.frames:
                 for note in frame.notes:
                     self._eval_collect_note(note, extremes)
-                if prev_idx is not None:
-                    self._update_extremes(extremes, "frame_gap", frame.frame_idx - prev_idx)
-                prev_idx = frame.frame_idx
+                if prev_time is not None:
+                    gap_ms = int(round((frame.time_sec - prev_time) * 1000))
+                    self._update_extremes(extremes, "frame_gap_ms", gap_ms)
+                prev_time = frame.time_sec
         return extremes
 
     # ── tensor export ─────────────────────────────────────────────────────
 
     # Slot layout (13 columns):
-    #   0  Δt            (int)  relative time in frames
+    #   0  Δt            (int)  relative time in milliseconds
     #   1  NoteType      (int)  NoteType enum value
     #   2  Lane          (int)  TapType enum value for TAP/HOLD/SLIDE start
     #   3  TouchType     (int)  TouchType enum value; 0 if not touch
-    #   4  holdTime      (int)  HOLD / TOUCH_HOLD duration in frames; 0 otherwise
+    #   4  holdTime      (int)  HOLD / TOUCH_HOLD duration in ms; 0 otherwise
     #   5  SlideShape    (int)  SlideShape enum value; 0 if not slide
-    #   6  wait_duration (int)  slide segment wait in frames; 0 otherwise
-    #   7  trace_duration (int) slide segment trace in frames; 0 otherwise
+    #   6  wait_duration (int)  slide segment wait in ms; 0 otherwise
+    #   7  trace_duration (int) slide segment trace in ms; 0 otherwise
     #   8  start_lane    (int)  TapType enum value; 0 if not slide
     #   9  end_lane      (int)  TapType enum value; 0 if not slide
     #   10 middle_lane   (int)  TapType enum value; 0 if not GrandV
@@ -824,43 +806,46 @@ class compiler:
             v |= 1 << 2
         return v
 
-    def _note_to_slots(self, note, delta_t: int) -> list[list[int]]:
+    def _note_to_slots(self, note, delta_ms: int) -> list[list[int]]:
         """Convert a Note into one or more slot rows. Slides expand per segment."""
         n_type = note.type.value
         modifiers = self._pack_modifiers(note)
 
         if note.type == NoteType.TAP:
-            return [[delta_t, n_type, note.data.value, 0, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+            return [[delta_ms, n_type, note.data.value, 0, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
 
         if note.type == NoteType.HOLD:
+            hold_ms = int(round(note.data.holdTime * 1000))
             return [[
-                delta_t, n_type,
+                delta_ms, n_type,
                 note.data.lane.value,
-                0, note.data.holdTime,
+                0, hold_ms,
                 0, 0, 0, 0, 0, 0, 0, modifiers,
             ]]
 
         if note.type == NoteType.TOUCH:
-            return [[delta_t, n_type, 0, note.data.Touch_area.value, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
+            return [[delta_ms, n_type, 0, note.data.Touch_area.value, 0, 0, 0, 0, 0, 0, 0, 0, modifiers]]
 
         if note.type == NoteType.TOUCH_HOLD:
-            ht = note.data.holdTime if note.data.holdTime is not None else 0
+            hold_ms = int(round(note.data.holdTime * 1000)) if note.data.holdTime > 0 else 0
             return [[
-                delta_t, n_type,
+                delta_ms, n_type,
                 0, note.data.Touch_area.value,
-                ht, 0, 0, 0, 0, 0, 0, 0, modifiers,
+                hold_ms, 0, 0, 0, 0, 0, 0, 0, modifiers,
             ]]
 
         if note.type == NoteType.SLIDE:
             rows: list[list[int]] = []
             for i, seg in enumerate(note.data):
-                d = delta_t if i == 0 else 0
+                d = delta_ms if i == 0 else 0
+                wait_ms = int(round(seg.wait_duration * 1000))
+                trace_ms = int(round(seg.trace_duration * 1000))
                 rows.append([
                     d, n_type,
                     seg.start_lane.value,
                     0, 0,
                     seg.shape.value,
-                    seg.wait_duration, seg.trace_duration,
+                    wait_ms, trace_ms,
                     seg.start_lane.value, seg.end_lane.value,
                     seg.middle_lane.value if seg.middle_lane is not None else 0,
                     self._pack_slide_features(seg),
@@ -877,8 +862,8 @@ class compiler:
         level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
         Returns an empty [0, 13] tensor if the level is missing or has no notes.
         Δt encoding:
-          - First note in chart: frame index of its frame
-          - First note in each subsequent frame: frame_gap from previous frame
+          - First note in chart: absolute time in ms
+          - First note in each subsequent frame: time gap in ms from previous frame
           - Simultaneous notes (same frame, index > 0): 0
         """
         if not (0 <= level_idx < len(self.chart.all_levels)):
@@ -888,16 +873,17 @@ class compiler:
             return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
 
         rows: list[list[int]] = []
-        prev_idx: int | None = None
+        prev_time_ms: int | None = None
         for frame in level.frames:
-            frame_delta = frame.frame_idx if prev_idx is None else frame.frame_idx - prev_idx
+            time_ms = int(round(frame.time_sec * 1000))
+            delta_ms = time_ms if prev_time_ms is None else time_ms - prev_time_ms
             for i_note, note in enumerate(frame.notes):
                 # First note in frame carries the time gap; simultaneous
                 # notes (same frame) get Δt=0 so the decoder learns they
-                # are co-occurring rather than spread across frame_delta.
-                delta = frame_delta if i_note == 0 else 0
-                rows.extend(self._note_to_slots(note, delta))
-            prev_idx = frame.frame_idx
+                # are co-occurring rather than spread across delta_ms.
+                d = delta_ms if i_note == 0 else 0
+                rows.extend(self._note_to_slots(note, d))
+            prev_time_ms = time_ms
 
         if not rows:
             return torch.zeros((0, self._SLOT_DIMS), dtype=torch.int64)
@@ -937,17 +923,17 @@ class compiler:
             raise ValueError(f"level_idx {level_idx} out of range 0..6")
 
         rows = tensor.tolist()
-        frames_by_idx: dict[int, list[Note]] = {}
-        frame_time_by_idx: dict[int, float] = {}
+        frames_by_time: dict[float, list[Note]] = {}
 
-        current_frame_idx = 0
+        current_time_ms = 0
         i = 0
         n = len(rows)
 
         while i < n:
             row = rows[i]
             dt, note_type_val = row[0], row[1]
-            current_frame_idx += dt
+            current_time_ms += dt
+            current_time_sec = current_time_ms / 1000.0
             note_type = NoteType(note_type_val)
             modifiers = self._unpack_modifiers(row[12])
             is_firework = modifiers.pop("isFirework", False)
@@ -955,68 +941,81 @@ class compiler:
             if note_type == NoteType.TAP:
                 lane = TapType(row[2])
                 note = Note(note_type, lane, **modifiers)
-                frames_by_idx.setdefault(current_frame_idx, []).append(note)
-                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                frames_by_time.setdefault(current_time_sec, []).append(note)
                 i += 1
 
             elif note_type == NoteType.HOLD:
                 lane = TapType(row[2])
-                hold_time = row[4]
-                note = Note(note_type, Hold_data(lane, hold_time), **modifiers)
-                frames_by_idx.setdefault(current_frame_idx, []).append(note)
-                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                hold_sec = row[4] / 1000.0
+                note = Note(note_type, Hold_data(lane, hold_sec), **modifiers)
+                frames_by_time.setdefault(current_time_sec, []).append(note)
                 i += 1
 
             elif note_type == NoteType.TOUCH:
                 touch_area = TouchType(row[3])
                 note = Note(note_type, Touch_data(touch_area, isFirework=is_firework), **modifiers)
-                frames_by_idx.setdefault(current_frame_idx, []).append(note)
-                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                frames_by_time.setdefault(current_time_sec, []).append(note)
                 i += 1
 
             elif note_type == NoteType.TOUCH_HOLD:
                 touch_area = TouchType(row[3])
-                hold_time = row[4] if row[4] > 0 else None
-                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_time), **modifiers)
-                frames_by_idx.setdefault(current_frame_idx, []).append(note)
-                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
+                hold_sec = row[4] / 1000.0 if row[4] > 0 else 0.0
+                note = Note(note_type, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_sec), **modifiers)
+                frames_by_time.setdefault(current_time_sec, []).append(note)
                 i += 1
 
             elif note_type == NoteType.SLIDE:
-                r = rows[i]
-                sf = self._unpack_slide_features(r[11])
-                shape = SlideShape(r[5])
-                start_lane = TapType(r[8])
-                end_lane = TapType(r[9])
-                middle_lane = TapType(r[10]) if r[10] != 0 else None
-                seg = SlideSegment(
-                    shape=shape,
-                    start_lane=start_lane,
-                    end_lane=end_lane,
-                    wait_duration=r[6],
-                    trace_duration=r[7],
-                    isClockwise=sf["isClockwise"],
-                    middle_lane=middle_lane,
-                    isForceStar=sf["isForceStar"],
-                    isFakeRotate=sf["isFakeRotate"],
-                    isSlideBreak=sf["isSlideBreak"],
-                    isSlideNoHead=sf["isSlideNoHead"],
-                )
-                note = Note(note_type, [seg], **modifiers)
-                frames_by_idx.setdefault(current_frame_idx, []).append(note)
-                frame_time_by_idx.setdefault(current_frame_idx, current_frame_idx * self.time_pre_frame)
-                i += 1
+                # Collect consecutive SLIDE rows at same time, splitting on
+                # chaining (start==prev_end) vs multiple (start==first_start)
+                segs: list[SlideSegment] = []
+                first_start = TapType(rows[i][8])
+                prev_end: TapType | None = None
+                slide_start_i = i
+                while i < n:
+                    r = rows[i]
+                    if r[1] != NoteType.SLIDE.value:
+                        break
+                    if i > slide_start_i and r[0] != 0:
+                        break  # different time
+                    sf = self._unpack_slide_features(r[11])
+                    shape = SlideShape(r[5])
+                    start_lane = TapType(r[8])
+                    end_lane = TapType(r[9])
+                    middle_lane = TapType(r[10]) if r[10] != 0 else None
+                    wait_sec = r[6] / 1000.0
+                    trace_sec = r[7] / 1000.0
+                    # If start != prev_end and start == first_start,
+                    # this is a new slide, not a continuation
+                    if prev_end is not None and start_lane != prev_end and start_lane == first_start:
+                        break
+                    seg = SlideSegment(
+                        shape=shape,
+                        start_lane=start_lane,
+                        end_lane=end_lane,
+                        wait_duration=wait_sec,
+                        trace_duration=trace_sec,
+                        isClockwise=sf["isClockwise"],
+                        middle_lane=middle_lane,
+                        isForceStar=sf["isForceStar"],
+                        isFakeRotate=sf["isFakeRotate"],
+                        isSlideBreak=sf["isSlideBreak"],
+                        isSlideNoHead=sf["isSlideNoHead"],
+                    )
+                    segs.append(seg)
+                    prev_end = end_lane
+                    i += 1
+                note = Note(note_type, segs, **modifiers)
+                frames_by_time.setdefault(current_time_sec, []).append(note)
 
             else:
                 i += 1
 
         frames = [
             Frame(
-                frame_idx=idx,
-                notes=tuple(frames_by_idx[idx]),
-                time_sec=frame_time_by_idx[idx],
+                notes=tuple(notes),
+                time_sec=t,
             )
-            for idx in sorted(frames_by_idx)
+            for t, notes in sorted(frames_by_time.items())
         ]
 
         # Preserve existing chart metadata if available
@@ -1121,9 +1120,8 @@ class compiler:
             if note.isEx:
                 s += "x"
             s += "h"
-            hold_frames = note.data.holdTime
-            if hold_frames and hold_frames > 0:
-                hold_sec = hold_frames * self.time_pre_frame
+            hold_sec = note.data.holdTime
+            if hold_sec > 0:
                 s += f"[{self._duration_to_notation(hold_sec, bpm)}]"
             return s
 
@@ -1137,9 +1135,8 @@ class compiler:
             s = note.data.Touch_area.name
             if note.data.isFirework:
                 s += "f"
-            hold_frames = note.data.holdTime
-            if hold_frames is not None and hold_frames > 0:
-                hold_sec = hold_frames * self.time_pre_frame
+            hold_sec = note.data.holdTime
+            if hold_sec > 0:
                 s += f"h[{self._duration_to_notation(hold_sec, bpm)}]"
             else:
                 s += "h"
@@ -1197,8 +1194,8 @@ class compiler:
 
             # duration bracket (only if trace > 0)
             if seg.trace_duration > 0:
-                trace_sec = seg.trace_duration * self.time_pre_frame
-                wait_sec = seg.wait_duration * self.time_pre_frame
+                trace_sec = seg.trace_duration
+                wait_sec = seg.wait_duration
                 default_wait = 240.0 / bpm  # 1 beat at generation BPM
                 if abs(wait_sec - default_wait) < 0.005:
                     # wait = 1 beat at gen BPM, use simple [D:M] notation
@@ -1239,7 +1236,7 @@ class compiler:
 
         gen_bpm = 12000.0
         gen_divider = 1.0
-        per_comma_frames = (240.0 / gen_bpm / gen_divider) / self.time_pre_frame
+        per_comma_time = 240.0 / gen_bpm / gen_divider  # 0.02 seconds
 
         for level_idx, level in enumerate(self.chart.all_levels):
             if level is None:
@@ -1256,15 +1253,15 @@ class compiler:
             commas_emitted = 0
             first_note = True
 
-            for frame in sorted(level.frames, key=lambda f: f.frame_idx):
+            for frame in sorted(level.frames, key=lambda f: f.time_sec):
                 if not frame.notes:
                     continue
 
                 # reconstruct note text from parsed Note objects
                 combined = "/".join(self._note_to_text(n, gen_bpm) for n in frame.notes)
 
-                # derive comma count from frame_idx via per_comma_frames
-                target_commas = max(0, int(round(frame.frame_idx / per_comma_frames)))
+                # derive comma count from time_sec
+                target_commas = max(0, int(round(frame.time_sec / per_comma_time)))
                 gap_commas = max(0, target_commas - commas_emitted)
 
                 if first_note:
