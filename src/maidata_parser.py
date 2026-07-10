@@ -880,59 +880,233 @@ class compiler:
 
     # ── tensor export (token vocabulary) ──────────────────────────────────
 
-    def to_tensor(self, level_idx: int = 4) -> torch.Tensor:
-        """Export a single level to a 1-D int64 token tensor.
+    @staticmethod
+    def _note_end_sec(frame_time: float, note: "Note") -> float:
+        """Absolute end-time of a single note.
 
-        Token encoding follows doc/token化设计.md:
-          <FRAME_START> TS_xxx <note1> <note2> ... <FRAME_END>
+        For TAP: same as frame_time.
+        For HOLD / TOUCH_HOLD: frame_time + holdTime.
+        For SLIDE: frame_time + max(wait + trace) across segments.
+        """
+        t = note.type
+        if t == NoteType.HOLD:
+            return frame_time + (note.data.holdTime or 0.0)
+        elif t == NoteType.TOUCH_HOLD:
+            return frame_time + (note.data.holdTime or 0.0)
+        elif t == NoteType.SLIDE:
+            end = frame_time
+            for seg in note.data:
+                candidate = frame_time + seg.wait_duration + seg.trace_duration
+                if candidate > end:
+                    end = candidate
+            return end
+        return frame_time
 
-        level_idx: 0..6 → lv_1..lv_7 (default 4 = lv_5 = MASTER).
-        Returns an empty 1-D int64 tensor if the level is missing.
+    def to_tensor(self, level_idx: int = 4) -> tuple[list[float], list[torch.Tensor]]:
+        """Export a single level to segmented token sequences.
+
+        Follows doc/token化设计.md §6:
+          - Segments at token granularity: split only after a token has fully
+            ended (hold/slide finish time), never mid-token.
+          - Each segment ≤ 30 seconds.
+          - Must track the **global** active-note latest end (e.g. a HOLD
+            spanning many frames), not just the current frame's end.
+          - TS tokens within a segment are relative (segment_offset subtracted).
+          - Frames without notes are skipped.
+
+        Returns:
+            (offsets, tensors) where len(offsets) == len(tensors).
+            offsets[i] = absolute time (seconds) of segment i's start.
+            tensors[i] = 1-D int64 token sequence for segment i.
+            Empty ([], []) if the level is missing.
         """
         if not (0 <= level_idx < len(self.chart.all_levels)):
             raise ValueError(f"level_idx {level_idx} out of range")
         level = self.chart.all_levels[level_idx]
         if level is None:
-            return torch.zeros((0,), dtype=torch.int64)
+            return ([], [])
 
-        tokens: list[int] = []
+        # ── build token groups with float timestamps ──
+        # Each group: (note_tokens, frame_time, frame_end_time)
+        groups: list[tuple[list[int], float, float]] = []
+
         for frame in level.frames:
-            tokens.append(FRAME_START)
-            tokens.append(self._ts_token(frame.time_sec))
+            if not frame.notes:
+                continue
+            toks: list[int] = []
+            frame_end = frame.time_sec
             for note in frame.notes:
-                tokens.extend(self._encode_note_tokens(note))
-            tokens.append(FRAME_END)
+                toks.extend(self._encode_note_tokens(note))
+                note_end = self._note_end_sec(frame.time_sec, note)
+                if note_end > frame_end:
+                    frame_end = note_end
+            groups.append((toks, frame.time_sec, frame_end))
 
-        if not tokens:
-            return torch.zeros((0,), dtype=torch.int64)
-        return torch.tensor(tokens, dtype=torch.int64)
+        if not groups:
+            return ([], [])
+
+        # ── dynamic segmentation (§6.2) ──
+        # 硬约束：每段 ≤ 30 秒（TS_0~TS_2999 @ 100fps = 30s）。
+        # 不按固定 30 秒硬切，在 token 边界处切割，不破坏任何音符。
+        # 关键：seg_max_end 跟踪当前段内**所有**活跃音符的最晚结束时间
+        #（例如一个 HOLD 跨越多个帧，期间有其他音符），不能只看当前帧的 end。
+        # 先判断再加入，确保每段 ≤ 30s。
+        seg_offset = groups[0][1]
+        seg_max_end = groups[0][2]
+        current_seg: list[tuple[list[int], float]] = []
+        all_segs: list[tuple[float, list[tuple[list[int], float]]]] = []
+
+        for note_toks, start, end in groups:
+            # 先判断：加入这个 group 后，全局最晚 end 是否超过 30s？
+            candidate_max = max(seg_max_end, end)
+            if current_seg and (candidate_max - seg_offset > 30.0):
+                # 超过了，先 flush 当前段（当前 group 不加入）
+                all_segs.append((seg_offset, current_seg))
+                # 新段从当前帧的 start 开始，保证相对时间 ≥ 0
+                seg_offset = start
+                seg_max_end = end
+                current_seg = [(note_toks, start)]
+            else:
+                seg_max_end = candidate_max
+                current_seg.append((note_toks, start))
+
+        if current_seg:
+            all_segs.append((seg_offset, current_seg))
+
+        if not all_segs:
+            return ([], [])
+
+        # ── build final token lists with relative TS (§6.1) ──
+        offsets: list[float] = []
+        tensors: list[torch.Tensor] = []
+        for abs_offset, seg in all_segs:
+            tokens: list[int] = [SOS]
+            for note_toks, frame_time in seg:
+                tokens.append(FRAME_START)
+                tokens.append(self._ts_token(frame_time - abs_offset))
+                tokens.extend(note_toks)
+                tokens.append(FRAME_END)
+            tokens.append(EOS)
+            offsets.append(abs_offset)
+            tensors.append(torch.tensor(tokens, dtype=torch.int64))
+
+        return (offsets, tensors)
+
+    # ── §6 Data Loader utilities ───────────────────────────────────────────
+
+    @staticmethod
+    def fit_tokens(token_list: list[int], max_len: int) -> torch.Tensor:
+        """Pad or truncate a token list to exactly max_len.
+
+        §6.4: 由于每段的 token 数量不等，需要填充到统一长度。
+        模型通过 attention mask 忽略 PAD 位置。
+        """
+        if len(token_list) >= max_len:
+            return torch.tensor(token_list[:max_len], dtype=torch.int64)
+        padded = token_list + [PAD] * (max_len - len(token_list))
+        return torch.tensor(padded, dtype=torch.int64)
+
+    def extract_time_slots(self, tokens: list[int]) -> list[float]:
+        """Extract relative time (seconds) for each token in a segment.
+
+        §6.5: 每个 token 的时间位置 = segment_offset + token_relative_time。
+        返回的 list 与 tokens 等长，非 TS 位置返回前一个 TS 的值。
+        """
+        slots: list[float] = []
+        current_time = 0.0
+        for tok in tokens:
+            if TS_BASE <= tok < TS_BASE + 3000:
+                current_time = (tok - TS_BASE) / 100.0
+            slots.append(current_time)
+        return slots
+
+    def to_training_data(
+        self,
+        level_idx: int = 4,
+        max_tokens: int = 0,
+    ) -> tuple[list[float], torch.Tensor, torch.Tensor]:
+        """Export a level ready for the Data Loader.
+
+        §6.3 Data Loader 工作流程:
+          1. 按动态分段策略将 token 序列切成 N 段
+          2. 每段记录 segment_offset + tokens
+          3. 填充到统一长度
+          4. 生成 attention mask
+
+        Returns:
+            offsets: list[float]  — 每段的绝对起始时间（秒）
+            padded: (N, max_tokens) int64  — 填充后的 token 张量
+            mask:   (N, max_tokens) bool   — True = 有效 token，False = PAD
+        """
+        offsets, tensors = self.to_tensor(level_idx)
+        if not offsets:
+            return ([], torch.empty(0, dtype=torch.int64), torch.empty(0, dtype=torch.bool))
+
+        token_lists = [t.tolist() for t in tensors]
+
+        if max_tokens <= 0:
+            max_tokens = max(len(tl) for tl in token_lists)
+
+        padded_rows = []
+        mask_rows = []
+        for tl in token_lists:
+            length = min(len(tl), max_tokens)
+            padded_rows.append(self.fit_tokens(tl, max_tokens))
+            mask_rows.append(
+                torch.cat([torch.ones(length, dtype=torch.bool),
+                           torch.zeros(max_tokens - length, dtype=torch.bool)])
+            )
+
+        padded = torch.stack(padded_rows)
+        mask = torch.stack(mask_rows)
+        return (offsets, padded, mask)
+
+    def get_audio_slice(
+        self,
+        mel: torch.Tensor,
+        segment_offset: float,
+        segment_duration: float,
+        sample_rate: int = 22050,
+        hop_length: int = 256,
+        n_mels: int = 80,
+    ) -> torch.Tensor:
+        """Slice mel spectrogram for a segment's time window.
+
+        §6.5: 用 segment_offset 和 segment_duration 从 mel 中切出对应帧。
+
+        Args:
+            mel: (n_mels, T_total) 完整音频的 mel spectrogram
+            segment_offset: 段的绝对起始时间（秒）
+            segment_duration: 段的持续时间（秒）
+            sample_rate: 音频采样率
+            hop_length: mel 的 hop length
+            n_mels: mel 频带数
+
+        Returns:
+            (n_mels, T_segment) 切片后的 mel
+        """
+        frames_per_sec = sample_rate / hop_length
+        start_frame = int(segment_offset * frames_per_sec)
+        end_frame = int((segment_offset + segment_duration) * frames_per_sec)
+        start_frame = max(0, min(start_frame, mel.shape[1]))
+        end_frame = max(start_frame, min(end_frame, mel.shape[1]))
+        return mel[:, start_frame:end_frame]
 
     # ── tensor import (token vocabulary) ────────────────────────────────────
 
-    def parse_from_tensor(
-        self,
-        tensor: torch.Tensor,
-        level_idx: int = 4,
-        title: str = "generated",
-        artist: str | None = None,
-        level_query: float | None = None,
-    ) -> "compiler":
-        """Import a 1-D token tensor into the compiler's chart at level_idx.
+    def _parse_token_segment(self, tok: list[int]) -> list[Frame]:
+        """Parse a flat token list (one segment) into Frame objects.
 
-        Inverse of to_tensor().  Returns self for chaining.
+        Returns a list of Frame with relative time_sec (caller adds offset).
         """
-        if tensor.ndim != 1:
-            raise ValueError(f"Expected 1-D tensor, got shape {tensor.shape}")
-        if not (0 <= level_idx < 7):
-            raise ValueError(f"level_idx {level_idx} out of range 0..6")
-
-        tok = tensor.tolist()
         frames: list[Frame] = []
         i = 0
         n = len(tok)
+        skipped_tokens: list[tuple[int, int]] = []  # (pos, token_id)
 
         while i < n:
             if tok[i] != FRAME_START:
+                skipped_tokens.append((i, tok[i]))
                 i += 1
                 continue
             i += 1
@@ -942,6 +1116,8 @@ class compiler:
                 time_sec = (tok[i] - TS_BASE) / 100.0
                 i += 1
             else:
+                if i < n:
+                    print(f"[parse] WARNING: expected TS token at pos {i}, got {tok[i]} (0x{tok[i]:04x})")
                 time_sec = 0.0
 
             # ── notes until FRAME_END ──
@@ -951,9 +1127,14 @@ class compiler:
 
                 if t == NOTE_TAP:
                     i += 1
-                    lane_tok = tok[i] if i < n else LANE_BASE
-                    lane = TapType(lane_tok - LANE_BASE + 1) if LANE_BASE <= lane_tok < LANE_BASE + 8 else TapType.LANE1
-                    i += 1
+                    if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
+                        lane = TapType(tok[i] - LANE_BASE + 1)
+                        i += 1
+                    else:
+                        lane_tok = tok[i] if i < n else -1
+                        print(f"[parse] WARNING: TAP at pos {i-1} missing valid LANE, got {lane_tok}, fallback LANE1")
+                        lane = TapType.LANE1
+                        i += 1 if i < n else 0
                     is_break = False
                     is_ex = False
                     while i < n and tok[i] in (IS_BREAK, IS_EX):
@@ -966,9 +1147,14 @@ class compiler:
 
                 elif t == NOTE_HOLD:
                     i += 1
-                    lane_tok = tok[i] if i < n else LANE_BASE
-                    lane = TapType(lane_tok - LANE_BASE + 1) if LANE_BASE <= lane_tok < LANE_BASE + 8 else TapType.LANE1
-                    i += 1
+                    if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
+                        lane = TapType(tok[i] - LANE_BASE + 1)
+                        i += 1
+                    else:
+                        lane_tok = tok[i] if i < n else -1
+                        print(f"[parse] WARNING: HOLD at pos {i-1} missing valid LANE, got {lane_tok}, fallback LANE1")
+                        lane = TapType.LANE1
+                        i += 1 if i < n else 0
                     hold_sec = 0.0
                     if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
                         hold_sec = (tok[i] - TS_BASE) / 100.0
@@ -985,9 +1171,14 @@ class compiler:
 
                 elif t == NOTE_TOUCH:
                     i += 1
-                    touch_tok = tok[i] if i < n else TOUCH_BASE
-                    touch_area = TouchType(touch_tok - TOUCH_BASE + 1) if TOUCH_BASE <= touch_tok < TOUCH_BASE + 33 else TouchType.A1
-                    i += 1
+                    if i < n and TOUCH_BASE <= tok[i] < TOUCH_BASE + 33:
+                        touch_area = TouchType(tok[i] - TOUCH_BASE + 1)
+                        i += 1
+                    else:
+                        touch_tok = tok[i] if i < n else -1
+                        print(f"[parse] WARNING: TOUCH at pos {i-1} missing valid TOUCH area, got {touch_tok}, fallback A1")
+                        touch_area = TouchType.A1
+                        i += 1 if i < n else 0
                     hold_sec = 0.0
                     if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
                         hold_sec = (tok[i] - TS_BASE) / 100.0
@@ -1015,16 +1206,28 @@ class compiler:
                     segments: list[SlideSegment] = []
                     while i < n and tok[i] == SEGMENT_START:
                         i += 1
-                        shape_tok = tok[i] if i < n else SLIDE_SHAPE_BASE
-                        shape = SlideShape(shape_tok - SLIDE_SHAPE_BASE + 1) if SLIDE_SHAPE_BASE <= shape_tok < SLIDE_SHAPE_BASE + 11 else SlideShape.Line
+                        if i < n and SLIDE_SHAPE_BASE <= tok[i] < SLIDE_SHAPE_BASE + 11:
+                            shape = SlideShape(tok[i] - SLIDE_SHAPE_BASE + 1)
+                        else:
+                            shape_tok = tok[i] if i < n else -1
+                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid SHAPE, got {shape_tok}, fallback Line")
+                            shape = SlideShape.Line
                         i += 1
 
-                        start_lane_tok = tok[i] if i < n else LANE_BASE
-                        start_lane = TapType(start_lane_tok - LANE_BASE + 1) if LANE_BASE <= start_lane_tok < LANE_BASE + 8 else TapType.LANE1
+                        if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
+                            start_lane = TapType(tok[i] - LANE_BASE + 1)
+                        else:
+                            start_tok = tok[i] if i < n else -1
+                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid start LANE, got {start_tok}, fallback LANE1")
+                            start_lane = TapType.LANE1
                         i += 1
 
-                        end_lane_tok = tok[i] if i < n else LANE_BASE
-                        end_lane = TapType(end_lane_tok - LANE_BASE + 1) if LANE_BASE <= end_lane_tok < LANE_BASE + 8 else TapType.LANE1
+                        if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
+                            end_lane = TapType(tok[i] - LANE_BASE + 1)
+                        else:
+                            end_tok = tok[i] if i < n else -1
+                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid end LANE, got {end_tok}, fallback LANE1")
+                            end_lane = TapType.LANE1
                         i += 1
 
                         # optional middle_lane for GrandV (non-TS, non-SEGMENT_END, non-attribute)
@@ -1087,16 +1290,108 @@ class compiler:
                     notes.append(Note(NoteType.SLIDE, segments, isBreak=note_break, isEx=note_ex))
 
                 else:
-                    i += 1  # skip unknown tokens
+                    print(f"[parse_token] 警告: 未知 token {tok[i]} (位置 {i})，跳过")
+                    i += 1
 
             # consume FRAME_END
             if i < n and tok[i] == FRAME_END:
                 i += 1
+            elif notes:
+                print(f"[parse_token] 警告: 帧结束于位置 {i}，但未找到 FRAME_END")
 
             if notes:
                 frames.append(Frame(notes=tuple(notes), time_sec=time_sec))
 
         frames.sort(key=lambda f: f.time_sec)
+        return frames
+
+    def parse_from_tensor(
+        self,
+        data: tuple[list[float], list[torch.Tensor]],
+        level_idx: int = 4,
+        title: str = "generated",
+        artist: str | None = None,
+        level_query: float | None = None,
+    ) -> "compiler":
+        """Import token data into the compiler's chart at level_idx.
+
+        Accepts:
+          - (offsets, tensors) tuple from to_tensor() (preferred, §6 format).
+          - 2-D tensor (num_segments, max_tokens): backward compat, offsets
+            inferred by accumulating last-frame relative times.
+
+        Inverse of to_tensor().  Returns self for chaining.
+        """
+        if isinstance(data, tuple):
+            offsets, tensors = data
+            if len(offsets) != len(tensors):
+                print(f"[parse_from_tensor] 警告: offsets 长度 ({len(offsets)}) != tensors 长度 ({len(tensors)})")
+            segment_rows = [t.tolist() for t in tensors]
+        elif isinstance(data, torch.Tensor):
+            if data.ndim == 2:
+                segment_rows = [data[i].tolist() for i in range(data.shape[0])]
+            elif data.ndim == 1:
+                segment_rows = [data.tolist()]
+            else:
+                raise ValueError(f"Expected 1-D or 2-D tensor, got shape {data.shape}")
+            offsets = None  # will be inferred
+        else:
+            raise TypeError(f"Expected tuple or Tensor, got {type(data)}")
+
+        if not (0 <= level_idx < 7):
+            raise ValueError(f"level_idx {level_idx} out of range 0..6")
+
+        all_frames: list[Frame] = []
+        inferred_offset = 0.0
+        skipped_empty = 0
+        skipped_bad_sos = 0
+
+        for seg_idx, seg_tok in enumerate(segment_rows):
+            # strip PAD tokens from the end
+            while seg_tok and seg_tok[-1] == PAD:
+                seg_tok.pop()
+            if not seg_tok:
+                skipped_empty += 1
+                continue
+
+            # 校验 SOS 开头
+            if seg_tok[0] != SOS:
+                print(f"[parse_from_tensor] 警告: 段 {seg_idx} 不以 SOS 开头 (实际={seg_tok[0]})")
+                skipped_bad_sos += 1
+
+            # use explicit offset if available, else infer
+            if offsets is not None:
+                abs_offset = offsets[seg_idx]
+                if abs_offset < 0:
+                    print(f"[parse_from_tensor] 警告: 段 {seg_idx} 偏移为负 ({abs_offset:.3f}s)")
+            else:
+                abs_offset = inferred_offset
+
+            rel_frames = self._parse_token_segment(seg_tok)
+            if not rel_frames:
+                print(f"[parse_from_tensor] 段 {seg_idx} (offset={abs_offset:.3f}s) 解码出 0 帧")
+
+            for f in rel_frames:
+                all_frames.append(Frame(
+                    notes=f.notes,
+                    time_sec=f.time_sec + abs_offset,
+                ))
+
+            # for inferred offsets: next segment starts after last frame
+            if offsets is None and rel_frames:
+                inferred_offset = abs_offset + rel_frames[-1].time_sec
+
+        all_frames.sort(key=lambda f: f.time_sec)
+
+        # 汇总日志
+        total_segs = len(segment_rows)
+        decoded_segs = total_segs - skipped_empty
+        print(
+            f"[parse_from_tensor] 完成: {len(all_frames)} 帧, "
+            f"{decoded_segs}/{total_segs} 段有效"
+            f"{f', 跳过 {skipped_empty} 空段' if skipped_empty else ''}"
+            f"{f', {skipped_bad_sos} 段缺 SOS' if skipped_bad_sos else ''}"
+        )
 
         # Preserve existing chart metadata
         if self.chart is not None:
@@ -1108,16 +1403,19 @@ class compiler:
 
         if self.chart is None or self.chart.all_levels == []:
             self.chart = Chart(all_levels=[None] * 7, title=chart_title, artist=chart_artist)
-        elif len(self.chart.all_levels) <= level_idx:
-            self.chart.all_levels.extend([None] * (level_idx + 1 - len(self.chart.all_levels)))
+        else:
+            self.chart.title = chart_title
+            self.chart.artist = chart_artist
+            if len(self.chart.all_levels) <= level_idx:
+                self.chart.all_levels.extend([None] * (level_idx + 1 - len(self.chart.all_levels)))
 
         self.chart.all_levels[level_idx] = Level(
             level_name=f"level_{level_idx + 1}",
             level_query=level_query if level_query is not None else 0.0,
-            frames=frames,
+            frames=all_frames,
         )
 
-        print(f"[parse_from_tensor] level {level_idx}: {len(frames)} frames decoded")
+        print(f"[parse_from_tensor] level {level_idx}: {len(all_frames)} frames decoded")
         return self
 
     # ── note-to-text reconstruction ───────────────────────────────────────
@@ -1405,15 +1703,15 @@ def main():
             path_a.write_text(text_a, encoding="utf-8")
 
             # ── flow (b): parse → tensor → parse_from_tensor → generate ──
-            tensors: dict[int, tuple[torch.Tensor, float]] = {}
+            tensors: dict[int, tuple[list[float], list[torch.Tensor], float]] = {}
             for li in range(7):
                 lv = parser.chart.all_levels[li]
                 if lv is not None:
-                    t = parser.to_tensor(level_idx=li)
-                    tensors[li] = (t, lv.level_query)
+                    offsets, segs = parser.to_tensor(level_idx=li)
+                    tensors[li] = (offsets, segs, lv.level_query)
             parser.chart = None
-            for li, (t, lq) in tensors.items():
-                parser.parse_from_tensor(t, level_idx=li, title=title, artist=artist, level_query=lq)
+            for li, (offsets, segs, lq) in tensors.items():
+                parser.parse_from_tensor((offsets, segs), level_idx=li, title=title, artist=artist, level_query=lq)
             text_b = parser.generate()
             path_b.write_text(text_b, encoding="utf-8")
 

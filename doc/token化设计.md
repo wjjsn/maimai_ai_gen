@@ -345,27 +345,30 @@ Wifi（`w`）在游戏中有 3 个终点，但 token 格式只存 1 个终点（
 
 ---
 
-## 六、张量存储格式
+## 六、存储格式
 
-### 6.1 三维张量结构
+### 6.1 `to_tensor`返回值要求
 
 ```python
-shape = (num_segments, max_time_offset, token_sequence)
+-> list[absolute_time_offset:float], list[torch.Tensor]
+
+assert len(list[absolute_time_offset]) == len(list[torch.Tensor])
 ```
 
 | 维度 | 含义 | 使用者 |
 |------|------|--------|
-| 第一维 `num_segments` | 分段数量（音频总时长 ÷ ~30s） | data loader |
-| 第二维 `max_time_offset` | 段内时间偏移（用于和音频帧对齐） | data loader |
-| 第三维 `token_sequence` | 一维 token 序列 | **模型输入** |
+| `absolute_time_offset` | 绝对时间偏移（用于和音频对齐） | data loader |
+| `token_sequence` | 一维 token 序列 | 模型输入 |
 
-模型最终拿到的是第三维的一维 token 序列。第一维和第二维仅用于 data loader 的音频对齐和分段管理。
+每一段`token_sequence`，的起始需要是`SOS`，终止需要为`EOS`
 
 ### 6.2 动态分段策略
 
 **核心约束**：TS_0 ~ TS_2999 最多表示 30 秒（100fps × 3000 帧 = 30s）。每段必须 **≤ 30 秒**，不能超。
 
-**不按固定 30 秒硬切**，而是在 token 累积接近 30 秒时，在最后一个完整 token 的结束处提前切割。这样不会切碎任何音符/帧。
+**不按固定 30 秒硬切**，而是在 token 累积接近 30 秒时，在最后一个完整 token 的结束处于下一个的起始的中间，在30s前切割。这样不会切碎任何音符/帧。
+
+**绝对不能只看当前帧的 end**，必须看全局活跃音符的最晚 end（也就是从长按按下去到长按结束这一段时间，会有其他 token。这些其他的token也需要被正确处理）
 
 ```
 音频: |───────────────────────────────────────────────────|
@@ -376,21 +379,6 @@ shape = (num_segments, max_time_offset, token_sequence)
 
 动态切:    |─28.5s─|─29.2s─|─28.8s─|─29.7s─|─29.4s─|─28.5s─|─19.8s─|
            每段 ≤30s，在 token 边界处切割，不破坏任何音符
-```
-
-#### 分段算法
-
-```
-offset = 0
-tokens_accumulated = []
-for token in full_token_sequence:
-    if token 的结束时间 - offset > 30s:
-        # 加入这个 token 会超 30s，先提交当前段
-        提交当前段: (offset, tokens_accumulated)
-        offset = token 的开始时间
-        tokens_accumulated = []
-    tokens_accumulated.append(token)
-提交最后一段（如果还有剩余）
 ```
 
 **关键**：先判断再加入，确保每段 ≤ 30s。
@@ -411,7 +399,18 @@ for token in full_token_sequence:
 每段内部 TS 从 0 重新计数。data loader 记录每段的绝对偏移量，用于和音频特征对齐。
 
 ### 6.3 Data Loader 工作流程
+第一步：重建缓存。
 
+第二步：验证数据集。
+需满足以下两个条件，才能将它们确认为一个数据集：
+(a) 验证有缓存的音频文件与对应的谱面文件能否对应；
+(b) 验证谱面文件在解析时没有报错。
+
+第三步：编译谱面并计算总长度。
+每一个谱面都需要经过编译。编译后可以得到有多少个段，每一段代表一个长度。要把所有有可能的段全部编译一遍，算出全部的长度，加在一起就是总的长度，并且准备好索引。
+
+第四步：迭代读取与音频切片。
+只有在迭代器运行的时候，从缓存中读取数据，算出正确的偏移切片。因为音频一段是 30 秒，所以要根据解析出来的片段进行切片，并且确认音频切片是正确的。
 ```
 1. 读取音频，计算总时长
 2. 按动态分段策略将 token 序列切成 N 段
