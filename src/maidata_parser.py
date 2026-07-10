@@ -951,7 +951,9 @@ class compiler:
         # 关键：seg_max_end 跟踪当前段内**所有**活跃音符的最晚结束时间
         #（例如一个 HOLD 跨越多个帧，期间有其他音符），不能只看当前帧的 end。
         # 先判断再加入，确保每段 ≤ 30s。
-        seg_offset = groups[0][1]
+        # 第一段从音频 0 秒开始，保留首个音符前的静音上下文。
+        # 后续段仍按谱面 frame 起点动态切分，避免训练/原始音频推理起点不一致。
+        seg_offset = 0.0
         seg_max_end = groups[0][2]
         current_seg: list[tuple[list[int], float]] = []
         all_segs: list[tuple[float, list[tuple[list[int], float]]]] = []
