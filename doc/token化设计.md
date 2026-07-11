@@ -399,6 +399,9 @@ assert len(list[absolute_time_offset]) == len(list[torch.Tensor])
 每段内部 TS 从 0 重新计数。data loader 记录每段的绝对偏移量，用于和音频特征对齐。
 
 ### 6.3 Data Loader 工作流程
+
+> 当前实现补充：历史设计使用 `to_tensor()` 动态分段；当前训练代码已改成滑窗训练。下面的动态分段流程仍描述 token 格式的原始设计约束，不等同于当前 `ChartDataset` 的训练样本构造方式。
+
 第一步：重建缓存。
 
 第二步：验证数据集。
@@ -410,7 +413,7 @@ assert len(list[absolute_time_offset]) == len(list[torch.Tensor])
 每一个谱面都需要经过编译。编译后可以得到有多少个段，每一段代表一个长度。要把所有有可能的段全部编译一遍，算出全部的长度，加在一起就是总的长度，并且准备好索引。
 
 第四步：迭代读取与音频切片。
-只有在迭代器运行的时候，从缓存中读取数据，算出正确的偏移切片。因为音频一段是 30 秒，所以要根据解析出来的片段进行切片，并且确认音频切片是正确的。
+只有在迭代器运行的时候，从缓存中读取数据，算出正确的偏移切片。动态分段设计里每段 token 的相对时间必须 ≤30 秒，所以音频切片也应覆盖对应的 token 时间范围。
 ```
 1. 读取音频，计算总时长
 2. 按动态分段策略将 token 序列切成 N 段
@@ -420,6 +423,60 @@ assert len(list[absolute_time_offset]) == len(list[torch.Tensor])
     - time_slots: 每个 token 对应的相对时间（用于音频对齐）
 4. 加载对应时间段的音频特征（mel spectrogram 等）
 5. 将 token 序列和音频特征一起送入模型
+```
+
+### 6.3.1 当前滑窗训练实现
+
+当前 `src/dataset.py` 不再直接使用 `to_tensor()` 的动态分段作为训练样本，而是按固定提交区滑动构造样本：
+
+```text
+target_start = 0s, 1s, 2s, ...（训练）
+target_start = 0s, 10s, 20s, ...（验证和正式推理提交）
+逻辑窗口起点 = target_start - 12s
+token 前缀区 = 相对 6..12s
+提交区 = 相对 12..22s
+目标 token = 提交区内“开始”的音符
+跨边界 HOLD/SLIDE = 不拆开，归属于开始时间所在提交区
+```
+
+输入音频窗口由模型结构决定。当前模型配置是：
+
+```text
+sample_rate = 22050
+hop_length = 256
+n_audio_ctx = 1500
+mel_frames = 2 * n_audio_ctx = 3000
+输入窗口时长 = 3000 / (22050 / 256) ≈ 34.83s
+```
+
+因此当前实现里的“输入窗口”不是严格 30 秒，而是 **3000 个 mel 帧，约 34.83 秒**。
+
+这不违反 `TS_0 ~ TS_2999` 的 30 秒约束，原因是：
+
+```text
+TS 的 30 秒约束限制的是 token 序列里的相对时间可表达范围
+当前训练目标只覆盖相对 12..22 秒的 10 秒提交区
+输入 mel 可以包含额外上下文，只要目标 token 的相对时间仍在 TS_0~TS_2999 内
+```
+
+当前默认上下文关系是：
+
+```text
+输入窗口: 约 34.83s
+左音频上下文: 12.0s
+token 前缀区: 6.0s（相对 6..12s，只作为 decoder 上下文）
+提交区: 10.0s（相对 12..22s）
+右音频上下文: 约 12.83s
+```
+
+如果以后要让音频输入窗口也严格等于 30 秒，需要同步修改：
+
+```text
+src/train.py 的 n_audio_ctx
+src/dataset.py 的 mel_frames
+src/infer.py 的 WINDOW_FRAMES
+src/overfit_window.py / src/overfit_song.py 的模型尺寸和 collate mel_frames
+所有旧 checkpoint 都不能继续使用
 ```
 
 ### 6.4 张量填充
@@ -438,7 +495,7 @@ padded_tensor = torch.full(
 )
 ```
 
-模型通过 attention mask 忽略 PAD 位置。
+当前 decoder 没有传入 token attention mask。PAD 只出现在序列尾部，因果 attention 不会影响此前有效 token；训练损失由独立 `loss_mask` 限定，只监督目标区 token 和 EOS，不监督 PAD 或前缀。
 
 ### 6.5 与音频对齐
 
