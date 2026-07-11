@@ -5,12 +5,14 @@ Usage:
 """
 
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
 import torch
 import torchaudio
 
+from config import CONFIG, validate_checkpoint_config
 from model import Whisper, ModelDimensions
 from constrained_decode import allowed_tokens
 from maidata_parser import (
@@ -20,23 +22,48 @@ from maidata_parser import (
 
 # ──────────────────── defaults ────────────────────
 
-SAMPLE_RATE = 22050
-N_FFT = 1024
-HOP_LENGTH = 256
-N_MELS = 80
-MAX_TOKENS = 2048
-ENCODER_CTX = 1500      # encoder 期望的 mel 帧数（conv2 输出）
-WINDOW_FRAMES = 3000    # 每窗 mel 帧数（conv2 stride=2 后 → ENCODER_CTX）
-DEFAULT_LEVEL = 5
-PREFIX_START_SEC = 6.0
-TARGET_START_SEC = 12.0
-TARGET_END_SEC = 22.0
-DEFAULT_COMMIT_SEC = TARGET_END_SEC - TARGET_START_SEC
+SAMPLE_RATE = CONFIG.audio.sample_rate
+N_FFT = CONFIG.audio.n_fft
+HOP_LENGTH = CONFIG.audio.hop_length
+N_MELS = CONFIG.audio.n_mels
+MAX_TOKENS = CONFIG.model.max_tokens
+WINDOW_FRAMES = CONFIG.window.mel_frames
+DEFAULT_LEVEL = CONFIG.inference.level_idx
+PREFIX_START_SEC = CONFIG.window.prefix_start_sec
+TARGET_START_SEC = CONFIG.window.target_start_sec
+TARGET_END_SEC = CONFIG.window.target_end_sec
+DEFAULT_COMMIT_SEC = CONFIG.window.infer_stride_sec
+
+
+def _level_arg(value: str) -> int:
+    level = int(value)
+    if not 0 <= level <= 6:
+        raise argparse.ArgumentTypeError("难度编号必须在 0 到 6 之间")
+    return level
+
+
+def _nonnegative_float_arg(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("必须是大于等于 0 的有限数字")
+    return number
 
 
 def load_model(ckpt_path: str | Path, device: torch.device) -> tuple[Whisper, ModelDimensions]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     dims: ModelDimensions = ckpt["dims"]
+    validate_checkpoint_config(
+        ckpt.get("config"),
+        CONFIG,
+        for_training=False,
+        allow_legacy=CONFIG.inference.allow_legacy_checkpoint,
+    )
+    if dims.n_mels != N_MELS:
+        raise ValueError(f"检查点梅尔频带数为 {dims.n_mels}，当前配置为 {N_MELS}")
+    if dims.n_audio_ctx * 2 != WINDOW_FRAMES:
+        raise ValueError(f"检查点梅尔帧数为 {dims.n_audio_ctx * 2}，当前配置为 {WINDOW_FRAMES}")
+    if dims.n_text_ctx != MAX_TOKENS:
+        raise ValueError(f"检查点最大词元数为 {dims.n_text_ctx}，当前配置为 {MAX_TOKENS}")
     model = Whisper(dims).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
@@ -102,7 +129,11 @@ def decode_segment(
             logits = model.logits(dec_input, audio_features)   # (1, S, vocab)
         next_logits = logits[0, -1, :]   # (vocab,)
         if constrained:
-            allowed = allowed_tokens(tokens, min_frame_time=1200, max_frame_time=2199)
+            allowed = allowed_tokens(
+                tokens,
+                min_frame_time=round(TARGET_START_SEC * 100),
+                max_frame_time=round(TARGET_END_SEC * 100) - 1,
+            )
             if not allowed:
                 break
             masked = torch.full_like(next_logits, float("-inf"))
@@ -255,12 +286,10 @@ def frames_to_maidata(frames: list[Frame], level_idx: int) -> str:
 def main():
     parser = argparse.ArgumentParser(description="maimai chart inference")
     parser.add_argument("audio", type=str, help="Path to audio file")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best.pt")
-    parser.add_argument("--level", type=int, default=DEFAULT_LEVEL)
+    parser.add_argument("--checkpoint", type=Path, default=CONFIG.inference.checkpoint)
+    parser.add_argument("--level", type=_level_arg, default=DEFAULT_LEVEL)
     parser.add_argument("--out", type=str, default=None, help="Output text file path")
-    parser.add_argument("--window", type=int, default=WINDOW_FRAMES)
-    parser.add_argument("--commit-sec", type=float, default=DEFAULT_COMMIT_SEC)
-    parser.add_argument("--start-sec", type=float, default=0.0)
+    parser.add_argument("--start-sec", type=_nonnegative_float_arg, default=CONFIG.inference.start_sec)
     args = parser.parse_args()
 
     device = torch.device(
@@ -278,7 +307,7 @@ def main():
         return
 
     mel = audio_to_mel(audio_path)
-    frames = overlap_infer(model, mel, device, window=args.window, commit_sec=args.commit_sec, start_sec=args.start_sec)
+    frames = overlap_infer(model, mel, device, start_sec=args.start_sec)
     print(f"[infer] total frames: {len(frames)}")
     maidata_text = frames_to_maidata(frames, level_idx=args.level)
 
@@ -287,6 +316,7 @@ def main():
     else:
         tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
         out_path = tmp_dir.with_suffix(".txt")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(maidata_text, encoding="utf-8")
     print(f"[infer] saved to '{out_path}'")
 

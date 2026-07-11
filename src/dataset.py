@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from chart_cache import ensure_chart_cache
+from config import CONFIG
 from maidata_parser import EOS, FRAME_END, FRAME_START, LANE_BASE, SOS, TOUCH_BASE, compiler
 
 
@@ -67,9 +68,9 @@ def validate_dataset(
 
 # ── Step 3: Compile charts & build index ──────────────────────────────────
 
-PREFIX_START_SEC = 6.0
-TARGET_START_SEC = 12.0
-TARGET_END_SEC = 22.0
+PREFIX_START_SEC = CONFIG.window.prefix_start_sec
+TARGET_START_SEC = CONFIG.window.target_start_sec
+TARGET_END_SEC = CONFIG.window.target_end_sec
 
 
 class _IndexEntry(NamedTuple):
@@ -192,10 +193,10 @@ class RotatedDataset(Dataset):
 def compile_index(
     valid_pairs: list[tuple[Path, Path]],
     level_idx: int,
-    sample_rate: int = 22050,
-    hop_length: int = 256,
-    stride_sec: float = 1.0,
-    mel_frames: int = 3000,
+    sample_rate: int = CONFIG.audio.sample_rate,
+    hop_length: int = CONFIG.audio.hop_length,
+    stride_sec: float = CONFIG.window.train_stride_sec,
+    mel_frames: int = CONFIG.window.mel_frames,
 ) -> tuple[list[_IndexEntry], int, dict[str, int]]:
     """构建平移窗口：6..12 秒谱面前缀，12..22 秒训练目标。"""
     index: list[_IndexEntry] = []
@@ -299,32 +300,40 @@ class ChartDataset(Dataset):
         self,
         charts_dir: str | Path,
         cache_dir: str | Path | None = None,
-        level_idx: int = 5,
+        level_idx: int = CONFIG.training.level_idx,
         max_tokens: int = 0,
-        sample_rate: int = 22050,
-        hop_length: int = 256,
-        n_mels: int = 80,
-        stride_sec: float = 1.0,
-        mel_frames: int = 3000,
+        sample_rate: int = CONFIG.audio.sample_rate,
+        n_fft: int = CONFIG.audio.n_fft,
+        hop_length: int = CONFIG.audio.hop_length,
+        n_mels: int = CONFIG.audio.n_mels,
+        stride_sec: float = CONFIG.window.train_stride_sec,
+        mel_frames: int = CONFIG.window.mel_frames,
         valid_pairs: list[tuple[Path, Path]] | None = None,
         chart_limit: int = 0,
-        seed: int = 42,
+        seed: int = CONFIG.training.seed,
     ):
         self.charts_dir = Path(charts_dir)
-        self.cache_dir = Path(cache_dir) if cache_dir else self.charts_dir.parent / ".cache" / "charts"
+        self.cache_dir = Path(cache_dir) if cache_dir else CONFIG.paths.mel_cache_dir
         self.level_idx = level_idx
         self.sample_rate = sample_rate
+        self.n_fft = n_fft
         self.hop_length = hop_length
         self.n_mels = n_mels
         self.stride_sec = stride_sec
         self.mel_frames = mel_frames
         self._mel_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
 
+        if not self.charts_dir.is_dir():
+            raise ValueError(f"谱面目录不存在或不是目录: {self.charts_dir}")
+        if self.cache_dir.exists() and not self.cache_dir.is_dir():
+            raise ValueError(f"梅尔缓存路径不是目录: {self.cache_dir}")
+
         cache_path = ensure_chart_cache(
             self.charts_dir,
             self.cache_dir,
             level_idx=level_idx,
             sample_rate=sample_rate,
+            n_fft=n_fft,
             hop_length=hop_length,
             n_mels=n_mels,
             stride_sec=stride_sec,
@@ -341,6 +350,10 @@ class ChartDataset(Dataset):
         self.valid_pairs = valid
         self._index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir, {path for path, _ in valid})
         computed_max = max((len(entry.tokens) for entry in self._index), default=0)
+        if max_tokens > 0 and computed_max > max_tokens:
+            raise ValueError(
+                f"配置的最大词元数 {max_tokens} 装不下数据；当前窗口最大需要 {computed_max} 个词元"
+            )
         self.max_tokens = max_tokens if max_tokens > 0 else computed_max
         print(f"[dataset] 缓存索引: {len(valid)} 首歌，{len(self._index)} 个窗口，max_tokens={self.max_tokens}")
 
@@ -354,6 +367,11 @@ class ChartDataset(Dataset):
         mel_full = self._mel_cache.get(entry.mel_path)
         if mel_full is None:
             mel_full = np.load(str(entry.mel_path), mmap_mode="r")
+            if mel_full.ndim != 2 or mel_full.shape[0] != self.n_mels:
+                raise ValueError(
+                    f"梅尔缓存形状错误: {entry.mel_path} 为 {mel_full.shape}，"
+                    f"当前配置需要 ({self.n_mels}, 时间帧数)"
+                )
             self._mel_cache[entry.mel_path] = mel_full
             # ponytail: 每个 worker 最多保持 8 个 mmap；需要更多时再按命中率调大。
             if len(self._mel_cache) > 8:
@@ -429,14 +447,14 @@ def collate_segments(batch: list[dict], mel_frames: int = 0) -> dict:
 # ── self-check ────────────────────────────────────────────────────────────
 
 def _self_check():
-    charts_dir = Path(__file__).resolve().parent.parent / "charts"
+    charts_dir = CONFIG.paths.charts_dir
     if not charts_dir.exists():
         print("[dataset] charts/ not found, skipping self-check")
         return
 
     from maidata_parser import SOS, EOS
 
-    ds = ChartDataset(charts_dir, max_tokens=2048, level_idx=5)
+    ds = ChartDataset(charts_dir, max_tokens=CONFIG.model.max_tokens, level_idx=CONFIG.training.level_idx)
     print(f"[dataset] total: {len(ds)} segments")
 
     if len(ds) > 0:

@@ -9,8 +9,10 @@ import numpy as np
 import torch
 import torchaudio
 
-CHARTS_DIR = Path(__file__).resolve().parent.parent / "charts"
-CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "charts"
+from config import CONFIG
+
+CHARTS_DIR = CONFIG.paths.charts_dir
+CACHE_DIR = CONFIG.paths.mel_cache_dir
 
 
 
@@ -33,20 +35,8 @@ def _cache_is_current(out: Path, track_path: Path, config: dict[str, int]) -> bo
     if not out.exists():
         return False
     if not metadata_path.exists():
-        try:
-            # 迁移既有缓存，不在升级后重新计算全部音频；后续启动会严格校验。
-            shape = np.load(out, mmap_mode="r").shape
-            if shape[:1] != (config["n_mels"],):
-                return False
-            _write_json(metadata_path, {
-                "cache_version": 1,
-                "config": config,
-                "mel_shape": list(shape),
-                "track": _file_state(track_path),
-            })
-            return True
-        except (OSError, ValueError):
-            return False
+        # 无法从数组形状推断采样率、FFT 和 hop，不能把未知来源的旧缓存认证为当前配置。
+        return False
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         return metadata["track"] == _file_state(track_path) and metadata["config"] == config
@@ -60,7 +50,15 @@ def _write_json(path: Path, value: dict) -> None:
     temp.replace(path)
 
 
-def process_one(chart_dir: Path, rel_path: str, cache_dir: Path = CACHE_DIR, sample_rate = 22050, n_fft=1024, hop_length = 256, n_mels = 80) -> tuple[Path, bool]:
+def process_one(
+    chart_dir: Path,
+    rel_path: str,
+    cache_dir: Path = CACHE_DIR,
+    sample_rate=CONFIG.audio.sample_rate,
+    n_fft=CONFIG.audio.n_fft,
+    hop_length=CONFIG.audio.hop_length,
+    n_mels=CONFIG.audio.n_mels,
+) -> tuple[Path, bool]:
     out = cache_dir / f"{cache_key(rel_path)}.npy"
     track_path = chart_dir / "track.mp3"
     config = {
@@ -96,7 +94,14 @@ def process_one(chart_dir: Path, rel_path: str, cache_dir: Path = CACHE_DIR, sam
     return out, True
 
 
-def main(charts_dir = CHARTS_DIR, cache_dir = CACHE_DIR, sample_rate = 22050, n_fft=1024, hop_length = 256, n_mels = 80):
+def main(
+    charts_dir=CHARTS_DIR,
+    cache_dir=CACHE_DIR,
+    sample_rate=CONFIG.audio.sample_rate,
+    n_fft=CONFIG.audio.n_fft,
+    hop_length=CONFIG.audio.hop_length,
+    n_mels=CONFIG.audio.n_mels,
+):
     cache_dir.mkdir(exist_ok=True, parents=True)
     found = 0
     skipped = 0

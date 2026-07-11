@@ -10,4 +10,5 @@ dependencies = [
     "torchcodec>=0.3.0",
     "numpy>=2.2.0",
     "tqdm>=4.68.4",
+    "pyyaml>=6.0.3",
 ]

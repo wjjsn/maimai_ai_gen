@@ -10,13 +10,14 @@ from pathlib import Path
 
 import numpy as np
 
+from config import CONFIG
 from maidata_parser import EOS, FRAME_END, FRAME_START, SOS, _match_music, compiler, load_music_data, music_data_version
 from mel_cache import main as rebuild_mel_cache
 
 CACHE_VERSION = 3
-PREFIX_START_SEC = 6.0
-TARGET_START_SEC = 12.0
-TARGET_END_SEC = 22.0
+PREFIX_START_SEC = CONFIG.window.prefix_start_sec
+TARGET_START_SEC = CONFIG.window.target_start_sec
+TARGET_END_SEC = CONFIG.window.target_end_sec
 ENTRY_DTYPE = np.dtype([
     ("chart_id", "<u4"),
     ("source_start_frame", "<i8"),
@@ -28,6 +29,20 @@ ENTRY_DTYPE = np.dtype([
     ("token_length", "<u4"),
     ("loss_start", "<u4"),
 ])
+
+
+def _level_arg(value: str) -> int:
+    level = int(value)
+    if not 0 <= level <= 6:
+        raise argparse.ArgumentTypeError("难度编号必须在 0 到 6 之间")
+    return level
+
+
+def _positive_float_arg(value: str) -> float:
+    number = float(value)
+    if not np.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("必须是大于 0 的有限数字")
+    return number
 
 
 def _state(path: Path) -> dict[str, int]:
@@ -203,11 +218,11 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     print(f"[chart-cache] 宴会場排除 {excluded} 首")
 
 
-def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, build_mel: bool = True) -> Path:
+def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_idx: int, sample_rate: int, n_fft: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, build_mel: bool = True) -> Path:
     charts_dir = Path(charts_dir)
     cache_dir = Path(cache_dir)
     if build_mel:
-        rebuild_mel_cache(charts_dir, cache_dir, sample_rate, 1024, hop_length, n_mels)
+        rebuild_mel_cache(charts_dir, cache_dir, sample_rate, n_fft, hop_length, n_mels)
     config = _config(level_idx, sample_rate, hop_length, n_mels, stride_sec, mel_frames, music_data_version())
     cache_root, lock_path = _paths(cache_dir, config)
     sources = _scan_sources(charts_dir, cache_dir)
@@ -232,13 +247,22 @@ def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_i
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--charts-dir", type=Path, default=Path(__file__).resolve().parent.parent / "charts")
-    parser.add_argument("--cache-dir", type=Path, default=Path(__file__).resolve().parent.parent / ".cache" / "charts")
-    parser.add_argument("--level", type=int, default=5)
-    parser.add_argument("--stride-sec", type=float, default=1.0)
+    parser.add_argument("--charts-dir", type=Path, default=CONFIG.paths.charts_dir)
+    parser.add_argument("--cache-dir", type=Path, default=CONFIG.paths.mel_cache_dir)
+    parser.add_argument("--level", type=_level_arg, default=CONFIG.training.level_idx)
+    parser.add_argument("--stride-sec", type=_positive_float_arg, default=CONFIG.window.train_stride_sec)
     args = parser.parse_args()
-    path = ensure_chart_cache(args.charts_dir, args.cache_dir, level_idx=args.level, sample_rate=22050,
-                              hop_length=256, n_mels=80, stride_sec=args.stride_sec, mel_frames=3000)
+    path = ensure_chart_cache(
+        args.charts_dir,
+        args.cache_dir,
+        level_idx=args.level,
+        sample_rate=CONFIG.audio.sample_rate,
+        n_fft=CONFIG.audio.n_fft,
+        hop_length=CONFIG.audio.hop_length,
+        n_mels=CONFIG.audio.n_mels,
+        stride_sec=args.stride_sec,
+        mel_frames=CONFIG.window.mel_frames,
+    )
     print(f"[chart-cache] 就绪: {path}")
 
 

@@ -1,5 +1,4 @@
-from pathlib import Path
-
+from config import CONFIG
 from dataset import ChartDataset, rotate_token_id, rotate_token_list
 from maidata_parser import EOS, PAD, SOS, TOUCH_BASE, compiler
 
@@ -11,8 +10,11 @@ def strip_pad(tokens: list[int]) -> list[int]:
 
 
 def main():
-    root = Path(__file__).resolve().parent.parent
-    ds = ChartDataset(root / "charts", level_idx=5, max_tokens=2048)
+    ds = ChartDataset(
+        CONFIG.paths.charts_dir,
+        level_idx=CONFIG.training.level_idx,
+        max_tokens=CONFIG.model.max_tokens,
+    )
     tokens = strip_pad(ds[0]["tokens"].tolist())
 
     assert rotate_token_list(tokens, 0) == tokens

@@ -1,6 +1,5 @@
 from collections import defaultdict
 from functools import partial
-import os
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +10,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from model import Whisper, ModelDimensions
+from config import CONFIG, checkpoint_config, validate_checkpoint_config
 from dataset import ChartDataset, RotatedDataset, collate_segments
 from content_metrics import content_match_frame_counts
 from infer import decode_segment, overlap_infer
@@ -29,44 +29,50 @@ if DEVICE.type == "cuda":
     torch.backends.cudnn.allow_tf32 = True
 print(f"Using device: {DEVICE}")
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-CHARTS_DIR = Path(os.environ.get("MAIMAI_CHARTS_DIR", ROOT_DIR / "charts"))
-LEVEL_IDX = int(os.environ.get("MAIMAI_LEVEL_IDX", "5"))          # 默认 Master
-MAX_TOKENS = int(os.environ.get("MAIMAI_MAX_TOKENS", "2048"))      # 序列最大长度
-BATCH_SIZE = int(os.environ.get("MAIMAI_BATCH_SIZE", "24"))
-NUM_WORKERS = int(os.environ.get("MAIMAI_NUM_WORKERS", "2"))
-PREFETCH_FACTOR = int(os.environ.get("MAIMAI_PREFETCH_FACTOR", "2"))
-PIN_MEMORY = os.environ.get("MAIMAI_PIN_MEMORY", "1") == "1"
-NUM_EPOCHS = int(os.environ.get("MAIMAI_NUM_EPOCHS", "500"))
-LR = float(os.environ.get("MAIMAI_LR", "3e-4"))
-WEIGHT_DECAY = float(os.environ.get("MAIMAI_WEIGHT_DECAY", "0.01"))
-VAL_RATIO = float(os.environ.get("MAIMAI_VAL_RATIO", "0.15"))       # 验证集比例
-GRAD_CLIP = float(os.environ.get("MAIMAI_GRAD_CLIP", "1.0"))        # 梯度裁剪
-EARLY_STOP_PATIENCE = int(os.environ.get("MAIMAI_EARLY_STOP_PATIENCE", "12"))
-LABEL_SMOOTHING = float(os.environ.get("MAIMAI_LABEL_SMOOTHING", "0.05"))
-EOS_LOSS_WEIGHT = float(os.environ.get("MAIMAI_EOS_LOSS_WEIGHT", "5.0"))
-LR_T_MAX = int(os.environ.get("MAIMAI_LR_T_MAX", "80"))          # 500 轮退火太慢，验证集平台期前学习率几乎不降
-SEED = int(os.environ.get("MAIMAI_SEED", "42"))
-VAL_GEN_CHARTS = int(os.environ.get("MAIMAI_VAL_GEN_CHARTS", "2"))
-VAL_ORACLE_WINDOWS = int(os.environ.get("MAIMAI_VAL_ORACLE_WINDOWS", "8"))
-OVERFIT_CHARTS = int(os.environ.get("MAIMAI_OVERFIT_CHARTS", "0"))
-RESUME_PATH = os.environ.get("MAIMAI_RESUME")
-CHECKPOINT_DIR = Path(os.environ.get("MAIMAI_CHECKPOINT_DIR", ROOT_DIR / "checkpoints"))
+CHARTS_DIR = CONFIG.paths.charts_dir
+LEVEL_IDX = CONFIG.training.level_idx
+MAX_TOKENS = CONFIG.model.max_tokens
+BATCH_SIZE = CONFIG.training.batch_size
+NUM_WORKERS = CONFIG.training.num_workers
+PREFETCH_FACTOR = CONFIG.training.prefetch_factor
+PIN_MEMORY = CONFIG.training.pin_memory
+NUM_EPOCHS = CONFIG.training.num_epochs
+LR = CONFIG.training.learning_rate
+WEIGHT_DECAY = CONFIG.training.weight_decay
+VAL_RATIO = CONFIG.training.val_ratio
+GRAD_CLIP = CONFIG.training.grad_clip
+EARLY_STOP_PATIENCE = CONFIG.training.early_stop_patience
+LABEL_SMOOTHING = CONFIG.training.label_smoothing
+EOS_LOSS_WEIGHT = CONFIG.training.eos_loss_weight
+LR_T_MAX = CONFIG.training.lr_t_max
+SEED = CONFIG.training.seed
+VAL_GEN_CHARTS = CONFIG.training.val_gen_charts
+VAL_ORACLE_WINDOWS = CONFIG.training.val_oracle_windows
+OVERFIT_CHARTS = CONFIG.training.overfit_charts
+RESUME_PATH = CONFIG.training.resume_path
+CHECKPOINT_DIR = CONFIG.paths.checkpoint_dir
+if CHECKPOINT_DIR.exists() and not CHECKPOINT_DIR.is_dir():
+    raise ValueError(f"检查点路径不是目录: {CHECKPOINT_DIR}")
 CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
+
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if DEVICE.type == "cuda":
+    torch.cuda.manual_seed_all(SEED)
 
 # ─────────────────────── 1. 模型 ───────────────────────
 
 dims = ModelDimensions(
-    n_mels=80,
-    n_audio_ctx=1500,
-    n_audio_state=384,
-    n_audio_head=6,
-    n_audio_layer=4,
+    n_mels=CONFIG.audio.n_mels,
+    n_audio_ctx=CONFIG.window.mel_frames // 2,
+    n_audio_state=CONFIG.model.audio_state,
+    n_audio_head=CONFIG.model.audio_head,
+    n_audio_layer=CONFIG.model.audio_layer,
     n_vocab=VOCAB_SIZE,
     n_text_ctx=MAX_TOKENS,
-    n_text_state=384,
-    n_text_head=6,
-    n_text_layer=4,
+    n_text_state=CONFIG.model.text_state,
+    n_text_head=CONFIG.model.text_head,
+    n_text_layer=CONFIG.model.text_layer,
 )
 model = Whisper(dims).to(DEVICE)
 print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
@@ -76,17 +82,29 @@ print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 print("Loading dataset...")
 train_full_ds = ChartDataset(
     CHARTS_DIR,
+    cache_dir=CONFIG.paths.mel_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    stride_sec=1.0,
+    sample_rate=CONFIG.audio.sample_rate,
+    n_fft=CONFIG.audio.n_fft,
+    hop_length=CONFIG.audio.hop_length,
+    n_mels=CONFIG.audio.n_mels,
+    stride_sec=CONFIG.window.train_stride_sec,
+    mel_frames=CONFIG.window.mel_frames,
     chart_limit=OVERFIT_CHARTS,
     seed=SEED,
 )
 val_full_ds = ChartDataset(
     CHARTS_DIR,
+    cache_dir=CONFIG.paths.mel_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    stride_sec=10.0,
+    sample_rate=CONFIG.audio.sample_rate,
+    n_fft=CONFIG.audio.n_fft,
+    hop_length=CONFIG.audio.hop_length,
+    n_mels=CONFIG.audio.n_mels,
+    stride_sec=CONFIG.window.infer_stride_sec,
+    mel_frames=CONFIG.window.mel_frames,
     valid_pairs=train_full_ds.valid_pairs,
 )
 print(f"Total train windows: {len(train_full_ds)}, val windows: {len(val_full_ds)}")
@@ -111,8 +129,12 @@ else:
     train_indices = [i for p in chart_paths if p not in val_charts for i in by_chart[p]]
     val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in val_charts]
 base_train_ds = Subset(train_full_ds, train_indices)
-train_ds = RotatedDataset(base_train_ds)
+train_ds = RotatedDataset(base_train_ds, rotations=CONFIG.training.rotations)
 val_ds = Subset(val_full_ds, val_indices)
+if len(base_train_ds) == 0:
+    raise ValueError("训练集没有可用窗口；正常训练至少需要两首含指定难度的有效歌曲")
+if len(val_ds) == 0:
+    raise ValueError("验证集没有可用窗口；请检查谱面目录、难度编号和验证集比例")
 print(
     f"Train: {len(base_train_ds)} windows / {train_chart_count} charts, "
     f"旋转增强后 {len(train_ds)} samples, "
@@ -176,18 +198,26 @@ optimizer = optim.AdamW(
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=1e-6)
 scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
 window_config = {
-    "mel_frames": 2 * dims.n_audio_ctx,
-    "prefix_start_sec": 6.0,
-    "target_start_sec": 12.0,
-    "target_end_sec": 22.0,
-    "train_stride_sec": 1.0,
-    "infer_stride_sec": 10.0,
+    "mel_frames": CONFIG.window.mel_frames,
+    "prefix_start_sec": CONFIG.window.prefix_start_sec,
+    "target_start_sec": CONFIG.window.target_start_sec,
+    "target_end_sec": CONFIG.window.target_end_sec,
+    "train_stride_sec": CONFIG.window.train_stride_sec,
+    "infer_stride_sec": CONFIG.window.infer_stride_sec,
 }
 start_epoch = 1
 resume_checkpoint = None
 if RESUME_PATH:
     resume_path = Path(RESUME_PATH)
+    if not resume_path.is_file():
+        raise ValueError(f"恢复检查点不存在或不是文件: {resume_path}")
     resume_checkpoint = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+    validate_checkpoint_config(
+        resume_checkpoint.get("config"),
+        CONFIG,
+        for_training=True,
+        allow_legacy=CONFIG.training.allow_legacy_checkpoint,
+    )
     resume_window_config = resume_checkpoint.get("window_config")
     if resume_window_config is None:
         print("警告: 旧 checkpoint 没有 window_config，无法确认是否来自当前滑窗任务")
@@ -442,6 +472,7 @@ if __name__ == "__main__":
                 "val_content_f1": val_content_f1,
                 "dims": dims,
                 "window_config": window_config,
+                "config": checkpoint_config(CONFIG),
             }, ckpt_path)
             print(f"  -> 保存验证损失最优模型到 {ckpt_path}")
         if val_content_f1 > best_val_content_f1:
@@ -459,8 +490,24 @@ if __name__ == "__main__":
                 "val_content_f1": val_content_f1,
                 "dims": dims,
                 "window_config": window_config,
+                "config": checkpoint_config(CONFIG),
             }, ckpt_path)
             print(f"  -> 保存生成效果最优模型到 {ckpt_path}")
+        ckpt_path = CHECKPOINT_DIR / "newest.pt"
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "val_loss": val_loss,
+            "val_precision": val_precision,
+            "val_recall": val_recall,
+            "val_content_f1": val_content_f1,
+            "dims": dims,
+            "window_config": window_config,
+            "config": checkpoint_config(CONFIG),
+        }, ckpt_path)
         if not val_loss_improved:
             bad_epochs += 1
             if bad_epochs >= EARLY_STOP_PATIENCE:
