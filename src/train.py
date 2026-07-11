@@ -1,16 +1,20 @@
+from collections import defaultdict
+from functools import partial
+import os
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from functools import partial
-from torch.utils.data import DataLoader, random_split
-from pathlib import Path
+from torch.utils.data import DataLoader, Subset
+from tqdm import tqdm
 
 from model import Whisper, ModelDimensions
-from dataset import ChartDataset, collate_segments
-from maidata_parser import (
-    PAD, SOS, EOS, VOCAB_SIZE,
-    FRAME_START, FRAME_END, SEGMENT_START, SEGMENT_END,
-)
+from dataset import ChartDataset, RotatedDataset, collate_segments
+from content_metrics import content_match_frame_counts
+from infer import decode_segment, overlap_infer
+from maidata_parser import EOS, FRAME_END, FRAME_START, PAD, SOS, VOCAB_SIZE, compiler
 
 # ─────────────────────── 0. 配置 ───────────────────────
 
@@ -19,19 +23,33 @@ DEVICE = torch.device(
     else "mps" if torch.backends.mps.is_available()
     else "cpu"
 )
+if DEVICE.type == "cuda":
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 print(f"Using device: {DEVICE}")
 
-CHARTS_DIR = Path(__file__).resolve().parent.parent / "charts"
-LEVEL_IDX = 4          # 默认 Master
-MAX_TOKENS = 2048      # 序列最大长度
-BATCH_SIZE = 16
-NUM_EPOCHS = 500
-LR = 3e-4
-WEIGHT_DECAY = 0.01
-VAL_RATIO = 0.15       # 验证集比例
-GRAD_CLIP = 1.0        # 梯度裁剪
-CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
-CHECKPOINT_DIR.mkdir(exist_ok=True)
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CHARTS_DIR = Path(os.environ.get("MAIMAI_CHARTS_DIR", ROOT_DIR / "charts"))
+LEVEL_IDX = int(os.environ.get("MAIMAI_LEVEL_IDX", "5"))          # 默认 Master
+MAX_TOKENS = int(os.environ.get("MAIMAI_MAX_TOKENS", "2048"))      # 序列最大长度
+BATCH_SIZE = int(os.environ.get("MAIMAI_BATCH_SIZE", "16"))
+NUM_EPOCHS = int(os.environ.get("MAIMAI_NUM_EPOCHS", "500"))
+LR = float(os.environ.get("MAIMAI_LR", "3e-4"))
+WEIGHT_DECAY = float(os.environ.get("MAIMAI_WEIGHT_DECAY", "0.01"))
+VAL_RATIO = float(os.environ.get("MAIMAI_VAL_RATIO", "0.15"))       # 验证集比例
+GRAD_CLIP = float(os.environ.get("MAIMAI_GRAD_CLIP", "1.0"))        # 梯度裁剪
+EARLY_STOP_PATIENCE = int(os.environ.get("MAIMAI_EARLY_STOP_PATIENCE", "12"))
+LABEL_SMOOTHING = float(os.environ.get("MAIMAI_LABEL_SMOOTHING", "0.05"))
+EOS_LOSS_WEIGHT = float(os.environ.get("MAIMAI_EOS_LOSS_WEIGHT", "5.0"))
+LR_T_MAX = int(os.environ.get("MAIMAI_LR_T_MAX", "80"))          # 500 轮退火太慢，验证集平台期前学习率几乎不降
+SEED = int(os.environ.get("MAIMAI_SEED", "42"))
+VAL_GEN_CHARTS = int(os.environ.get("MAIMAI_VAL_GEN_CHARTS", "2"))
+VAL_ORACLE_WINDOWS = int(os.environ.get("MAIMAI_VAL_ORACLE_WINDOWS", "8"))
+OVERFIT_CHARTS = int(os.environ.get("MAIMAI_OVERFIT_CHARTS", "0"))
+RESUME_PATH = os.environ.get("MAIMAI_RESUME")
+CHECKPOINT_DIR = Path(os.environ.get("MAIMAI_CHECKPOINT_DIR", ROOT_DIR / "checkpoints"))
+CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
 
 # ─────────────────────── 1. 模型 ───────────────────────
 
@@ -53,143 +71,391 @@ print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 # ─────────────────────── 2. 数据 ───────────────────────
 
 print("Loading dataset...")
-full_ds = ChartDataset(CHARTS_DIR, level_idx=LEVEL_IDX, max_tokens=MAX_TOKENS)
-print(f"Total segments: {len(full_ds)}")
+train_full_ds = ChartDataset(
+    CHARTS_DIR,
+    level_idx=LEVEL_IDX,
+    max_tokens=MAX_TOKENS,
+    stride_sec=1.0,
+    chart_limit=OVERFIT_CHARTS,
+    seed=SEED,
+)
+val_full_ds = ChartDataset(
+    CHARTS_DIR,
+    level_idx=LEVEL_IDX,
+    max_tokens=MAX_TOKENS,
+    stride_sec=10.0,
+    valid_pairs=train_full_ds.valid_pairs,
+)
+print(f"Total train windows: {len(train_full_ds)}, val windows: {len(val_full_ds)}")
 
-val_size = max(1, int(len(full_ds) * VAL_RATIO))
-train_size = len(full_ds) - val_size
-train_ds, val_ds = random_split(full_ds, [train_size, val_size])
-print(f"Train: {train_size}, Val: {val_size}")
+by_chart = defaultdict(list)
+for idx, entry in enumerate(train_full_ds._index):
+    by_chart[entry.mel_path].append(idx)
+
+chart_paths = sorted(by_chart)
+perm = torch.randperm(len(chart_paths), generator=torch.Generator().manual_seed(SEED)).tolist()
+if OVERFIT_CHARTS > 0:
+    selected_charts = {chart_paths[i] for i in perm[:min(OVERFIT_CHARTS, len(chart_paths))]}
+    val_charts = selected_charts
+    train_chart_count = len(selected_charts)
+    val_chart_count = len(selected_charts)
+    train_indices = [i for p in chart_paths if p in selected_charts for i in by_chart[p]]
+    val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in selected_charts]
+else:
+    val_chart_count = max(1, int(len(chart_paths) * VAL_RATIO))
+    train_chart_count = len(chart_paths) - val_chart_count
+    val_charts = {chart_paths[i] for i in perm[:val_chart_count]}
+    train_indices = [i for p in chart_paths if p not in val_charts for i in by_chart[p]]
+    val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in val_charts]
+base_train_ds = Subset(train_full_ds, train_indices)
+train_ds = RotatedDataset(base_train_ds)
+val_ds = Subset(val_full_ds, val_indices)
+print(
+    f"Train: {len(base_train_ds)} windows / {train_chart_count} charts, "
+    f"旋转增强后 {len(train_ds)} samples, "
+    f"Val: {len(val_ds)} windows / {val_chart_count} charts"
+)
+supervised_tokens = 0
+eos_targets = 0
+after_frame_end = 0
+for index in train_indices:
+    entry = train_full_ds._index[index]
+    supervised_tokens += sum(entry.loss_mask)
+    eos_targets += int(entry.tokens[-1] == EOS and entry.loss_mask[-1])
+    after_frame_end += sum(
+        entry.loss_mask[i] and entry.tokens[i - 1] == FRAME_END
+        for i in range(1, len(entry.tokens))
+    )
+print(
+    f"EOS监督: {eos_targets}/{supervised_tokens} token ({eos_targets / max(supervised_tokens, 1) * 100:.3f}%), "
+    f"FRAME_END后结束率={eos_targets / max(after_frame_end, 1) * 100:.2f}%, "
+    f"EOS loss权重={EOS_LOSS_WEIGHT:g}x"
+)
+if OVERFIT_CHARTS > 0:
+    print(f"整曲过拟合模式: {train_chart_count} 首歌，训练和验证使用同一批歌曲")
+
+chart_by_mel = {mel_path: chart_path for chart_path, mel_path in val_full_ds.valid_pairs}
+if OVERFIT_CHARTS > 0:
+    print("过拟合歌曲:")
+    for i, mel_path in enumerate(sorted(selected_charts), 1):
+        chart_dir = chart_by_mel[mel_path].parent.relative_to(CHARTS_DIR)
+        print(f"  {i}. {chart_dir}")
+    gen_val_paths = sorted(selected_charts)
+else:
+    gen_val_paths = sorted(val_charts)[:VAL_GEN_CHARTS]
 
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
     collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
-    num_workers=6, pin_memory=True,
+    num_workers=3, pin_memory=True, persistent_workers=True, prefetch_factor=4,
 )
 val_loader = DataLoader(
     val_ds, batch_size=BATCH_SIZE, shuffle=False,
     collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
-    num_workers=6, pin_memory=True,
+    num_workers=3, pin_memory=True, persistent_workers=True, prefetch_factor=4,
 )
 
 # ─────────────────────── 3. 损失 & 优化器 ───────────────────────
 
-# 给特殊标记更高权重，帮助模型学会 EOS 停止和结构边界
-# 注意: weight 按类别加权，ignore_index 按位置排除，两者职责不同
-# PAD 只出现在 EOS 之后的位置，被 ignore_index 排除，不需要设置权重
-_token_weights = torch.ones(VOCAB_SIZE)
-_token_weights[EOS] = 5.0           # 让模型学会及时停止
-_token_weights[SOS] = 3.0           # 强化起始信号
-_token_weights[FRAME_START] = 3.0   # 帧边界
-_token_weights[FRAME_END] = 3.0     # 帧边界
-_token_weights[SEGMENT_START] = 3.0 # 段边界
-_token_weights[SEGMENT_END] = 3.0   # 段边界
-
 criterion = nn.CrossEntropyLoss(
     ignore_index=PAD,
-    weight=_token_weights.to(DEVICE),
+    label_smoothing=LABEL_SMOOTHING,
+    reduction="none",
 )
-optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+optimizer = optim.AdamW(
+    model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
+    fused=DEVICE.type == "cuda",
+)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=1e-6)
+scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
+window_config = {
+    "mel_frames": 2 * dims.n_audio_ctx,
+    "prefix_start_sec": 6.0,
+    "target_start_sec": 12.0,
+    "target_end_sec": 22.0,
+    "train_stride_sec": 1.0,
+    "infer_stride_sec": 10.0,
+}
+start_epoch = 1
+resume_checkpoint = None
+if RESUME_PATH:
+    resume_path = Path(RESUME_PATH)
+    resume_checkpoint = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+    resume_window_config = resume_checkpoint.get("window_config")
+    if resume_window_config is None:
+        print("警告: 旧 checkpoint 没有 window_config，无法确认是否来自当前滑窗任务")
+    elif resume_window_config != window_config:
+        raise ValueError(
+            f"checkpoint 窗口配置不兼容: {resume_window_config!r}，当前为 {window_config!r}"
+        )
+    model.load_state_dict(resume_checkpoint["model_state_dict"])
+    if "optimizer_state_dict" in resume_checkpoint:
+        optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+    if "scheduler_state_dict" in resume_checkpoint:
+        scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+    else:
+        # 旧 checkpoint 没有 scheduler 状态；optimizer 中已经保存了当时的学习率。
+        # 直接恢复计数，避免在 optimizer.step() 前伪调用 scheduler.step()。
+        completed_epochs = int(resume_checkpoint.get("epoch", 0))
+        scheduler.last_epoch = completed_epochs
+        scheduler._step_count = completed_epochs + 1
+        scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
+    if "scaler_state_dict" in resume_checkpoint:
+        scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+    start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+    print(f"从检查点继续训练: {resume_path}，下一轮 epoch={start_epoch}")
 
 # ─────────────────────── 4. 训练/验证函数 ───────────────────────
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
     model.train()
-    total_loss = 0.0
-    total_tokens = 0
+    total_loss = torch.zeros((), device=device)
+    total_tokens = torch.zeros((), device=device)
+    progress = tqdm(loader, desc="训练", leave=False)
 
-    for batch in loader:
-        mel = batch["mel"].to(device)       # (B, n_mels, T_mel)
-        tokens = batch["tokens"].to(device)  # (B, S)
-        mask = batch["mask"].to(device)      # (B, S)  True=有效
+    for step, batch in enumerate(progress, 1):
+        mel = batch["mel"].to(device, non_blocking=True)       # (B, n_mels, T_mel)
+        tokens = batch["tokens"].to(device, non_blocking=True)  # (B, S)
+        mask = batch["mask"].to(device, non_blocking=True)      # (B, S)  True=有效
+        loss_mask = batch["loss_mask"].to(device, non_blocking=True)
 
         # teacher forcing: tokens 已经以 SOS 开头，只预测下一个 token。
         dec_input = tokens[:, :-1]
         target = tokens[:, 1:]
 
-        logits = model(mel, dec_input)      # (B, S, vocab)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            logits = model(mel, dec_input)      # (B, S, vocab)
+            token_loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                target.reshape(-1),
+            ).view_as(target)
+            target_loss_mask = loss_mask[:, 1:]
+            token_loss = token_loss * torch.where(target == EOS, EOS_LOSS_WEIGHT, 1.0)
+            loss = token_loss[target_loss_mask].mean()
 
-        loss = criterion(
-            logits.reshape(-1, logits.size(-1)),
-            target.reshape(-1),
-        )
-
-        optimizer.zero_grad()
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
-        n_valid = mask[:, 1:].sum().item()
-        total_loss += loss.item() * n_valid
+        n_valid = target_loss_mask.sum()
+        total_loss += loss.detach() * n_valid
         total_tokens += n_valid
+        if step % 10 == 0:
+            progress.set_postfix(loss=f"{(total_loss / total_tokens.clamp_min(1)).item():.4f}")
 
-    return total_loss / max(total_tokens, 1)
+    return (total_loss / total_tokens.clamp_min(1)).item()
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, device):
     model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    correct = 0
+    total_loss = torch.zeros((), device=device)
+    total_tokens = torch.zeros((), device=device)
+    correct = torch.zeros((), device=device)
+    eos_correct = torch.zeros((), device=device)
+    eos_total = torch.zeros((), device=device)
+    eos_probability = torch.zeros((), device=device)
+    eos_rank = torch.zeros((), device=device)
+    eos_as_frame_start = torch.zeros((), device=device)
 
-    for batch in loader:
-        mel = batch["mel"].to(device)
-        tokens = batch["tokens"].to(device)
-        mask = batch["mask"].to(device)
+    progress = tqdm(loader, desc="验证", leave=False)
+    for step, batch in enumerate(progress, 1):
+        mel = batch["mel"].to(device, non_blocking=True)
+        tokens = batch["tokens"].to(device, non_blocking=True)
+        loss_mask = batch["loss_mask"].to(device, non_blocking=True)
 
         dec_input = tokens[:, :-1]
         target = tokens[:, 1:]
-        target_mask = mask[:, 1:]
+        target_mask = loss_mask[:, 1:]
 
-        logits = model(mel, dec_input)
-        loss = criterion(
-            logits.reshape(-1, logits.size(-1)),
-            target.reshape(-1),
-        )
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            logits = model(mel, dec_input)
+            token_loss = criterion(
+                logits.reshape(-1, logits.size(-1)),
+                target.reshape(-1),
+            ).view_as(target)
+            token_loss = token_loss * torch.where(target == EOS, EOS_LOSS_WEIGHT, 1.0)
+            loss = token_loss[target_mask].mean()
 
-        n_valid = target_mask.sum().item()
-        total_loss += loss.item() * n_valid
+        n_valid = target_mask.sum()
+        total_loss += loss * n_valid
         total_tokens += n_valid
 
         preds = logits.argmax(dim=-1)
         # mask 排除 PAD 位置，只统计有效 token 的准确率
-        correct += ((preds == target) & target_mask).sum().item()
+        correct += ((preds == target) & target_mask).sum()
+        eos_mask = (target == EOS) & target_mask
+        if eos_mask.any():
+            eos_logits = logits[eos_mask]
+            eos_targets = target[eos_mask]
+            eos_total += eos_mask.sum()
+            eos_correct += (eos_logits.argmax(dim=-1) == eos_targets).sum()
+            eos_probability += eos_logits.softmax(dim=-1)[:, EOS].sum()
+            eos_rank += (eos_logits > eos_logits[:, EOS].unsqueeze(1)).sum()
+            eos_as_frame_start += (eos_logits.argmax(dim=-1) == FRAME_START).sum()
 
-    avg_loss = total_loss / max(total_tokens, 1)
-    accuracy = correct / max(total_tokens, 1) * 100
-    return avg_loss, accuracy
+        if step % 10 == 0:
+            progress.set_postfix(loss=f"{(total_loss / total_tokens.clamp_min(1)).item():.4f}")
+
+    avg_loss = total_loss / total_tokens.clamp_min(1)
+    accuracy = correct / total_tokens.clamp_min(1) * 100
+    return (
+        avg_loss.item(),
+        accuracy.item(),
+        (eos_correct / eos_total.clamp_min(1) * 100).item(),
+        (eos_probability / eos_total.clamp_min(1) * 100).item(),
+        (eos_rank / eos_total.clamp_min(1) + 1).item(),
+        (eos_as_frame_start / eos_total.clamp_min(1) * 100).item(),
+    )
+
+
+@torch.no_grad()
+def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
+    model.eval()
+    total_tp = 0
+    total_pred = 0
+    total_target = 0
+    total_windows = 0
+    total_limit_windows = 0
+    total_new_tokens = 0
+    for mel_path in tqdm(mel_paths, desc="整曲生成验证", leave=False):
+        mel = np.load(mel_path)
+        generated_frames, infer_stats = overlap_infer(model, mel, device, verbose=False, return_stats=True)
+        total_windows += infer_stats["windows"]
+        total_limit_windows += infer_stats["limit_windows"]
+        total_new_tokens += infer_stats["new_tokens"]
+        c = compiler()
+        c.parse(chart_by_mel[mel_path].read_text(encoding="utf-8"))
+        level = c.chart.all_levels[level_idx]
+        target_frames = [] if level is None else level.frames
+        tp, pred_count, target_count = content_match_frame_counts(generated_frames, target_frames)
+        total_tp += tp
+        total_pred += pred_count
+        total_target += target_count
+    precision = total_tp / max(total_pred, 1)
+    recall = total_tp / max(total_target, 1)
+    f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
+    return (
+        precision * 100,
+        recall * 100,
+        f1 * 100,
+        total_limit_windows,
+        total_windows,
+        total_new_tokens / max(total_windows, 1),
+    )
+
+
+@torch.no_grad()
+def validate_oracle_prefix(model, loader, device, max_windows):
+    model.eval()
+    checked = 0
+    limit_windows = 0
+    total_new_tokens = 0
+    for batch in loader:
+        for i in range(batch["tokens"].size(0)):
+            if checked >= max_windows:
+                return limit_windows, checked, total_new_tokens / max(checked, 1)
+            valid_len = int(batch["mask"][i].sum().item())
+            loss_positions = batch["loss_mask"][i, :valid_len].nonzero()
+            first_target = int(loss_positions[0].item())
+            prefix = batch["tokens"][i, :first_target].tolist()
+            _tokens, stats = decode_segment(
+                model,
+                batch["mel"][i],
+                device,
+                max_tokens=MAX_TOKENS,
+                prefix_tokens=prefix,
+                return_stats=True,
+                verbose=False,
+            )
+            checked += 1
+            limit_windows += int(stats["hit_limit"])
+            total_new_tokens += int(stats["new_tokens"])
+    return limit_windows, checked, total_new_tokens / max(checked, 1)
 
 
 # ─────────────────────── 5. 主循环 ───────────────────────
 
 if __name__ == "__main__":
-    best_val_loss = float("inf")
+    best_val_loss = float("inf") if resume_checkpoint is None else resume_checkpoint.get("val_loss", float("inf"))
+    best_val_content_f1 = -1.0 if resume_checkpoint is None else resume_checkpoint.get("val_content_f1", -1.0)
+    bad_epochs = 0
 
-    for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, DEVICE)
-        val_loss, val_acc = validate(model, val_loader, criterion, DEVICE)
+    for epoch in range(start_epoch, NUM_EPOCHS + 1):
+        train_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, DEVICE)
+        val_loss, val_acc, eos_acc, eos_prob, eos_rank, eos_to_frame = validate(
+            model, val_loader, criterion, DEVICE
+        )
+        oracle_limits, oracle_windows, oracle_avg_tokens = validate_oracle_prefix(
+            model, val_loader, DEVICE, VAL_ORACLE_WINDOWS
+        )
+        val_precision, val_recall, val_content_f1, limit_windows, gen_windows, avg_new_tokens = validate_generation(
+            model, gen_val_paths, chart_by_mel, LEVEL_IDX, DEVICE
+        )
         scheduler.step()
+        val_loss_improved = val_loss < best_val_loss
 
         lr_now = scheduler.get_last_lr()[0]
         print(
             f"Epoch [{epoch}/{NUM_EPOCHS}]  "
-            f"lr={lr_now:.2e}  "
-            f"train_loss={train_loss:.4f}  "
-            f"val_loss={val_loss:.4f}  "
-            f"val_acc={val_acc:.2f}%"
+            f"学习率={lr_now:.2e}  "
+            f"训练损失={train_loss:.4f}  "
+            f"验证损失={val_loss:.4f}  "
+            f"看答案续写猜对率={val_acc:.2f}%  "
+            f"EOS准确率={eos_acc:.2f}%  "
+            f"EOS概率={eos_prob:.2f}%  "
+            f"EOS平均排名={eos_rank:.1f}  "
+            f"EOS误判FRAME_START={eos_to_frame:.2f}%  "
+            f"真值前缀撞上限={oracle_limits}/{oracle_windows}  "
+            f"真值前缀平均新增token={oracle_avg_tokens:.1f}  "
+            f"整曲生成P={val_precision:.2f}%  "
+            f"整曲生成R={val_recall:.2f}%  "
+            f"整曲生成F1={val_content_f1:.2f}%  "
+            f"撞上限={limit_windows}/{gen_windows}  "
+            f"平均新增token={avg_new_tokens:.1f}"
         )
 
-        if val_loss < best_val_loss:
+        if val_loss_improved:
             best_val_loss = val_loss
+            bad_epochs = 0
             ckpt_path = CHECKPOINT_DIR / "best.pt"
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "val_loss": val_loss,
+                "val_precision": val_precision,
+                "val_recall": val_recall,
+                "val_content_f1": val_content_f1,
                 "dims": dims,
+                "window_config": window_config,
             }, ckpt_path)
-            print(f"  -> saved best checkpoint to {ckpt_path}")
+            print(f"  -> 保存验证损失最优模型到 {ckpt_path}")
+        if val_content_f1 > best_val_content_f1:
+            best_val_content_f1 = val_content_f1
+            ckpt_path = CHECKPOINT_DIR / "best_gen.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "val_loss": val_loss,
+                "val_precision": val_precision,
+                "val_recall": val_recall,
+                "val_content_f1": val_content_f1,
+                "dims": dims,
+                "window_config": window_config,
+            }, ckpt_path)
+            print(f"  -> 保存生成效果最优模型到 {ckpt_path}")
+        if not val_loss_improved:
+            bad_epochs += 1
+            if bad_epochs >= EARLY_STOP_PATIENCE:
+                print(f"  -> 验证集连续 {EARLY_STOP_PATIENCE} 轮没有改善，提前停止")
+                break

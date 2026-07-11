@@ -8,12 +8,14 @@ Four-step workflow:
 """
 
 from pathlib import Path
+import random
+from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 from mel_cache import main as rebuild_cache
-from maidata_parser import compiler
+from maidata_parser import EOS, FRAME_END, FRAME_START, LANE_BASE, SOS, TOUCH_BASE, compiler
 
 
 # ── Step 2: Validate dataset ─────────────────────────────────────────────
@@ -63,8 +65,72 @@ def validate_dataset(
 
 # ── Step 3: Compile charts & build index ──────────────────────────────────
 
-# Each index entry: (mel_path, start_frame, end_frame, tokens_list)
-_IndexEntry = tuple[Path, int, int, list[int]]
+PREFIX_START_SEC = 6.0
+TARGET_START_SEC = 12.0
+TARGET_END_SEC = 22.0
+
+
+class _IndexEntry(NamedTuple):
+    mel_path: Path
+    source_start_frame: int
+    source_end_frame: int
+    left_pad_frames: int
+    window_start_sec: float
+    target_start_sec: float
+    tokens: list[int]
+    loss_mask: list[bool]
+
+
+def rotate_token_id(token: int, steps: int) -> int:
+    """把 8 轨相关 token 向右旋转 steps 次；旋转 8 次必须还原。"""
+    steps %= 8
+    if steps == 0:
+        return token
+
+    if LANE_BASE <= token < LANE_BASE + 8:
+        return LANE_BASE + ((token - LANE_BASE + steps) % 8)
+
+    if TOUCH_BASE <= token < TOUCH_BASE + 33:
+        offset = token - TOUCH_BASE
+        if 0 <= offset < 8:       # A1~A8
+            return TOUCH_BASE + ((offset + steps) % 8)
+        if 8 <= offset < 16:      # B1~B8
+            return TOUCH_BASE + 8 + ((offset - 8 + steps) % 8)
+        if offset == 16:          # C 不随 8 轨旋转
+            return token
+        if 17 <= offset < 25:     # D1~D8
+            return TOUCH_BASE + 17 + ((offset - 17 + steps) % 8)
+        if 25 <= offset < 33:     # E1~E8
+            return TOUCH_BASE + 25 + ((offset - 25 + steps) % 8)
+
+    return token
+
+
+def rotate_token_list(tokens: list[int], steps: int) -> list[int]:
+    return [rotate_token_id(token, steps) for token in tokens]
+
+
+class RotatedDataset(Dataset):
+    """把基础数据集扩成 8 个方向；只旋转 token，不改音频。"""
+
+    def __init__(self, base: Dataset, rotations: int = 8):
+        self.base = base
+        self.rotations = rotations
+
+    def __len__(self) -> int:
+        return len(self.base) * self.rotations
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.base[idx // self.rotations]
+        steps = idx % self.rotations
+        if steps == 0:
+            return item
+        rotated = dict(item)
+        rotated["tokens"] = torch.tensor(
+            rotate_token_list(item["tokens"].tolist(), steps),
+            dtype=item["tokens"].dtype,
+        )
+        return rotated
 
 
 def compile_index(
@@ -72,18 +138,18 @@ def compile_index(
     level_idx: int,
     sample_rate: int = 22050,
     hop_length: int = 256,
+    stride_sec: float = 1.0,
+    mel_frames: int = 3000,
 ) -> tuple[list[_IndexEntry], int, dict[str, int]]:
-    """Build index: for each segment, store mel slice coords + tokens.
-
-    Does NOT load any mel data. Only stores (mel_path, start_frame, end_frame, tokens).
-    """
+    """构建平移窗口：6..12 秒谱面前缀，12..22 秒训练目标。"""
     index: list[_IndexEntry] = []
     max_tokens = 0
-    total_segments = 0
+    total_windows = 0
     total_frames = 0
     parse_errors = 0
     c = compiler(hop_length=hop_length, sample_rate=sample_rate)
     frames_per_sec = sample_rate / hop_length
+    window_sec = mel_frames / frames_per_sec
 
     for maidata_path, mel_path in valid_pairs:
         try:
@@ -97,43 +163,69 @@ def compile_index(
         if level is None:
             continue
 
-        offsets, tensors = c.to_tensor(level_idx=level_idx)
-        if not offsets:
-            continue
-
         total_frames += len(level.frames)
-        token_lists = [t.tolist() for t in tensors]
 
-        # need mel total frames to compute end boundary for last segment
+        # 只读 shape；实际 mel 数据仍在 __getitem__ 里按需 mmap。
         mel_arr = np.load(str(mel_path))
         mel_total_frames = mel_arr.shape[1]
         del mel_arr
+        song_end_sec = mel_total_frames / frames_per_sec
 
-        for seg_i in range(len(offsets)):
-            start_offset = offsets[seg_i]
-            if seg_i + 1 < len(offsets):
-                end_offset = offsets[seg_i + 1]
-            else:
-                end_offset = mel_total_frames / frames_per_sec
+        target_start = 0.0
+        while target_start < song_end_sec:
+            window_start = target_start - TARGET_START_SEC
+            logical_start_frame = round(window_start * frames_per_sec)
+            source_start = max(0, logical_start_frame)
+            source_end = min(mel_total_frames, logical_start_frame + mel_frames)
+            left_pad = source_start - logical_start_frame
 
-            start_frame = max(0, int(start_offset * frames_per_sec))
-            end_frame = min(mel_total_frames, int(end_offset * frames_per_sec))
-            if end_frame <= start_frame:
-                end_frame = min(start_frame + 1, mel_total_frames)
+            tl = [SOS]
+            loss_mask = [False]
+            for frame in level.frames:
+                if not frame.notes:
+                    continue
+                rel_cs = round((frame.time_sec - window_start) * 100)
+                is_prefix = round(PREFIX_START_SEC * 100) <= rel_cs < round(TARGET_START_SEC * 100)
+                is_target = round(TARGET_START_SEC * 100) <= rel_cs < round(TARGET_END_SEC * 100)
+                if not (is_prefix or is_target):
+                    continue
 
-            tl = token_lists[seg_i]
+                frame_tokens = [FRAME_START, c._ts_token(rel_cs / 100.0)]
+                for note in frame.notes:
+                    frame_tokens.extend(c._encode_note_tokens(note))
+                frame_tokens.append(FRAME_END)
+                tl.extend(frame_tokens)
+                loss_mask.extend([is_target] * len(frame_tokens))
+            tl.append(EOS)
+            loss_mask.append(True)
+
             if len(tl) > max_tokens:
                 max_tokens = len(tl)
 
-            index.append((mel_path, start_frame, end_frame, tl))
-            total_segments += 1
+            index.append(_IndexEntry(
+                mel_path=mel_path,
+                source_start_frame=source_start,
+                source_end_frame=max(source_start, source_end),
+                left_pad_frames=left_pad,
+                window_start_sec=window_start,
+                target_start_sec=target_start,
+                tokens=tl,
+                loss_mask=loss_mask,
+            ))
+            total_windows += 1
+            target_start += stride_sec
 
     stats = {
         "charts": len(valid_pairs),
-        "segments": total_segments,
+        "windows": total_windows,
         "frames": total_frames,
         "max_tokens": max_tokens,
         "parse_errors": parse_errors,
+        "window_sec": window_sec,
+        "stride_sec": stride_sec,
+        "prefix_start_sec": PREFIX_START_SEC,
+        "target_start_sec": TARGET_START_SEC,
+        "target_end_sec": TARGET_END_SEC,
     }
     return index, max_tokens, stats
 
@@ -151,11 +243,16 @@ class ChartDataset(Dataset):
         self,
         charts_dir: str | Path,
         cache_dir: str | Path | None = None,
-        level_idx: int = 4,
+        level_idx: int = 5,
         max_tokens: int = 0,
         sample_rate: int = 22050,
         hop_length: int = 256,
         n_mels: int = 80,
+        stride_sec: float = 1.0,
+        mel_frames: int = 3000,
+        valid_pairs: list[tuple[Path, Path]] | None = None,
+        chart_limit: int = 0,
+        seed: int = 42,
     ):
         self.charts_dir = Path(charts_dir)
         self.cache_dir = Path(cache_dir) if cache_dir else self.charts_dir.parent / ".cache" / "charts"
@@ -163,15 +260,27 @@ class ChartDataset(Dataset):
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.n_mels = n_mels
+        self.stride_sec = stride_sec
+        self.mel_frames = mel_frames
+        self._mel_cache: dict[Path, np.ndarray] = {}
 
         # ── Step 1: rebuild cache ──
-        print("[dataset] Step 1: rebuilding mel cache...")
-        cached, errs = rebuild_cache(charts_dir, self.cache_dir, sample_rate, 1024, hop_length, n_mels)
-        print(f"[dataset]   {cached} cached, {errs} errors")
+        if valid_pairs is None:
+            print("[dataset] Step 1: rebuilding mel cache...")
+            cached, errs = rebuild_cache(charts_dir, self.cache_dir, sample_rate, 1024, hop_length, n_mels)
+            print(f"[dataset]   {cached} cached, {errs} errors")
 
-        # ── Step 2: validate ──
-        print("[dataset] Step 2: validating dataset...")
-        valid, invalid = validate_dataset(charts_dir, self.cache_dir)
+            # ── Step 2: validate ──
+            print("[dataset] Step 2: validating dataset...")
+            valid, invalid = validate_dataset(charts_dir, self.cache_dir)
+        else:
+            valid = list(valid_pairs)
+            invalid = []
+        if chart_limit > 0 and len(valid) > chart_limit:
+            rng = random.Random(seed)
+            valid = rng.sample(valid, chart_limit)
+            valid.sort()
+        self.valid_pairs = valid
         print(f"[dataset]   {len(valid)} valid, {len(invalid)} invalid")
         for path, reason in invalid[:5]:
             print(f"[dataset]   ✗ {path.parent.name}: {reason}")
@@ -179,7 +288,12 @@ class ChartDataset(Dataset):
         # ── Step 3: compile & build index ──
         print("[dataset] Step 3: compiling index...")
         self._index, computed_max, stats = compile_index(
-            valid, self.level_idx, sample_rate, hop_length,
+            valid,
+            self.level_idx,
+            sample_rate,
+            hop_length,
+            stride_sec,
+            mel_frames,
         )
         self.max_tokens = max_tokens if max_tokens > 0 else computed_max
         print(f"[dataset]   {stats}")
@@ -188,16 +302,26 @@ class ChartDataset(Dataset):
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict:
-        mel_path, start_frame, end_frame, tl = self._index[idx]
+        entry = self._index[idx]
 
-        # ── load mel from disk, slice on the fly ──
-        mel_full = np.load(str(mel_path))
-        mel_slice = torch.from_numpy(mel_full[:, start_frame:end_frame].copy()).float()
-        if mel_slice.shape[1] == 0:
-            mel_slice = torch.zeros(self.n_mels, 1)
+        # 每个 DataLoader worker 复用 mmap，避免同一首歌的分段反复从磁盘读整文件。
+        mel_full = self._mel_cache.get(entry.mel_path)
+        if mel_full is None:
+            mel_full = np.load(str(entry.mel_path), mmap_mode="r")
+            self._mel_cache[entry.mel_path] = mel_full
+        source = torch.from_numpy(
+            mel_full[:, entry.source_start_frame:entry.source_end_frame].copy()
+        ).float()
+        mel_slice = torch.zeros(self.n_mels, self.mel_frames)
+        copy_len = min(source.shape[1], self.mel_frames - entry.left_pad_frames)
+        if copy_len > 0:
+            mel_slice[:, entry.left_pad_frames:entry.left_pad_frames + copy_len] = source[:, :copy_len]
 
         # ── pad tokens ──
-        length = min(len(tl), self.max_tokens)
+        tl = entry.tokens
+        if len(tl) > self.max_tokens:
+            raise ValueError(f"窗口 token 数 {len(tl)} 超过 max_tokens={self.max_tokens}，拒绝截断合法序列")
+        length = len(tl)
         if length >= self.max_tokens:
             tokens = torch.tensor(tl[:self.max_tokens], dtype=torch.int64)
             mask = torch.ones(self.max_tokens, dtype=torch.bool)
@@ -208,7 +332,18 @@ class ChartDataset(Dataset):
                 torch.zeros(self.max_tokens - length, dtype=torch.bool),
             ])
 
-        return {"mel": mel_slice, "tokens": tokens, "mask": mask}
+        loss_mask = torch.tensor(
+            entry.loss_mask + [False] * (self.max_tokens - length),
+            dtype=torch.bool,
+        )
+        return {
+            "mel": mel_slice,
+            "tokens": tokens,
+            "mask": mask,
+            "loss_mask": loss_mask,
+            "window_start_sec": entry.window_start_sec,
+            "target_start_sec": entry.target_start_sec,
+        }
 
 
 # ── collate ───────────────────────────────────────────────────────────────
@@ -225,21 +360,19 @@ def collate_segments(batch: list[dict], mel_frames: int = 0) -> dict:
     if mel_frames <= 0:
         mel_frames = max(item["mel"].shape[1] for item in batch)
 
-    mels = []
-    for item in batch:
+    mels = torch.zeros(len(batch), n_mels, mel_frames)
+    for i, item in enumerate(batch):
         mel = item["mel"]                        # (n_mels, T)
         T = mel.shape[1]
-        if T < mel_frames:
-            pad = torch.zeros(n_mels, mel_frames - T)
-            mel = torch.cat([mel, pad], dim=1)
-        elif T > mel_frames:
-            mel = mel[:, :mel_frames]
-        mels.append(mel)
+        mels[i, :, :min(T, mel_frames)] = mel[:, :mel_frames]
 
     return {
-        "mel": torch.stack(mels),
+        "mel": mels,
         "tokens": torch.stack([item["tokens"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
+        "loss_mask": torch.stack([item["loss_mask"] for item in batch]),
+        "window_start_sec": torch.tensor([item["window_start_sec"] for item in batch]),
+        "target_start_sec": torch.tensor([item["target_start_sec"] for item in batch]),
     }
 
 
@@ -253,7 +386,7 @@ def _self_check():
 
     from maidata_parser import SOS, EOS
 
-    ds = ChartDataset(charts_dir, max_tokens=2048, level_idx=4)
+    ds = ChartDataset(charts_dir, max_tokens=2048, level_idx=5)
     print(f"[dataset] total: {len(ds)} segments")
 
     if len(ds) > 0:

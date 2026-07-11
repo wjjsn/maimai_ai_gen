@@ -61,6 +61,8 @@ def allowed_tokens(
     tokens: list[int],
     max_notes_per_frame: int = 33,
     max_action_notes_per_frame: int = 4,
+    min_frame_time: int = 0,
+    max_frame_time: int = 2999,
 ) -> tuple[int, ...]:
     """返回下一步允许的 token。只做语法约束，不判断音乐合理性。"""
     if not tokens:
@@ -76,7 +78,7 @@ def allowed_tokens(
 
     frame = tokens[start:]
     if len(frame) == 1:
-        return _times_from(_previous_frame_time(tokens[:start]))
+        return _times_from(max(_previous_frame_time(tokens[:start]), min_frame_time), max_frame_time)
     if len(frame) == 2:
         return NOTE_TYPES
 
@@ -101,8 +103,8 @@ def _previous_frame_time(tokens: list[int]) -> int:
     return 0
 
 
-def _times_from(min_time: int) -> tuple[int, ...]:
-    return tuple(range(TS_BASE + min_time, TS_BASE + 3000))
+def _times_from(min_time: int, max_time: int = 2999) -> tuple[int, ...]:
+    return tuple(range(TS_BASE + min_time, TS_BASE + min(max_time, 2999) + 1))
 
 
 def _allowed_in_frame(body: list[int], max_notes_per_frame: int, max_action_notes_per_frame: int) -> tuple[int, ...]:

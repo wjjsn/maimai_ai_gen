@@ -902,7 +902,7 @@ class compiler:
             return end
         return frame_time
 
-    def to_tensor(self, level_idx: int = 4) -> tuple[list[float], list[torch.Tensor]]:
+    def to_tensor(self, level_idx: int = 5) -> tuple[list[float], list[torch.Tensor]]:
         """Export a single level to segmented token sequences.
 
         Follows doc/token化设计.md §6:
@@ -1024,7 +1024,7 @@ class compiler:
 
     def to_training_data(
         self,
-        level_idx: int = 4,
+        level_idx: int = 5,
         max_tokens: int = 0,
     ) -> tuple[list[float], torch.Tensor, torch.Tensor]:
         """Export a level ready for the Data Loader.
@@ -1107,6 +1107,11 @@ class compiler:
         skipped_tokens: list[tuple[int, int]] = []  # (pos, token_id)
 
         while i < n:
+            if tok[i] in (SOS, PAD):
+                i += 1
+                continue
+            if tok[i] == EOS:
+                break
             if tok[i] != FRAME_START:
                 skipped_tokens.append((i, tok[i]))
                 i += 1
@@ -1310,7 +1315,7 @@ class compiler:
     def parse_from_tensor(
         self,
         data: tuple[list[float], list[torch.Tensor]],
-        level_idx: int = 4,
+        level_idx: int = 5,
         title: str = "generated",
         artist: str | None = None,
         level_query: float | None = None,
@@ -1369,7 +1374,7 @@ class compiler:
             else:
                 abs_offset = inferred_offset
 
-            rel_frames = self._parse_token_segment(seg_tok)
+            rel_frames = self._parse_token_segment([t for t in seg_tok if t not in (SOS, EOS, PAD)])
             if not rel_frames:
                 print(f"[parse_from_tensor] 段 {seg_idx} (offset={abs_offset:.3f}s) 解码出 0 帧")
 
