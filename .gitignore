@@ -29,3 +29,5 @@ Thumbs.db
 # uv
 charts/
 tmp/
+checkpoints/
+*.pt
