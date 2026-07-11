@@ -33,7 +33,10 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 CHARTS_DIR = Path(os.environ.get("MAIMAI_CHARTS_DIR", ROOT_DIR / "charts"))
 LEVEL_IDX = int(os.environ.get("MAIMAI_LEVEL_IDX", "5"))          # 默认 Master
 MAX_TOKENS = int(os.environ.get("MAIMAI_MAX_TOKENS", "2048"))      # 序列最大长度
-BATCH_SIZE = int(os.environ.get("MAIMAI_BATCH_SIZE", "16"))
+BATCH_SIZE = int(os.environ.get("MAIMAI_BATCH_SIZE", "24"))
+NUM_WORKERS = int(os.environ.get("MAIMAI_NUM_WORKERS", "2"))
+PREFETCH_FACTOR = int(os.environ.get("MAIMAI_PREFETCH_FACTOR", "2"))
+PIN_MEMORY = os.environ.get("MAIMAI_PIN_MEMORY", "1") == "1"
 NUM_EPOCHS = int(os.environ.get("MAIMAI_NUM_EPOCHS", "500"))
 LR = float(os.environ.get("MAIMAI_LR", "3e-4"))
 WEIGHT_DECAY = float(os.environ.get("MAIMAI_WEIGHT_DECAY", "0.01"))
@@ -147,12 +150,16 @@ else:
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
     collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
-    num_workers=3, pin_memory=True, persistent_workers=True, prefetch_factor=4,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    persistent_workers=NUM_WORKERS > 0,
+    prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
 )
 val_loader = DataLoader(
     val_ds, batch_size=BATCH_SIZE, shuffle=False,
     collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
-    num_workers=3, pin_memory=True, persistent_workers=True, prefetch_factor=4,
+    num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
+    persistent_workers=NUM_WORKERS > 0,
+    prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
 )
 
 # ─────────────────────── 3. 损失 & 优化器 ───────────────────────

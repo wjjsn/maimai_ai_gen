@@ -7,6 +7,8 @@ Four-step workflow:
   Step 4: 迭代读取    — __getitem__ loads mel from disk, slices on the fly
 """
 
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 import random
 from typing import NamedTuple
@@ -14,7 +16,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from mel_cache import main as rebuild_cache
+from chart_cache import ensure_chart_cache
 from maidata_parser import EOS, FRAME_END, FRAME_START, LANE_BASE, SOS, TOUCH_BASE, compiler
 
 
@@ -79,6 +81,60 @@ class _IndexEntry(NamedTuple):
     target_start_sec: float
     tokens: list[int]
     loss_mask: list[bool]
+
+
+@dataclass
+class _CachedIndexEntry:
+    mel_path: Path
+    source_start_frame: int
+    source_end_frame: int
+    left_pad_frames: int
+    window_start_sec: float
+    target_start_sec: float
+    tokens: np.ndarray
+    loss_start: int
+
+    @property
+    def loss_mask(self) -> np.ndarray:
+        mask = np.zeros(len(self.tokens), dtype=bool)
+        mask[self.loss_start:] = True
+        return mask
+
+
+class _CachedIndex:
+    """只保留窗口行号，具体 token 与元数据按需从 mmap 读取。"""
+
+    def __init__(self, cache_path: Path, charts_dir: Path, cache_dir: Path, selected_charts: set[Path] | None = None):
+        import json
+
+        manifest = json.loads((cache_path / "manifest.json").read_text(encoding="utf-8"))
+        self.rows = np.load(cache_path / "entries.npy", mmap_mode="r")
+        self.tokens = np.load(cache_path / "tokens.npy", mmap_mode="r")
+        self.mel_paths = [cache_dir.parent / chart["mel"] for chart in manifest["charts"]]
+        self.chart_paths = [charts_dir / chart["chart"] for chart in manifest["charts"]]
+        if selected_charts is None:
+            self.indices = np.arange(len(self.rows), dtype=np.int64)
+        else:
+            selected_ids = {i for i, path in enumerate(self.chart_paths) if path in selected_charts}
+            self.indices = np.flatnonzero(np.isin(self.rows["chart_id"], list(selected_ids)))
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, index: int) -> _CachedIndexEntry:
+        row = self.rows[self.indices[index]]
+        token_start = int(row["token_start"])
+        token_end = token_start + int(row["token_length"])
+        return _CachedIndexEntry(
+            mel_path=self.mel_paths[int(row["chart_id"])],
+            source_start_frame=int(row["source_start_frame"]),
+            source_end_frame=int(row["source_end_frame"]),
+            left_pad_frames=int(row["left_pad_frames"]),
+            window_start_sec=float(row["window_start_sec"]),
+            target_start_sec=float(row["target_start_sec"]),
+            tokens=self.tokens[token_start:token_end],
+            loss_start=int(row["loss_start"]),
+        )
 
 
 def rotate_token_id(token: int, steps: int) -> int:
@@ -262,41 +318,31 @@ class ChartDataset(Dataset):
         self.n_mels = n_mels
         self.stride_sec = stride_sec
         self.mel_frames = mel_frames
-        self._mel_cache: dict[Path, np.ndarray] = {}
+        self._mel_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
 
-        # ── Step 1: rebuild cache ──
-        if valid_pairs is None:
-            print("[dataset] Step 1: rebuilding mel cache...")
-            cached, errs = rebuild_cache(charts_dir, self.cache_dir, sample_rate, 1024, hop_length, n_mels)
-            print(f"[dataset]   {cached} cached, {errs} errors")
-
-            # ── Step 2: validate ──
-            print("[dataset] Step 2: validating dataset...")
-            valid, invalid = validate_dataset(charts_dir, self.cache_dir)
-        else:
-            valid = list(valid_pairs)
-            invalid = []
+        cache_path = ensure_chart_cache(
+            self.charts_dir,
+            self.cache_dir,
+            level_idx=level_idx,
+            sample_rate=sample_rate,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            stride_sec=stride_sec,
+            mel_frames=mel_frames,
+            build_mel=valid_pairs is None,
+        )
+        all_index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir)
+        all_valid = list(zip(all_index.chart_paths, all_index.mel_paths))
+        valid = list(valid_pairs) if valid_pairs is not None else all_valid
         if chart_limit > 0 and len(valid) > chart_limit:
             rng = random.Random(seed)
             valid = rng.sample(valid, chart_limit)
             valid.sort()
         self.valid_pairs = valid
-        print(f"[dataset]   {len(valid)} valid, {len(invalid)} invalid")
-        for path, reason in invalid[:5]:
-            print(f"[dataset]   ✗ {path.parent.name}: {reason}")
-
-        # ── Step 3: compile & build index ──
-        print("[dataset] Step 3: compiling index...")
-        self._index, computed_max, stats = compile_index(
-            valid,
-            self.level_idx,
-            sample_rate,
-            hop_length,
-            stride_sec,
-            mel_frames,
-        )
+        self._index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir, {path for path, _ in valid})
+        computed_max = max((len(entry.tokens) for entry in self._index), default=0)
         self.max_tokens = max_tokens if max_tokens > 0 else computed_max
-        print(f"[dataset]   {stats}")
+        print(f"[dataset] 缓存索引: {len(valid)} 首歌，{len(self._index)} 个窗口，max_tokens={self.max_tokens}")
 
     def __len__(self) -> int:
         return len(self._index)
@@ -309,6 +355,11 @@ class ChartDataset(Dataset):
         if mel_full is None:
             mel_full = np.load(str(entry.mel_path), mmap_mode="r")
             self._mel_cache[entry.mel_path] = mel_full
+            # ponytail: 每个 worker 最多保持 8 个 mmap；需要更多时再按命中率调大。
+            if len(self._mel_cache) > 8:
+                self._mel_cache.popitem(last=False)
+        else:
+            self._mel_cache.move_to_end(entry.mel_path)
         source = torch.from_numpy(
             mel_full[:, entry.source_start_frame:entry.source_end_frame].copy()
         ).float()
@@ -323,19 +374,18 @@ class ChartDataset(Dataset):
             raise ValueError(f"窗口 token 数 {len(tl)} 超过 max_tokens={self.max_tokens}，拒绝截断合法序列")
         length = len(tl)
         if length >= self.max_tokens:
-            tokens = torch.tensor(tl[:self.max_tokens], dtype=torch.int64)
+            tokens = torch.from_numpy(np.asarray(tl[:self.max_tokens], dtype=np.int64))
             mask = torch.ones(self.max_tokens, dtype=torch.bool)
         else:
-            tokens = torch.tensor(tl + [0] * (self.max_tokens - length), dtype=torch.int64)
+            tokens = torch.zeros(self.max_tokens, dtype=torch.int64)
+            tokens[:length] = torch.from_numpy(np.asarray(tl, dtype=np.int64))
             mask = torch.cat([
                 torch.ones(length, dtype=torch.bool),
                 torch.zeros(self.max_tokens - length, dtype=torch.bool),
             ])
 
-        loss_mask = torch.tensor(
-            entry.loss_mask + [False] * (self.max_tokens - length),
-            dtype=torch.bool,
-        )
+        loss_mask = torch.zeros(self.max_tokens, dtype=torch.bool)
+        loss_mask[entry.loss_start:length] = True
         return {
             "mel": mel_slice,
             "tokens": tokens,
