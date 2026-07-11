@@ -1,7 +1,10 @@
+import json
 import re
+import hashlib
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
+from urllib.request import urlopen
 
 import torch
 
@@ -179,6 +182,101 @@ IS_SLIDE_NO_HEAD = 3071
 VOCAB_SIZE = 3072
 
 # ── helpers ────────────────────────────────────────────────────────────────
+
+_MUSIC_DATA_URL = "https://www.diving-fish.com/api/maimaidxprober/music_data"
+
+
+def _music_data_path() -> Path:
+    return Path(__file__).resolve().parent.parent / ".cache" / "music_data.json"
+
+
+def load_music_data() -> list[dict]:
+    """只读取已下载的本地歌曲表；解析谱面绝不访问网络。"""
+    try:
+        data = json.loads(_music_data_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def update_music_data() -> None:
+    """显式下载歌曲表，供索引筛选等离线流程使用。"""
+    with urlopen(_MUSIC_DATA_URL, timeout=30) as response:
+        data = json.load(response)
+    if not isinstance(data, list):
+        raise ValueError("歌曲表格式错误")
+    path = _music_data_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    temp.replace(path)
+
+
+def music_data_version() -> str:
+    """本地歌曲表内容摘要；更新歌曲表才会改变训练索引。"""
+    data = json.dumps(load_music_data(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def _local_level_names(text: str) -> dict[int, str]:
+    return {
+        int(match.group(1)): match.group(2).strip()
+        for match in re.finditer(r"^&lv_(\d)=([^\n]*)$", text, re.MULTILINE)
+    }
+
+
+def _fallback_level_name(level: str) -> str:
+    try:
+        value = float(level)
+    except ValueError:
+        return level
+    if value == 13.0:
+        return "13"
+    if value == 13.5:
+        return "13+"
+    return level
+
+
+def _level_to_float(level: str) -> float | None:
+    try:
+        return float(level)
+    except ValueError:
+        if level.endswith("+"):
+            try:
+                return float(level[:-1]) + 0.5
+            except ValueError:
+                pass
+    return None
+
+
+def _levels_match(song: dict, local_levels: dict[int, str], *, fallback: bool) -> bool:
+    compared = False
+    for level_idx, local_level in local_levels.items():
+        ds_index = level_idx - 2
+        levels = song.get("level", [])
+        if not 0 <= ds_index < len(levels):
+            continue
+        compared = True
+        expected = _fallback_level_name(local_level) if fallback else local_level
+        if expected != levels[ds_index]:
+            return False
+    return compared
+
+
+def _match_music(text: str, title: str, songs: list[dict]) -> dict | None:
+    shortid_match = re.search(r"^&shortid=(\d+)\s*$", text, re.MULTILINE)
+    if shortid_match:
+        shortid = shortid_match.group(1)
+        song = next((song for song in songs if str(song.get("id")) == shortid), None)
+        if song is not None:
+            return song
+    matches = [song for song in songs if song.get("title") == title]
+    local_levels = _local_level_names(text)
+    for fallback in (False, True):
+        matched = [song for song in matches if _levels_match(song, local_levels, fallback=fallback)]
+        if len(matched) == 1:
+            return matched[0]
+    return None
 
 _LANE_MAP = {
     "1": TapType.LANE1, "2": TapType.LANE2, "3": TapType.LANE3, "4": TapType.LANE4,
@@ -660,7 +758,7 @@ class compiler:
 
     # ── main parse ────────────────────────────────────────────────────────
 
-    def parse(self, text: str):
+    def parse(self, text: str, music_data: list[dict] | None = None):
         self.chart = Chart(all_levels=[None] * 7)
 
         title_match = re.search(r"&title=([^\n]+)", text)
@@ -670,6 +768,9 @@ class compiler:
         artist_match = re.search(r"&artist=([^\n]+)", text)
         if artist_match:
             self.chart.artist = artist_match.group(1).strip()
+
+        # 调用方显式传入本地歌曲表时才使用云端元数据；解析本身不读文件或联网。
+        song = _match_music(text, self.chart.title, music_data) if music_data is not None else None
 
         for level in range(0, 7):
             level_match = re.search(
@@ -730,8 +831,14 @@ class compiler:
                 for t, notes in sorted(frames_by_time.items())
             ]
             level_name = f"level_{level + 1}"
-            level_query_match = re.search(rf"&lv_{level}=([0-9.]+)", text)
-            level_query = float(level_query_match.group(1)) if level_query_match else None
+            level_query_match = re.search(rf"&lv_{level}=([^\n]+)", text)
+            level_query = _level_to_float(level_query_match.group(1).strip()) if level_query_match else None
+            ds_index = level - 2  # maidata lv_2..lv_6 对应 API Basic..Re:Master。
+            if song is not None and 0 <= ds_index < len(song.get("ds", [])):
+                try:
+                    level_query = float(song["ds"][ds_index])
+                except (TypeError, ValueError):
+                    pass
             self.chart.all_levels[level] = Level(
                 level_name=level_name, level_query=level_query, frames=frames
             )

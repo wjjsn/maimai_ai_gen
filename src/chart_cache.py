@@ -10,10 +10,10 @@ from pathlib import Path
 
 import numpy as np
 
-from maidata_parser import EOS, FRAME_END, FRAME_START, SOS, compiler
+from maidata_parser import EOS, FRAME_END, FRAME_START, SOS, _match_music, compiler, load_music_data, music_data_version
 from mel_cache import main as rebuild_mel_cache
 
-CACHE_VERSION = 1
+CACHE_VERSION = 3
 PREFIX_START_SEC = 6.0
 TARGET_START_SEC = 12.0
 TARGET_END_SEC = 22.0
@@ -35,7 +35,7 @@ def _state(path: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-def _config(level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int) -> dict:
+def _config(level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, music_version: str) -> dict:
     return {
         "cache_version": CACHE_VERSION,
         "level_idx": level_idx,
@@ -47,6 +47,7 @@ def _config(level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stri
         "prefix_start_sec": PREFIX_START_SEC,
         "target_start_sec": TARGET_START_SEC,
         "target_end_sec": TARGET_END_SEC,
+        "music_data_version": music_version,
     }
 
 
@@ -139,14 +140,21 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     entries = []
     tokens: list[int] = []
     charts = []
+    songs = load_music_data()
+    excluded = 0
     for source in sources:
         chart_path = charts_dir / source["chart"]
         mel_path = cache_dir.parent / source["mel"]
         try:
+            text = chart_path.read_text(encoding="utf-8")
             parser = compiler(hop_length=config["hop_length"], sample_rate=config["sample_rate"])
-            parser.parse(chart_path.read_text(encoding="utf-8"))
+            parser.parse(text, music_data=songs)
         except Exception as error:
             print(f"[chart-cache] 跳过无法解析的谱面 {source['chart']}: {error}")
+            continue
+        song = _match_music(text, parser.chart.title, songs)
+        if song is not None and song.get("basic_info", {}).get("genre") == "宴会場":
+            excluded += 1
             continue
         level = parser.chart.all_levels[config["level_idx"]]
         if level is None:
@@ -192,6 +200,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     manifest = {"config": config, "sources": sources, "charts": charts, "windows": len(entries)}
     (build_path / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
     (build_path / "COMPLETE").touch()
+    print(f"[chart-cache] 宴会場排除 {excluded} 首")
 
 
 def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, build_mel: bool = True) -> Path:
@@ -199,7 +208,7 @@ def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_i
     cache_dir = Path(cache_dir)
     if build_mel:
         rebuild_mel_cache(charts_dir, cache_dir, sample_rate, 1024, hop_length, n_mels)
-    config = _config(level_idx, sample_rate, hop_length, n_mels, stride_sec, mel_frames)
+    config = _config(level_idx, sample_rate, hop_length, n_mels, stride_sec, mel_frames, music_data_version())
     cache_root, lock_path = _paths(cache_dir, config)
     sources = _scan_sources(charts_dir, cache_dir)
     current_path = _current_path(cache_root)
