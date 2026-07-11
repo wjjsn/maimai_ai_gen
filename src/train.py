@@ -388,8 +388,8 @@ def validate_oracle_prefix(model, loader, device, max_windows):
 # ─────────────────────── 5. 主循环 ───────────────────────
 
 if __name__ == "__main__":
-    best_val_loss = float("inf") if resume_checkpoint is None else resume_checkpoint.get("val_loss", float("inf"))
-    best_val_content_f1 = -1.0 if resume_checkpoint is None else resume_checkpoint.get("val_content_f1", -1.0)
+    best_val_loss = float("inf")
+    best_val_content_f1 = -1.0
     bad_epochs = 0
 
     for epoch in range(start_epoch, NUM_EPOCHS + 1):
