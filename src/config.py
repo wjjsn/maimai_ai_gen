@@ -23,6 +23,8 @@ class MertConfig:
     chunk_sec: float
     context_sec: float
     cache_float16: bool
+    audio_workers: int
+    batch_size: int
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,9 @@ class TrainingConfig:
     overfit_charts: int
     resume_path: Path | None
     rotations: int
+    audio_augment_probability: float
+    feature_noise_std: float
+    max_time_mask_frames: int
 
 
 @dataclass(frozen=True)
@@ -95,6 +100,8 @@ SECTIONS = {
         "分块秒数": "chunk_sec",
         "上下文秒数": "context_sec",
         "缓存半精度": "cache_float16",
+        "音频工作线程数": "audio_workers",
+        "最大批大小": "batch_size",
     }),
     "滑窗": (WindowConfig, {
         "MERT帧数": "mert_frames",
@@ -131,6 +138,9 @@ SECTIONS = {
         "过拟合歌曲数": "overfit_charts",
         "恢复检查点": "resume_path",
         "旋转增强数": "rotations",
+        "音频增强概率": "audio_augment_probability",
+        "特征噪声强度": "feature_noise_std",
+        "最大时间遮挡帧数": "max_time_mask_frames",
     }),
     "推理": (InferenceConfig, {
         "检查点": "checkpoint",
@@ -209,6 +219,8 @@ def _validate_config(config: AppConfig) -> None:
     _require(math.isfinite(mert.chunk_sec) and mert.chunk_sec > 0, "配置 MERT.分块秒数 必须大于 0")
     _require(math.isfinite(mert.context_sec) and mert.context_sec >= 0, "配置 MERT.上下文秒数 不能小于 0")
     _require(mert.context_sec * 2 < mert.chunk_sec, "配置 MERT.上下文秒数的两倍必须小于分块秒数")
+    _require(mert.audio_workers > 0, "配置 MERT.音频工作线程数 必须大于 0")
+    _require(mert.batch_size > 0, "配置 MERT.最大批大小 必须大于 0")
 
     _require(window.mert_frames > 0, "配置 滑窗.MERT帧数 必须大于 0")
     _require(window.prefix_start_sec >= 0, "配置 滑窗.前缀开始秒 不能小于 0")
@@ -261,6 +273,9 @@ def _validate_config(config: AppConfig) -> None:
     _require(training.val_oracle_windows >= 0, "配置 训练.真值前缀验证窗口数 不能小于 0")
     _require(training.overfit_charts >= 0, "配置 训练.过拟合歌曲数 不能小于 0")
     _require(training.rotations in range(1, 9), "配置 训练.旋转增强数 必须在 1 到 8 之间")
+    _require(0 <= training.audio_augment_probability <= 1, "配置 训练.音频增强概率 必须在 0 到 1 之间")
+    _require(training.feature_noise_std >= 0, "配置 训练.特征噪声强度 不能小于 0")
+    _require(training.max_time_mask_frames >= 0, "配置 训练.最大时间遮挡帧数 不能小于 0")
     _require(0 <= inference.level_idx <= 6, "配置 推理.难度编号 必须在 0 到 6 之间")
     _require(inference.start_sec >= 0, "配置 推理.开始秒 不能小于 0")
 
@@ -404,6 +419,20 @@ def _self_check() -> None:
     _expect_error(
         "状态维度 至少为 4",
         lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, state=2, head=1))),
+    )
+    _expect_error(
+        "音频增强概率",
+        lambda: _validate_config(replace(
+            CONFIG,
+            training=replace(CONFIG.training, audio_augment_probability=1.1),
+        )),
+    )
+    _expect_error(
+        "最大时间遮挡帧数",
+        lambda: _validate_config(replace(
+            CONFIG,
+            training=replace(CONFIG.training, max_time_mask_frames=-1),
+        )),
     )
     _expect_error(
         "时间戳上限",

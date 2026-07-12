@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from model import Whisper, ModelDimensions
 from config import CONFIG, checkpoint_config, validate_checkpoint_config
-from dataset import ChartDataset, RotatedDataset, collate_segments
+from dataset import AudioAugmentedDataset, ChartDataset, RotatedDataset, collate_segments
 from content_metrics import content_match_frame_counts
 from infer import decode_segment, overlap_infer
 from maidata_parser import compiler
@@ -119,7 +119,13 @@ else:
     train_indices = [i for p in chart_paths if p not in val_charts for i in by_chart[p]]
     val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in val_charts]
 base_train_ds = Subset(train_full_ds, train_indices)
-train_ds = RotatedDataset(base_train_ds, rotations=CONFIG.training.rotations)
+augmented_train_ds = AudioAugmentedDataset(
+    base_train_ds,
+    probability=CONFIG.training.audio_augment_probability,
+    noise_std=CONFIG.training.feature_noise_std,
+    max_time_mask_frames=CONFIG.training.max_time_mask_frames,
+)
+train_ds = RotatedDataset(augmented_train_ds, rotations=CONFIG.training.rotations)
 val_ds = Subset(val_full_ds, val_indices)
 if len(base_train_ds) == 0:
     raise ValueError("训练集没有可用窗口；正常训练至少需要两首含指定难度的有效歌曲")

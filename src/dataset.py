@@ -159,6 +159,47 @@ class RotatedDataset(Dataset):
         return rotated
 
 
+class AudioAugmentedDataset(Dataset):
+    """仅在训练时在线增强缓存的 MERT 特征，不改变时间或谱面标签。"""
+
+    def __init__(
+        self,
+        base: Dataset,
+        probability: float,
+        noise_std: float,
+        max_time_mask_frames: int,
+    ):
+        self.base = base
+        self.probability = probability
+        self.noise_std = noise_std
+        self.max_time_mask_frames = max_time_mask_frames
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.base[idx]
+        if self.probability == 0 or torch.rand(()) >= self.probability:
+            return item
+
+        augmented = dict(item)
+        mel = item["mel"].clone()
+        valid_frames = item["audio_mask"].nonzero(as_tuple=True)[0]
+        if self.noise_std > 0:
+            valid = mel[valid_frames]
+            mel[valid_frames] = (
+                valid
+                + torch.randn_like(valid) * valid.std(unbiased=False) * self.noise_std
+            )
+        if self.max_time_mask_frames > 0 and valid_frames.numel() > 1:
+            length = min(self.max_time_mask_frames, valid_frames.numel() - 1)
+            length = torch.randint(1, length + 1, ()).item()
+            start = torch.randint(0, valid_frames.numel() - length + 1, ()).item()
+            mel[valid_frames[start:start + length]] = 0
+        augmented["mel"] = mel
+        return augmented
+
+
 def compile_index(
     valid_pairs: list[tuple[Path, Path]],
     level_idx: int,
@@ -401,6 +442,28 @@ def collate_segments(batch: list[dict], mert_frames: int = 0) -> dict:
 # ── self-check ────────────────────────────────────────────────────────────
 
 def _self_check():
+    base_item = {
+        "mel": torch.tensor([[0.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [0.0, 0.0]]),
+        "audio_mask": torch.tensor([False, True, True, True, False]),
+        "tokens": torch.tensor([SOS, EOS]),
+        "mask": torch.tensor([True, True]),
+        "loss_mask": torch.tensor([False, True]),
+        "window_start_sec": 0.0,
+        "target_start_sec": 12.0,
+    }
+    torch.manual_seed(0)
+    augmented = AudioAugmentedDataset([base_item], 1.0, 0.1, 2)[0]
+    torch.manual_seed(0)
+    repeated = AudioAugmentedDataset([base_item], 1.0, 0.1, 2)[0]
+    assert torch.equal(augmented["mel"], repeated["mel"])
+    assert torch.equal(
+        base_item["mel"],
+        torch.tensor([[0.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [0.0, 0.0]]),
+    )
+    assert torch.equal(augmented["audio_mask"], base_item["audio_mask"])
+    assert torch.equal(augmented["tokens"], base_item["tokens"])
+    assert not augmented["mel"][~base_item["audio_mask"]].any()
+
     charts_dir = CONFIG.paths.charts_dir
     if not charts_dir.exists():
         print("[dataset] charts/ not found, skipping self-check")
