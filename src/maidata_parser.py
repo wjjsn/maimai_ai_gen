@@ -359,6 +359,14 @@ class compiler:
     def __init__(self, hop_length=512, sample_rate=44100):
         self.chart = Chart(all_levels=[None] * 7)
         self.current_time = 0.0  # seconds
+        self._warned: set[str] = set()
+
+    def _log_once(self, kind: str, message: str, *, warning: bool = False) -> None:
+        if kind in self._warned:
+            return
+        self._warned.add(kind)
+        level = "警告: " if warning else ""
+        print(f"[maidata-parser] {level}歌曲={self.chart.title!r} {message}")
 
     # ── note parsing ──────────────────────────────────────────────────────
 
@@ -380,27 +388,31 @@ class compiler:
             return self._parse_hold(token, bpm)
 
         # ── TAP ──
+        if token[0] not in _LANE_MAP:
+            raise ValueError(f"未知音符起始字符: {token}")
         return self._parse_tap(token)
 
     @staticmethod
     def _is_multi_tap(token: str) -> bool:
         """Check if token is a compact EACH of pure TAPs (e.g. '17' = TAP1 + TAP7)."""
-        return len(token) >= 2 and all(c in _LANE_MAP for c in token)
+        return len(re.findall(r"[1-8]", token)) >= 2 and re.fullmatch(r"(?:[1-8][bx$]*)+", token) is not None
 
     def _parse_note(self, token: str, bpm: float) -> list[Note] | None:
-        """Parse note token, handling EACH (``/``). Returns list of Notes."""
+        """Parse note token, normalizing pseudo-EACH (`` ` ``) to ordinary EACH."""
         if not token or token == "E":
             return None
-        parts = token.split("/")
+        if "`" in token:
+            self._log_once("pseudo-each", f"伪 EACH 已合并为普通 EACH，示例: {token}")
+        parts = re.split(r"[/`]", token)
         notes: list[Note] = []
         for part in parts:
             part = part.strip()
             if not part:
+                self._log_once("empty-each", f"已忽略 EACH 空分支，示例: {token}", warning=True)
                 continue
             # compact EACH: '17' -> TAP at 1 + TAP at 7
             if self._is_multi_tap(part):
-                for ch in part:
-                    notes.append(Note(type=NoteType.TAP, data=_lane(ch)))
+                notes.extend(self._parse_tap(atom) for atom in re.findall(r"[1-8][bx$]*", part))
             else:
                 n = self._parse_single_note(part, bpm)
                 if n is not None:
@@ -411,7 +423,15 @@ class compiler:
 
     def _parse_tap(self, token: str) -> Note:
         if token[0] not in _LANE_MAP:
-            return Note(type=NoteType.TAP, data=TapType.LANE1)  # fallback
+            raise ValueError(f"TAP 轨道无效: {token}")
+        bracket = re.search(r"\[[^]]+\]$", token)
+        if bracket:
+            self._log_once("tap-duration", f"已忽略 TAP 后的孤立时长，示例: {token}", warning=True)
+            token = token[:bracket.start()]
+        if any(ch not in "bx$" for ch in token[1:]):
+            raise ValueError(f"TAP 含未知修饰符: {token}")
+        if "$" in token:
+            self._log_once("star-tap", f"星形 TAP 已归一化为普通 TAP，示例: {token}")
         lane = _lane(token[0])
         is_break = "b" in token
         is_ex = "x" in token
@@ -432,6 +452,7 @@ class compiler:
             )
         else:
             # pseudo-hold (no bracket): treat as TAP
+            self._log_once("pseudo-hold", f"伪 HOLD 已归一化为 TAP，示例: {token}")
             return Note(
                 type=NoteType.TAP,
                 data=lane,
@@ -449,6 +470,8 @@ class compiler:
         else:
             area_str = token[:1]
         area = _touch_area(area_str)
+        if area_str not in _TOUCH_MAP:
+            raise ValueError(f"TOUCH 区域无效: {token}")
 
         if has_h:
             m = re.search(r"\[([^\]]+)\]", token)
@@ -461,6 +484,7 @@ class compiler:
                 )
             else:
                 # pseudo-touch-hold (no bracket): treat as TOUCH
+                self._log_once("pseudo-touch-hold", f"伪 TOUCH HOLD 已归一化为 TOUCH，示例: {token}")
                 return Note(
                     type=NoteType.TOUCH,
                     data=Touch_data(Touch_area=area, isFirework=has_f),
@@ -510,6 +534,8 @@ class compiler:
             t = t[1:]
 
         segments, is_ex, is_slide_break = self._build_slide_segments(t, bpm, is_slide_break, is_no_head)
+        if not segments:
+            raise ValueError(f"无法解析 Slide: {token}")
         return Note(type=NoteType.SLIDE, data=segments, isBreak=is_slide_break, isEx=is_ex)
 
     def _build_slide_segments(
@@ -548,7 +574,8 @@ class compiler:
                 i += 1
             elif t[i] == "b":
                 # 'b' before shape = break (some charts write it here)
-                i += 1  # just consume, isSlideBreak handled outside
+                is_slide_break = True
+                i += 1
             elif t[i] in ("?", "!"):
                 is_no_head = True
                 i += 1
@@ -557,31 +584,93 @@ class compiler:
         # we handle it in the outer loop
 
         cur_start = start_lane
+        previous_shape: SlideShape | None = None
+        previous_cw: bool | None = None
 
         while i < n:
+            while i < n and t[i] in ("@", "$", "x", "b", "?", "!"):
+                if t[i] == "$":
+                    if i + 1 < n and t[i + 1] == "$":
+                        is_fake_rotate = True
+                        i += 2
+                    else:
+                        is_force_star = True
+                        i += 1
+                elif t[i] == "@":
+                    is_no_star = True
+                    i += 1
+                elif t[i] == "x":
+                    is_ex = True
+                    i += 1
+                elif t[i] == "b":
+                    is_slide_break = True
+                    i += 1
+                else:
+                    is_no_head = True
+                    i += 1
+
             # skip '*' separator (multiple slide)
             if t[i] == "*":
                 i += 1
+                if i >= n:
+                    raise ValueError(f"Slide 末尾存在空分支: {t}")
                 # reset cur_start to original start for multiple slides
                 # (multiple slides share the same start point)
                 # actually after *, next segment starts from the *original* start
                 cur_start = start_lane
 
+                while i < n and t[i] in ("@", "$", "x", "b", "?", "!"):
+                    if t[i] == "$":
+                        if i + 1 < n and t[i + 1] == "$":
+                            is_fake_rotate = True
+                            i += 2
+                        else:
+                            is_force_star = True
+                            i += 1
+                    elif t[i] == "@":
+                        is_no_star = True
+                        i += 1
+                    elif t[i] == "x":
+                        is_ex = True
+                        i += 1
+                    elif t[i] == "b":
+                        is_slide_break = True
+                        i += 1
+                    else:
+                        is_no_head = True
+                        i += 1
+
             # try to match a shape
             shape = self._match_shape(t, i)
             if shape is None:
-                break
-            # determine clockwise for Circle shapes
-            is_cw = None
-            if shape == SlideShape.Circle:
-                if t[i] == ">":
-                    is_cw = True
-                elif t[i] == "<":
-                    is_cw = False
-                # else '^' -> None (auto)
-            i += len(shape.name) if shape in (
-                SlideShape.PP, SlideShape.QQ
-            ) else self._shape_char_len(shape, t, i)
+                if previous_shape is not None and t[i] in "12345678":
+                    shape = previous_shape
+                    is_cw = previous_cw
+                    self._log_once(
+                        "missing-slide-shape",
+                        f"链式 Slide 缺少形状符，已复用上一段形状，示例: {t}",
+                        warning=True,
+                    )
+                else:
+                    raise ValueError(f"Slide 含无法识别的片段: {t[i:]} ({t})")
+            else:
+                # determine clockwise for Circle shapes
+                is_cw = None
+                if shape == SlideShape.Circle:
+                    if t[i] == ">":
+                        is_cw = True
+                    elif t[i] == "<":
+                        is_cw = False
+                    # else '^' -> None (auto)
+                i += len(shape.name) if shape in (
+                    SlideShape.PP, SlideShape.QQ
+                ) else self._shape_char_len(shape, t, i)
+
+            # 部分谱面把 Break/EX 写在形状与终点之间，如 2pbx7b[8:3]。
+            while i < n and t[i] in ("b", "x"):
+                is_slide_break |= t[i] == "b"
+                is_ex |= t[i] == "x"
+                i += 1
 
             # For GrandV: middle_lane is an extra digit before end lane
             middle_lane = None
@@ -592,13 +681,14 @@ class compiler:
 
             # end lane
             if i >= n or t[i] not in "12345678":
-                break
+                raise ValueError(f"Slide 缺少终点: {t[i:]} ({t})")
             end_lane = _lane(t[i])
             i += 1
 
             # optional 'b' break marker before bracket
-            if i < n and t[i] == "b":
-                is_slide_break = True
+            while i < n and t[i] in ("b", "x"):
+                is_slide_break |= t[i] == "b"
+                is_ex |= t[i] == "x"
                 i += 1
 
             # optional [wait##trace] for this segment
@@ -609,6 +699,11 @@ class compiler:
                 bracket_content = t[i + 1 : j]
                 wait_sec, trace_sec = self._parse_slide_bracket(bracket_content, bpm)
                 i = j + 1
+
+            while i < n and t[i] in ("b", "x"):
+                is_slide_break |= t[i] == "b"
+                is_ex |= t[i] == "x"
+                i += 1
 
             seg = SlideSegment(
                 shape=shape,
@@ -625,6 +720,8 @@ class compiler:
             )
             segments.append(seg)
             cur_start = end_lane  # chaining: next starts where this ended
+            previous_shape = shape
+            previous_cw = is_cw
 
             # check for clockwise indicator on arc
             if shape == SlideShape.Circle and len(segments) > 0:
@@ -739,6 +836,7 @@ class compiler:
 
     def parse(self, text: str, music_data: list[dict] | None = None):
         self.chart = Chart(all_levels=[None] * 7)
+        self._warned.clear()
 
         title_match = re.search(r"&title=([^\n]+)", text)
         if title_match:
@@ -753,8 +851,9 @@ class compiler:
 
         for level in range(0, 7):
             level_match = re.search(
-                rf"&inote_{level}=([\s\S]*?)(?=&lv_[0-9]|&inote_[0-9]|$)",
+                rf"&inote_{level}=([\s\S]*?)(?=^&|\Z)",
                 text,
+                re.MULTILINE,
             )
             if not level_match:
                 continue
@@ -769,35 +868,55 @@ class compiler:
             self.current_time = 0.0
             frames_by_time: dict[float, list[Note]] = {}
 
-            for raw_note in chart_content_strip:
+            for slot_idx, raw_note in enumerate(chart_content_strip):
                 # strip comments (|| to end of line)
                 if "||" in raw_note:
                     raw_note = raw_note[:raw_note.index("||")]
+                raw_note = re.sub(r"\s+", "", raw_note)
                 if not raw_note:
                     self.current_time += current_per_comma_length
                     continue
                 if raw_note == "E":
                     break
 
-                current_bpm, current_length_divider, current_per_comma_length = (
-                    self._parse_current_time_per_comma(
-                        raw_note,
-                        current_bpm,
-                        current_length_divider,
-                        current_per_comma_length,
+                try:
+                    current_bpm, current_length_divider, current_per_comma_length = (
+                        self._parse_current_time_per_comma(
+                            raw_note,
+                            current_bpm,
+                            current_length_divider,
+                            current_per_comma_length,
+                        )
                     )
-                )
+                except (ValueError, ZeroDivisionError) as error:
+                    raise ValueError(
+                        f"歌曲={self.chart.title!r} 难度={level} 槽位={slot_idx} "
+                        f"时间={self.current_time:.6f}s 时值定义无效: {raw_note!r}"
+                    ) from error
 
                 cleaned = re.sub(r"\([^)]*\)", "", raw_note)
                 cleaned = re.sub(r"\{[^}]*\}", "", cleaned).strip()
+                # 容忍时值定义后多写的右花括号，例如 ``{2}}8h[...]``。
+                stripped = cleaned.lstrip("}")
+                if stripped != cleaned:
+                    self._log_once("extra-brace", f"已忽略多余右花括号，示例: {raw_note}", warning=True)
+                    cleaned = stripped
                 if not cleaned or cleaned == "E":
                     self.current_time += current_per_comma_length
                     continue
 
-                notes = self._parse_note(cleaned, current_bpm)
+                try:
+                    notes = self._parse_note(cleaned, current_bpm)
+                except (KeyError, ValueError, IndexError) as error:
+                    raise ValueError(
+                        f"歌曲={self.chart.title!r} 难度={level} 槽位={slot_idx} "
+                        f"时间={self.current_time:.6f}s 音符解析失败: {cleaned!r}"
+                    ) from error
                 if notes is None:
-                    self.current_time += current_per_comma_length
-                    continue
+                    raise ValueError(
+                        f"歌曲={self.chart.title!r} 难度={level} 槽位={slot_idx} "
+                        f"时间={self.current_time:.6f}s 未解析出音符: {cleaned!r}"
+                    )
 
                 frames_by_time.setdefault(self.current_time, []).extend(notes)
                 self.current_time += current_per_comma_length
@@ -1587,6 +1706,33 @@ def _self_check() -> None:
     with patch("chart_cache.compiler", side_effect=AssertionError):
         with patch("chart_cache.Path.rglob", return_value=[]):
             assert _scan_sources(Path("charts"), Path(".cache/charts")) == []
+
+    chart = compiler().parse(
+        "&title=test\n&lv_5=14\n&inote_5=(120){4}1`2`3/4,5h/Chf,2pbx7b[8:3]*p8b[8:3],1?-5[8:1],E"
+    )
+    frames = chart.all_levels[5].frames
+    assert [note.data for note in frames[0].notes] == [
+        TapType.LANE1, TapType.LANE2, TapType.LANE3, TapType.LANE4,
+    ]
+    assert frames[1].notes[0] == Note(NoteType.TAP, TapType.LANE5)
+    assert frames[1].notes[1] == Note(NoteType.TOUCH, Touch_data(TouchType.C, isFirework=True))
+    slide = frames[2].notes[0]
+    assert slide.type is NoteType.SLIDE and slide.isBreak and slide.isEx
+    assert len(slide.data) == 2
+    assert [(seg.start_lane, seg.end_lane) for seg in slide.data] == [
+        (TapType.LANE2, TapType.LANE7), (TapType.LANE2, TapType.LANE8),
+    ]
+    assert all(seg.isSlideBreak for seg in slide.data)
+    assert frames[3].notes[0].data[0].isSlideNoHead
+    assert compiler().parse(
+        "&title=test\n&lv_5=14\n&inote_5=(120){2}}8h[64:47],E"
+    ).all_levels[5].frames[0].notes[0].type is NoteType.HOLD
+    try:
+        compiler()._parse_slide("2p", 120)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("空 Slide 必须拒绝")
     print("[maidata-parser] 自检通过")
 
 

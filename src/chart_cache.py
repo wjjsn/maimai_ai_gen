@@ -15,7 +15,7 @@ from maidata_parser import _match_music, compiler, load_music_data, music_data_v
 from mel_cache import main as rebuild_mel_cache
 from tokenizer import EOS, SOS, encode_frame
 
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
 TARGET_START_SEC = CONFIG.window.target_start_sec
 TARGET_END_SEC = CONFIG.window.target_end_sec
@@ -166,8 +166,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
             parser = compiler(hop_length=config["hop_length"], sample_rate=config["sample_rate"])
             parser.parse(text, music_data=songs)
         except Exception as error:
-            print(f"[chart-cache] 跳过无法解析的谱面 {source['chart']}: {error}")
-            continue
+            raise RuntimeError(f"谱面解析失败，终止缓存构建: {source['chart']}") from error
         song = _match_music(text, parser.chart.title, songs)
         if song is not None and song.get("basic_info", {}).get("genre") == "宴会場":
             excluded += 1
