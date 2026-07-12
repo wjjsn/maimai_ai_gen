@@ -4,19 +4,21 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torchaudio
+import transformers
 from transformers import AutoModel, Wav2Vec2FeatureExtractor
 
 from config import CONFIG
 
 
 MODEL_DIR = CONFIG.mert.model_dir
-CACHE_DIR = CONFIG.paths.mel_cache_dir
-CACHE_VERSION = 1
+CACHE_DIR = CONFIG.paths.mert_cache_dir
+CACHE_VERSION = 2
 
 
 def cache_key(rel_path: str) -> str:
@@ -29,8 +31,31 @@ def _state(path: Path) -> dict[str, int]:
 
 
 def _model_signature(model_dir: Path = MODEL_DIR) -> dict[str, dict[str, int]]:
-    names = ("config.json", "preprocessor_config.json", "modeling_MERT.py", "configuration_MERT.py", "pytorch_model.bin")
+    names = sorted(
+        path.name
+        for path in model_dir.iterdir()
+        if path.is_file() and (
+            path.suffix in (".json", ".py", ".bin", ".safetensors")
+            or ".bin." in path.name
+            or ".safetensors." in path.name
+        )
+    )
     return {name: _state(model_dir / name) for name in names}
+
+
+def feature_signature() -> dict:
+    """描述会改变冻结 MERT 特征数值的实现和配置。"""
+    return {
+        "cache_version": CACHE_VERSION,
+        "model": _model_signature(),
+        "chunk_sec": CONFIG.mert.chunk_sec,
+        "context_sec": CONFIG.mert.context_sec,
+        "float16": CONFIG.mert.cache_float16,
+        "python": sys.version,
+        "torch": torch.__version__,
+        "torchaudio": torchaudio.__version__,
+        "transformers": transformers.__version__,
+    }
 
 
 def load_mert(device: torch.device):
@@ -41,9 +66,9 @@ def load_mert(device: torch.device):
         MODEL_DIR, local_files_only=True, trust_remote_code=True
     ).to(device).eval()
     model.requires_grad_(False)
-    if model.config.hidden_size != CONFIG.model.audio_state:
+    if model.config.hidden_size != CONFIG.model.state:
         raise ValueError(
-            f"MERT 输出维度为 {model.config.hidden_size}，配置音频状态维度为 {CONFIG.model.audio_state}"
+            f"MERT 输出维度为 {model.config.hidden_size}，配置状态维度为 {CONFIG.model.state}"
         )
     return processor, model
 
@@ -83,6 +108,7 @@ def extract_waveform_features(
     stride = int(np.prod(model.config.conv_stride))
     total_samples = waveform.numel()
     pieces = []
+    kept_centers = []
     for core_start in range(0, total_samples, core_samples):
         core_end = min(total_samples, core_start + core_samples)
         input_start = max(0, core_start - context_samples)
@@ -93,6 +119,10 @@ def extract_waveform_features(
         centers = _feature_centers(model, hidden.shape[0], input_start, device)
         keep = (centers >= core_start) & (centers < core_end)
         pieces.append(hidden[keep].cpu())
+        kept_centers.append(centers[keep].cpu())
+    centers = torch.cat(kept_centers)
+    if centers.numel() > 1 and not torch.all(centers[1:] > centers[:-1]):
+        raise RuntimeError("MERT 分块拼接后的特征中心不严格递增")
     features = torch.cat(pieces).numpy()
     dtype = np.float16 if CONFIG.mert.cache_float16 else np.float32
     return features.astype(dtype, copy=False)
@@ -129,14 +159,10 @@ def process_one(chart_dir: Path, rel_path: str, cache_dir: Path, device, process
     metadata_path = out.with_suffix(".json")
     track = chart_dir / "track.mp3"
     expected = {
-        "cache_version": CACHE_VERSION,
+        **feature_signature(),
         "track": _state(track),
-        "model": _model_signature(),
         "sample_rate": processor.sampling_rate,
         "hidden_size": model.config.hidden_size,
-        "chunk_sec": CONFIG.mert.chunk_sec,
-        "context_sec": CONFIG.mert.context_sec,
-        "float16": CONFIG.mert.cache_float16,
     }
     try:
         if out.exists() and json.loads(metadata_path.read_text(encoding="utf-8")) == expected:

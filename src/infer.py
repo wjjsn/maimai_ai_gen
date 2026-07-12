@@ -6,6 +6,7 @@ Usage:
 
 import argparse
 import math
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -17,15 +18,15 @@ from maidata_parser import (
     compiler, Chart, Level, Frame, Note, NoteType, TapType,
 )
 from tokenizer import PAD, SOS, EOS, VOCAB_SIZE, FRAME_END, decode_frames, encode_frame
-from mert_cache import extract_audio_features
+from mert_cache import extract_audio_features, feature_signature
 
 # ──────────────────── defaults ────────────────────
 
 SAMPLE_RATE = 75
 HOP_LENGTH = 1
-N_MELS = CONFIG.model.audio_state
+N_MELS = CONFIG.model.state
 MAX_TOKENS = CONFIG.model.max_tokens
-WINDOW_FRAMES = round(CONFIG.window.mel_frames * CONFIG.audio.hop_length / CONFIG.audio.sample_rate * SAMPLE_RATE)
+WINDOW_FRAMES = CONFIG.window.mert_frames
 DEFAULT_LEVEL = CONFIG.inference.level_idx
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
 TARGET_START_SEC = CONFIG.window.target_start_sec
@@ -49,17 +50,18 @@ def _nonnegative_float_arg(value: str) -> float:
 
 def load_model(ckpt_path: str | Path, device: torch.device) -> tuple[Whisper, ModelDimensions]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if ckpt.get("model_kind") != "mert-v1-95m-frozen-decoder":
-        raise ValueError("检查点不是冻结 MERT-v1-95M decoder，旧 Whisper 检查点不能用于本推理路径")
+    if ckpt.get("checkpoint_version") != 3 or ckpt.get("model_kind") != "mert-window-decoder-v2":
+        raise ValueError("检查点来自旧架构，拒绝加载")
+    if ckpt.get("feature_signature") != feature_signature():
+        raise ValueError("检查点使用的 MERT 特征实现与当前环境不一致")
     dims: ModelDimensions = ckpt["dims"]
     validate_checkpoint_config(
         ckpt.get("config"),
         CONFIG,
         for_training=False,
-        allow_legacy=CONFIG.inference.allow_legacy_checkpoint,
     )
-    if dims.n_audio_state != N_MELS or dims.n_text_state != N_MELS:
-        raise ValueError(f"检查点状态维度与 MERT 输出不兼容: {dims.n_audio_state}/{dims.n_text_state}")
+    if dims.n_state != N_MELS:
+        raise ValueError(f"检查点状态维度与 MERT 输出不兼容: {dims.n_state}")
     if dims.n_audio_ctx != WINDOW_FRAMES:
         raise ValueError(f"检查点特征帧数为 {dims.n_audio_ctx}，当前配置为 {WINDOW_FRAMES}")
     if dims.n_text_ctx != MAX_TOKENS:
@@ -68,7 +70,7 @@ def load_model(ckpt_path: str | Path, device: torch.device) -> tuple[Whisper, Mo
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
     expected = {
-        "mel_frames": WINDOW_FRAMES,
+        "mert_frames": WINDOW_FRAMES,
         "prefix_start_sec": PREFIX_START_SEC,
         "target_start_sec": TARGET_START_SEC,
         "target_end_sec": TARGET_END_SEC,
@@ -302,6 +304,18 @@ def frames_to_maidata(frames: list[Frame], level_idx: int) -> str:
     return c.generate()
 
 
+def save_inference_files(audio_path: Path, maidata_text: str, out_path: Path | None) -> Path:
+    infer_dir = Path(__file__).resolve().parent.parent / "tmp" / "infer"
+    infer_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(audio_path, infer_dir / audio_path.name)
+    generated_path = infer_dir / "maidata.txt"
+    generated_path.write_text(maidata_text, encoding="utf-8")
+    if out_path is not None and out_path.resolve() != generated_path.resolve():
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(maidata_text, encoding="utf-8")
+    return generated_path
+
+
 def _self_check() -> None:
     mel = np.arange(5 * N_MELS, dtype=np.float32).reshape(5, N_MELS)
     window, mask = fit_logical_window(mel, -2, 8)
@@ -343,14 +357,11 @@ def main():
     print(f"[infer] total frames: {len(frames)}")
     maidata_text = frames_to_maidata(frames, level_idx=args.level)
 
-    if args.out:
-        out_path = Path(args.out)
-    else:
-        tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
-        out_path = tmp_dir.with_suffix(".txt")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(maidata_text, encoding="utf-8")
-    print(f"[infer] saved to '{out_path}'")
+    out_path = Path(args.out) if args.out else None
+    generated_path = save_inference_files(audio_path, maidata_text, out_path)
+    if out_path is not None:
+        print(f"[infer] saved to '{out_path}'")
+    print(f"[infer] inference files saved to '{generated_path.parent}'")
 
 
 if __name__ == "__main__":

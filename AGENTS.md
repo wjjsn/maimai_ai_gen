@@ -7,13 +7,13 @@
 
 ## 项目全览
 
-本项目是一个 maimai 谱面生成实验工程：输入歌曲音频，训练 Whisper 风格的 encoder-decoder 模型，自回归生成 simai/maidata 谱面 token，再还原成 `maidata.txt`。
+本项目是一个 maimai 谱面生成实验工程：输入歌曲音频，用冻结 MERT 提取时序特征，训练自回归 decoder 生成 simai/maidata 谱面 token，再还原成 `maidata.txt`。
 
 核心目录：
 
 - `charts/`：训练数据目录。每首歌通常包含 `maidata.txt` 和 `track.mp3`。
-- `.cache/charts/`：log-mel 缓存及同名 `.json` 元数据。`track.mp3` 的大小、修改时间或 Mel 参数变化时会自动重建对应文件。
-- `.cache/chart_index/`：持久化的滑窗谱面索引。按难度、Mel 参数、滑窗步长和目标区配置分目录保存 generation；`current.json` 原子切换当前 generation。
+- `.cache/mert/`：冻结 MERT 整曲特征及同名 `.json` 元数据。音频、模型文件、提取参数或运行库版本变化时自动重建。
+- `.cache/chart_index/`：持久化的滑窗谱面索引。按难度、MERT 窗口、滑窗步长和目标区配置分目录保存 generation；`current.json` 原子切换当前 generation。
 - `checkpoints/`：训练或过拟合保存的模型权重。
 - `tmp/`：推理、过拟合、文本对比等临时输出。
 - `doc/history.md`：历史排查记录，包含已废弃方案和当时的排查过程；不能单独作为当前行为依据，先以本文件和源码为准。
@@ -23,13 +23,13 @@
 核心代码：
 
 - `src/train.py`：主训练和整曲过拟合的统一入口。负责读取 `ChartDataset`、按歌曲划分 train/val、训练模型、teacher-forcing 验证、调用正式整曲推理计算事件 F1，并保存 `best.pt` 和 `best_gen.pt`。设置 `MAIMAI_OVERFIT_CHARTS=N` 可只选 N 首完整歌曲训练和验证，但窗口、loss、推理、指标都与全量流程一致。训练集会经过 `RotatedDataset` 做 8 方向旋转增强，验证集不增强。
-- `src/dataset.py`：数据集读取、滑窗标签语义和旋转增强。输入为 `3000` mel 帧，约 34.83 秒；窗口每 1 秒平移。运行时 mmap 读取 `chart_index` 的 token 与窗口坐标，按需读取 Mel；不再在训练启动时重新解析全量谱面。decoder 可见相对 `6..12s` 的谱面 token 前缀，只对相对 `12..22s` 的中间 10 秒 token 和 EOS 计算 loss，音频左右上下文约 12 秒。验证索引使用 10 秒步进。歌曲头尾通过左右补零保持目标区位置固定，不夹动窗口。
+- `src/dataset.py`：数据集读取、滑窗标签语义和旋转增强。输入为 `2612` 个 75Hz MERT 帧，约 34.83 秒；窗口每 1 秒平移。运行时 mmap 读取特征和谱面索引。decoder 可见相对 `6..12s` 的谱面 token 前缀，只对相对 `12..22s` 的中间 10 秒 token 和 EOS 计算 loss。歌曲头尾补零帧由 cross-attention mask 屏蔽。
 - `src/infer.py`：唯一正式推理入口。每次生成并提交 10 秒，使用前一窗口已生成结果中最后 6 秒的 token 作为当前 decoder 前缀；音频窗口与训练一样把目标固定在相对 `12..22s`。训练中的整曲生成验证直接复用 `overlap_infer()`，不再有 reference/fixed 特殊推理路径。
 - `src/maidata_parser.py`：simai/maidata 与内部 token 之间的转换器，文件很长。重点看这些区域：数据结构和 token 常量在文件前部；`parse()` 负责读 `&inote_*`；`_ts_token()` 负责秒到 TS token，当前会 clamp 到 `0..29.99s`；`to_tensor()` 是旧动态分段逻辑，当前主训练已不依赖它构造滑窗；`_parse_token_segment()` 和 `parse_from_tensor()` 负责把生成 token 还原成 frame；`generate()` 负责输出 maidata 文本。普通训练问题通常不用通读整个文件。
 - `src/constrained_decode.py`：严格前缀重放约束器。`allowed_tokens()` 根据完整 token 前缀恢复 frame、Note、Slide 和持续资源状态，只返回至少能按当前规则继续闭合的下一 token。它同时执行 canonical token 结构、Slide 几何、同帧资源冲突、HOLD/TOUCH_HOLD 跨帧占用、释放冷却和独立 press 间隔等硬规则，但不保证节奏编排、难度和音乐性。
-- `src/model.py`：Whisper 风格模型定义，包括音频 encoder 和文本 decoder。普通训练调参通常不用改它；如果改 mel 输入长度或 `n_audio_ctx`，必须看这里的 encoder positional embedding 长度约束。
-- `src/mel_cache.py`：把 `track.mp3` 转成 log-mel 并缓存；以源音频 `size + mtime_ns` 和 Mel 参数自动失效。旧 `.npy` 首次使用只补写元数据，不会全量重算。
-- `src/chart_cache.py`：编译并缓存滑窗 token、loss 起点和音频切片坐标。`ChartDataset` 自动调用 `ensure_chart_cache()`；源谱面或 Mel 的 `size + mtime_ns`、难度或窗口配置变化时自动重建。构建使用锁和临时 generation，写完后原子更新 `current.json`，不能删除正在被 mmap 使用的旧 generation。
+- `src/model.py`：冻结 MERT 特征的窗口级 LayerNorm、位置编码和自回归文本 decoder。
+- `src/mert_cache.py`：提取并缓存整曲 MERT 特征，按源音频、模型文件、提取参数和运行库版本自动失效。
+- `src/chart_cache.py`：编译并缓存滑窗 token、loss 起点和 MERT 特征切片坐标。
 - `src/check_rotation.py`：旋转增强自检脚本，检查旋转 0/8 次不变、连续 8 次还原、Touch C 不变、旋转后 token 可解析。
 
 难度编号：
@@ -40,14 +40,13 @@
 
 容易踩坑：
 
-- 训练和推理的滑窗定义必须保持一致。改 `PREFIX_START_SEC`、`TARGET_START_SEC`、`TARGET_END_SEC`、`mel_frames`、`n_audio_ctx` 或步长时，要同时检查 `chart_cache.py`、`dataset.py`、`infer.py` 和 `train.py`；同时提升 `CACHE_VERSION`，避免复用语义已变化的 token 缓存。
-- 当前 `3000 mel frames` 实际约 34.83 秒，不是严格 30 秒；而 TS token 只能表达 `0..29.99s`。这是后续改进重点。
+- 训练和推理的滑窗定义必须保持一致。改目标区、`MERT帧数` 或步长时，要同时检查 `chart_cache.py`、`dataset.py`、`infer.py` 和 `train.py`；语义变化时提升 `CACHE_VERSION`。
 - 8 方向旋转增强只旋转 token，不改音频。它覆盖所有整体旋转；逆时针 1 次等价于顺时针 7 次。
 - `constrained_decode.py` 的候选集合不能包含已知必死路径：无可用 frame 时间或 Note 容量时只能允许 `EOS`；所有 Touch area 都不可用时不能允许 `NOTE_TOUCH`；相同局部 Slide segment 可以闭合并继续扩展，只有完整 Slide Note 重复时才强制继续生成 `SEGMENT_START`。这些结构和资源硬规则仍不能替代模型学会音乐内容。
 - `tmp/` 和 `checkpoints/` 里的结果可能来自旧难度或旧方案，使用前要确认命令参数和 checkpoint 来源。
 - 谱面索引中的 token 以 `uint16` 保存，读取后转为 `torch.int64`；词表当前为 `0..3071`。修改词表范围、token 常量、编码或解析语义时，必须提升 `CACHE_VERSION`；若范围不再适合 `uint16`，还要升级缓存格式和存储 dtype。
 - 索引用 `loss_start` 表示连续监督后缀：从第一个目标 frame 的 `FRAME_START` 到 EOS；没有目标 frame 时只监督 EOS。修改 token 窗口构造时必须验证它与逐 token `loss_mask` 等价。
-- `ChartDataset` 每个 worker 最多保留 8 首歌的 Mel mmap。训练 loader 默认 `MAIMAI_NUM_WORKERS=2`、`MAIMAI_PREFETCH_FACTOR=2`、`MAIMAI_PIN_MEMORY=1`；内存紧张时优先调低这些参数。
+- `ChartDataset` 每个 worker 最多保留 8 首歌的 MERT mmap。
 
 ## 当前设计问答和结论
 
@@ -59,7 +58,7 @@
 
 问：当前滑窗训练是怎么组装 token 张量的？
 
-答：训练窗口按目标绝对起点 `0, 1, 2...` 每秒平移，逻辑音频窗口起点是 `target_start - 12s`。输入固定为 `3000` mel 帧，左音频上下文为 12 秒、右音频上下文约 12.83 秒；token 包含相对 `6..12s` 的真实谱面前缀和相对 `12..22s` 的目标。训练仍用 `tokens[:, :-1]` 预测 `tokens[:, 1:]`，但独立的 `loss_mask` 只监督目标区完整 frame token 与 EOS，前缀只作为 decoder 上下文。验证索引按 10 秒步进；歌曲头尾补零而不移动窗口，因此目标区始终固定在相对 `12..22s`。
+答：训练窗口按目标绝对起点 `0, 1, 2...` 每秒平移，逻辑音频窗口起点是 `target_start - 12s`。输入固定为 `2612` 个 MERT 帧；token 包含相对 `6..12s` 的真实谱面前缀和相对 `12..22s` 的目标。`loss_mask` 只监督目标区完整 frame token 与 EOS。
 
 问：缓存索引会不会在 token、mask 或坐标传递时弄坏训练样本？
 
@@ -86,13 +85,13 @@
 答：训练时不应该用 KV cache。teacher forcing 一次 forward 并行预测所有位置，比逐 token cache 更适合训练。KV cache 主要用于自回归推理。当前已完成每个窗口只跑一次 `model.embed_audio(mel)` 并复用 audio features；后续如实现 decoder KV cache，需要正确区分 self-attention cache 和 cross-attention/audio cache，不能随便传一个空 dict。
 ### 对于进一步改进的疑问
 
-问：`3000 mel frames ≈ 34.83s` 是不是当前滑窗方案的严重问题？
+问：`2612 MERT frames ≈ 34.83s` 是不是当前滑窗方案的严重问题？
 
 答：对当前实现不是。超过提交区的右侧部分只是上下文，不会被提交，也不会进入训练目标。窗口起点固定为 `target_start - 12s`，歌曲尾部通过右补零处理，不会再夹动窗口；目标时间戳始终位于相对 `12..22s`，不会因尾窗超过 `29.99s`。不要武断优先大改窗口长度；应先依据整曲评估确认边界质量是否是瓶颈。
 
 问：要不要改成 `10s 左上下文 + 10s 提交区 + 10s 右上下文`？
 
-答：这是合理方案，能让提交区更居中，边界更稳。如果保留当前 `3000 mel frames`，实际会变成 `10s 左上下文 + 10s 提交区 + 约 14.83s 右上下文`。代价是窗口数和推理次数大约翻倍；再叠加 8 倍旋转，训练成本会明显增加。如果边界质量差，可以考虑改；但应该和整曲评估一起看，不要盲目增加计算量。
+答：这是合理方案，能让提交区更居中，边界更稳。如果保留当前 `2612` 个 MERT 帧，实际会变成 `10s 左上下文 + 10s 提交区 + 约 14.83s 右上下文`。代价是窗口数和推理次数大约翻倍；再叠加 8 倍旋转，训练成本会明显增加。如果边界质量差，可以考虑改；但应该和整曲评估一起看，不要盲目增加计算量。
 
 问：左边音频上下文里，模型能不能看到已经生成过的 token？
 

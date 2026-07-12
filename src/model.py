@@ -1,10 +1,7 @@
-import base64
-import gzip
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -21,16 +18,12 @@ except (ImportError, RuntimeError, OSError):
 
 @dataclass
 class ModelDimensions:
-    n_mels: int
     n_audio_ctx: int
-    n_audio_state: int
-    n_audio_head: int
-    n_audio_layer: int
     n_vocab: int
     n_text_ctx: int
-    n_text_state: int
-    n_text_head: int
-    n_text_layer: int
+    n_state: int
+    n_head: int
+    n_layer: int
 
 
 class LayerNorm(nn.LayerNorm):
@@ -45,24 +38,6 @@ class Linear(nn.Linear):
             self.weight.to(x.dtype),
             None if self.bias is None else self.bias.to(x.dtype),
         )
-
-
-class Conv1d(nn.Conv1d):
-    def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
-    ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
-
-
-def sinusoids(length, channels, max_timescale=10000):
-    """Returns sinusoids for positional embedding"""
-    assert channels % 2 == 0
-    log_timescale_increment = np.log(max_timescale) / (channels // 2 - 1)
-    inv_timescales = torch.exp(-log_timescale_increment * torch.arange(channels // 2))
-    scaled_time = torch.arange(length)[:, np.newaxis] * inv_timescales[np.newaxis, :]
-    return torch.cat([torch.sin(scaled_time), torch.cos(scaled_time)], dim=1)
 
 
 @contextmanager
@@ -189,39 +164,6 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
-class AudioEncoder(nn.Module):
-    def __init__(
-        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
-    ):
-        super().__init__()
-        self.conv1 = Conv1d(n_mels, n_state, kernel_size=3, padding=1)
-        self.conv2 = Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
-        self.register_buffer("positional_embedding", sinusoids(n_ctx, n_state))
-
-        self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
-            [ResidualAttentionBlock(n_state, n_head) for _ in range(n_layer)]
-        )
-        self.ln_post = LayerNorm(n_state)
-
-    def forward(self, x: Tensor):
-        """
-        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
-            the mel spectrogram of the audio
-        """
-        x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))
-        x = x.permute(0, 2, 1)
-
-        assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
-        x = (x + self.positional_embedding).to(x.dtype)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.ln_post(x)
-        return x
-
-
 class TextDecoder(nn.Module):
     def __init__(
         self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
@@ -240,7 +182,7 @@ class TextDecoder(nn.Module):
         )
         self.ln = LayerNorm(n_state)
 
-        mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
+        mask = torch.empty(n_ctx, n_ctx).fill_(float("-inf")).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
 
     def forward(
@@ -253,7 +195,7 @@ class TextDecoder(nn.Module):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
             the text tokens
-        xa : torch.Tensor, shape = (batch_size, n_audio_ctx, n_audio_state)
+        xa : torch.Tensor, shape = (batch_size, MERT帧数, 状态维度)
             the encoded audio features to be attended on
         xa_mask : torch.BoolTensor, shape = (batch_size, n_audio_ctx)
             True 表示真实 MERT 帧，False 表示窗口补零。
@@ -288,32 +230,25 @@ class Whisper(nn.Module):
     def __init__(self, dims: ModelDimensions):
         super().__init__()
         self.dims = dims
+        self.audio_ln = LayerNorm(self.dims.n_state)
+        self.audio_position = nn.Parameter(
+            torch.empty(self.dims.n_audio_ctx, self.dims.n_state)
+        )
+        nn.init.normal_(self.audio_position, std=0.02)
         self.decoder = TextDecoder(
             self.dims.n_vocab,
             self.dims.n_text_ctx,
-            self.dims.n_text_state,
-            self.dims.n_text_head,
-            self.dims.n_text_layer,
+            self.dims.n_state,
+            self.dims.n_head,
+            self.dims.n_layer,
         )
-        # use the last half among the decoder layers for time alignment by default;
-        # to use a specific set of heads, see `set_alignment_heads()` below.
-        all_heads = torch.zeros(
-            self.dims.n_text_layer, self.dims.n_text_head, dtype=torch.bool
-        )
-        all_heads[self.dims.n_text_layer // 2 :] = True
-        self.register_buffer("alignment_heads", all_heads.to_sparse(), persistent=False)
 
-    def set_alignment_heads(self, dump: bytes):
-        array = np.frombuffer(
-            gzip.decompress(base64.b85decode(dump)), dtype=bool
-        ).copy()
-        mask = torch.from_numpy(array).reshape(
-            self.dims.n_text_layer, self.dims.n_text_head
-        )
-        self.register_buffer("alignment_heads", mask.to_sparse(), persistent=False)
-
-    def embed_audio(self, mel: torch.Tensor):
-        return mel
+    def embed_audio(self, features: torch.Tensor):
+        if features.shape[1:] != self.audio_position.shape:
+            raise ValueError(
+                f"MERT 特征形状错误: {features.shape[1:]}，需要 {self.audio_position.shape}"
+            )
+        return self.audio_ln(features) + self.audio_position.to(features.dtype)
 
     def logits(
         self,
@@ -325,15 +260,15 @@ class Whisper(nn.Module):
 
     def forward(
         self,
-        mel: torch.Tensor,
+        features: torch.Tensor,
         tokens: torch.Tensor,
         audio_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, mel, xa_mask=audio_mask)
+        return self.decoder(tokens, self.embed_audio(features), xa_mask=audio_mask)
 
 
 def _self_check() -> None:
-    dims = ModelDimensions(768, 100, 768, 12, 12, 3072, 64, 768, 12, 4)
+    dims = ModelDimensions(100, 3072, 64, 768, 12, 4)
     model = Whisper(dims)
     audio = torch.randn(2, 100, 768)
     tokens = torch.randint(0, 3072, (2, 16))

@@ -1,7 +1,6 @@
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
-import tempfile
 from typing import Any, get_args, get_origin, get_type_hints
 
 import yaml
@@ -14,16 +13,8 @@ CONFIG_PATH = ROOT_DIR / "config.yaml"
 @dataclass(frozen=True)
 class PathsConfig:
     charts_dir: Path
-    mel_cache_dir: Path
+    mert_cache_dir: Path
     checkpoint_dir: Path
-
-
-@dataclass(frozen=True)
-class AudioConfig:
-    sample_rate: int
-    n_fft: int
-    hop_length: int
-    n_mels: int
 
 
 @dataclass(frozen=True)
@@ -36,7 +27,7 @@ class MertConfig:
 
 @dataclass(frozen=True)
 class WindowConfig:
-    mel_frames: int
+    mert_frames: int
     prefix_start_sec: float
     target_start_sec: float
     target_end_sec: float
@@ -46,12 +37,9 @@ class WindowConfig:
 
 @dataclass(frozen=True)
 class ModelConfig:
-    audio_state: int
-    audio_head: int
-    audio_layer: int
-    text_state: int
-    text_head: int
-    text_layer: int
+    state: int
+    head: int
+    layer: int
     max_tokens: int
 
 
@@ -76,14 +64,12 @@ class TrainingConfig:
     val_oracle_windows: int
     overfit_charts: int
     resume_path: Path | None
-    allow_legacy_checkpoint: bool
     rotations: int
 
 
 @dataclass(frozen=True)
 class InferenceConfig:
     checkpoint: Path
-    allow_legacy_checkpoint: bool
     level_idx: int
     start_sec: float
 
@@ -91,7 +77,6 @@ class InferenceConfig:
 @dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
-    audio: AudioConfig
     mert: MertConfig
     window: WindowConfig
     model: ModelConfig
@@ -102,14 +87,8 @@ class AppConfig:
 SECTIONS = {
     "路径": (PathsConfig, {
         "谱面目录": "charts_dir",
-        "梅尔缓存目录": "mel_cache_dir",
+        "MERT缓存目录": "mert_cache_dir",
         "检查点目录": "checkpoint_dir",
-    }),
-    "音频": (AudioConfig, {
-        "采样率": "sample_rate",
-        "傅里叶窗口": "n_fft",
-        "跳步长度": "hop_length",
-        "梅尔频带数": "n_mels",
     }),
     "MERT": (MertConfig, {
         "模型目录": "model_dir",
@@ -118,7 +97,7 @@ SECTIONS = {
         "缓存半精度": "cache_float16",
     }),
     "滑窗": (WindowConfig, {
-        "梅尔帧数": "mel_frames",
+        "MERT帧数": "mert_frames",
         "前缀开始秒": "prefix_start_sec",
         "目标开始秒": "target_start_sec",
         "目标结束秒": "target_end_sec",
@@ -126,12 +105,9 @@ SECTIONS = {
         "推理步进秒": "infer_stride_sec",
     }),
     "模型": (ModelConfig, {
-        "音频状态维度": "audio_state",
-        "音频注意力头数": "audio_head",
-        "音频层数": "audio_layer",
-        "文本状态维度": "text_state",
-        "文本注意力头数": "text_head",
-        "文本层数": "text_layer",
+        "状态维度": "state",
+        "注意力头数": "head",
+        "层数": "layer",
         "最大词元数": "max_tokens",
     }),
     "训练": (TrainingConfig, {
@@ -154,12 +130,10 @@ SECTIONS = {
         "真值前缀验证窗口数": "val_oracle_windows",
         "过拟合歌曲数": "overfit_charts",
         "恢复检查点": "resume_path",
-        "允许旧检查点": "allow_legacy_checkpoint",
         "旋转增强数": "rotations",
     }),
     "推理": (InferenceConfig, {
         "检查点": "checkpoint",
-        "允许旧检查点": "allow_legacy_checkpoint",
         "难度编号": "level_idx",
         "开始秒": "start_sec",
     }),
@@ -209,7 +183,6 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _validate_config(config: AppConfig) -> None:
-    audio = config.audio
     mert = config.mert
     window = config.window
     model = config.model
@@ -232,32 +205,22 @@ def _validate_config(config: AppConfig) -> None:
     ):
         _require(math.isfinite(value), f"配置 {name} 必须是有限数字")
 
-    _require(audio.sample_rate > 0, "配置 音频.采样率 必须大于 0")
-    _require(audio.n_fft > 0, "配置 音频.傅里叶窗口 必须大于 0")
-    _require(audio.hop_length > 0, "配置 音频.跳步长度 必须大于 0")
-    _require(audio.hop_length <= audio.n_fft, "配置 音频.跳步长度 不能大于 傅里叶窗口")
-    _require(audio.n_mels > 0, "配置 音频.梅尔频带数 必须大于 0")
-    _require(
-        audio.n_mels <= audio.n_fft // 2 + 1,
-        "配置 音频.梅尔频带数 不能超过傅里叶频谱可提供的频率格数",
-    )
     _require(mert.model_dir.is_dir(), f"配置 MERT.模型目录不存在或不是目录: {mert.model_dir}")
     _require(math.isfinite(mert.chunk_sec) and mert.chunk_sec > 0, "配置 MERT.分块秒数 必须大于 0")
     _require(math.isfinite(mert.context_sec) and mert.context_sec >= 0, "配置 MERT.上下文秒数 不能小于 0")
     _require(mert.context_sec * 2 < mert.chunk_sec, "配置 MERT.上下文秒数的两倍必须小于分块秒数")
 
-    _require(window.mel_frames > 0, "配置 滑窗.梅尔帧数 必须大于 0")
-    _require(window.mel_frames % 2 == 0, "配置 滑窗.梅尔帧数 必须是偶数")
+    _require(window.mert_frames > 0, "配置 滑窗.MERT帧数 必须大于 0")
     _require(window.prefix_start_sec >= 0, "配置 滑窗.前缀开始秒 不能小于 0")
     _require(
         window.prefix_start_sec < window.target_start_sec < window.target_end_sec,
         "配置滑窗时间必须满足 前缀开始秒 < 目标开始秒 < 目标结束秒",
     )
     _require(window.target_end_sec <= 30.0, "配置 滑窗.目标结束秒 不能超过时间戳上限 30.0 秒")
-    window_duration = window.mel_frames * audio.hop_length / audio.sample_rate
+    window_duration = window.mert_frames / 75
     _require(
         window.target_end_sec <= window_duration,
-        f"配置 滑窗.目标结束秒 超出音频窗口；当前梅尔参数只能提供 {window_duration:.2f} 秒",
+        f"配置 滑窗.目标结束秒 超出音频窗口；当前 MERT 帧数只能提供 {window_duration:.2f} 秒",
     )
     _require(window.train_stride_sec > 0, "配置 滑窗.训练步进秒 必须大于 0")
     _require(window.infer_stride_sec > 0, "配置 滑窗.推理步进秒 必须大于 0")
@@ -268,28 +231,16 @@ def _validate_config(config: AppConfig) -> None:
     )
 
     for value, name in (
-        (model.audio_state, "音频状态维度"),
-        (model.audio_head, "音频注意力头数"),
-        (model.audio_layer, "音频层数"),
-        (model.text_state, "文本状态维度"),
-        (model.text_head, "文本注意力头数"),
-        (model.text_layer, "文本层数"),
+        (model.state, "状态维度"),
+        (model.head, "注意力头数"),
+        (model.layer, "层数"),
         (model.max_tokens, "最大词元数"),
     ):
         _require(value > 0, f"配置 模型.{name} 必须大于 0")
-    _require(model.audio_state >= 4, "配置 模型.音频状态维度 至少为 4")
-    _require(model.audio_state % 2 == 0, "配置 模型.音频状态维度 必须是偶数")
+    _require(model.state >= 4, "配置 模型.状态维度 至少为 4")
     _require(
-        model.audio_state % model.audio_head == 0,
-        "配置 模型.音频状态维度 必须能被 音频注意力头数 整除",
-    )
-    _require(
-        model.text_state % model.text_head == 0,
-        "配置 模型.文本状态维度 必须能被 文本注意力头数 整除",
-    )
-    _require(
-        model.audio_state == model.text_state,
-        "配置 模型.音频状态维度 必须等于 文本状态维度，交叉注意力才能连接两部分",
+        model.state % model.head == 0,
+        "配置 模型.状态维度 必须能被 注意力头数 整除",
     )
     _require(model.max_tokens >= 2, "配置 模型.最大词元数 至少为 2，才能容纳开始和结束词元")
 
@@ -317,12 +268,6 @@ def _validate_config(config: AppConfig) -> None:
 def inference_checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | float]]:
     """保存会改变模型结构、输入特征或正式推理语义的配置。"""
     return {
-        "音频": {
-            "采样率": config.audio.sample_rate,
-            "傅里叶窗口": config.audio.n_fft,
-            "跳步长度": config.audio.hop_length,
-            "梅尔频带数": config.audio.n_mels,
-        },
         "MERT": {
             "模型目录": str(config.mert.model_dir),
             "分块秒数": config.mert.chunk_sec,
@@ -330,19 +275,16 @@ def inference_checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | 
             "缓存半精度": config.mert.cache_float16,
         },
         "滑窗": {
-            "梅尔帧数": config.window.mel_frames,
+            "MERT帧数": config.window.mert_frames,
             "前缀开始秒": config.window.prefix_start_sec,
             "目标开始秒": config.window.target_start_sec,
             "目标结束秒": config.window.target_end_sec,
             "推理步进秒": config.window.infer_stride_sec,
         },
         "模型": {
-            "音频状态维度": config.model.audio_state,
-            "音频注意力头数": config.model.audio_head,
-            "音频层数": config.model.audio_layer,
-            "文本状态维度": config.model.text_state,
-            "文本注意力头数": config.model.text_head,
-            "文本层数": config.model.text_layer,
+            "状态维度": config.model.state,
+            "注意力头数": config.model.head,
+            "层数": config.model.layer,
             "最大词元数": config.model.max_tokens,
         },
     }
@@ -372,7 +314,6 @@ def validate_checkpoint_config(
     current: AppConfig,
     *,
     for_training: bool,
-    allow_legacy: bool,
 ) -> None:
     expected = checkpoint_config(current) if for_training else inference_checkpoint_config(current)
     complete = saved is not None and all(
@@ -380,10 +321,7 @@ def validate_checkpoint_config(
         for section, values in expected.items()
     )
     if not complete:
-        if allow_legacy:
-            print("警告: 正在加载配置记录不完整的旧检查点，无法确认全部参数是否兼容")
-            return
-        raise ValueError("旧检查点没有完整配置；如确认兼容，请将对应的“允许旧检查点”设为 true")
+        raise ValueError("检查点配置不完整或来自旧架构，拒绝加载")
     for section, values in expected.items():
         saved_section = saved.get(section, {})
         for key, value in values.items():
@@ -428,13 +366,12 @@ def _expect_error(message: str, action) -> None:
 def _self_check() -> None:
     from infer import _level_arg, _nonnegative_float_arg, _prefix_relative_cs, frames_to_prefix_tokens
     from maidata_parser import Frame, Note, NoteType, TapType
-    from mel_cache import _cache_is_current
     from tokenizer import TS_BASE
 
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
-    assert CONFIG.audio.sample_rate == 22050
     assert CONFIG.mert.model_dir == ROOT_DIR / "MERT-v1-95M"
-    assert CONFIG.model.audio_state == 768
+    assert CONFIG.model.state == 768
+    assert CONFIG.window.mert_frames == 2612
     assert CONFIG.window.target_end_sec - CONFIG.window.target_start_sec == 10.0
     assert CONFIG.model.max_tokens == 2048
     assert CONFIG.training.level_idx == 5
@@ -458,22 +395,15 @@ def _self_check() -> None:
 
     _expect_error(
         "目标结束秒 超出音频窗口",
-        lambda: _validate_config(replace(CONFIG, window=replace(CONFIG.window, mel_frames=1000))),
+        lambda: _validate_config(replace(CONFIG, window=replace(CONFIG.window, mert_frames=1000))),
     )
     _expect_error(
-        "音频状态维度 必须能被",
-        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, audio_head=5))),
+        "状态维度 必须能被",
+        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, head=5))),
     )
     _expect_error(
-        "音频状态维度 必须等于 文本状态维度",
-        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, text_state=192))),
-    )
-    _expect_error(
-        "音频状态维度 至少为 4",
-        lambda: _validate_config(replace(
-            CONFIG,
-            model=replace(CONFIG.model, audio_state=2, text_state=2, audio_head=1, text_head=1),
-        )),
+        "状态维度 至少为 4",
+        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, state=2, head=1))),
     )
     _expect_error(
         "时间戳上限",
@@ -485,55 +415,40 @@ def _self_check() -> None:
 
     saved = checkpoint_config(CONFIG)
     _expect_error(
-        "音频.跳步长度",
+        "滑窗.MERT帧数",
         lambda: validate_checkpoint_config(
-            saved, replace(CONFIG, audio=replace(CONFIG.audio, hop_length=128)),
-            for_training=False, allow_legacy=False,
+            saved, replace(CONFIG, window=replace(CONFIG.window, mert_frames=2000)),
+            for_training=False,
         ),
     )
     validate_checkpoint_config(
         saved, replace(CONFIG, window=replace(CONFIG.window, train_stride_sec=2.0)),
-        for_training=False, allow_legacy=False,
+        for_training=False,
     )
     _expect_error(
         "优化器.学习率",
         lambda: validate_checkpoint_config(
             saved, replace(CONFIG, training=replace(CONFIG.training, learning_rate=0.001)),
-            for_training=True, allow_legacy=False,
+            for_training=True,
         ),
     )
     _expect_error(
         "训练任务.难度编号",
         lambda: validate_checkpoint_config(
             saved, replace(CONFIG, training=replace(CONFIG.training, level_idx=4)),
-            for_training=True, allow_legacy=False,
+            for_training=True,
         ),
     )
     _expect_error(
-        "允许旧检查点",
-        lambda: validate_checkpoint_config(None, CONFIG, for_training=False, allow_legacy=False),
+        "旧架构",
+        lambda: validate_checkpoint_config(None, CONFIG, for_training=False),
     )
-    validate_checkpoint_config(None, CONFIG, for_training=False, allow_legacy=True)
     partial = checkpoint_config(CONFIG)
     del partial["优化器"]
     _expect_error(
-        "允许旧检查点",
-        lambda: validate_checkpoint_config(partial, CONFIG, for_training=True, allow_legacy=False),
+        "旧架构",
+        lambda: validate_checkpoint_config(partial, CONFIG, for_training=True),
     )
-    validate_checkpoint_config(partial, CONFIG, for_training=True, allow_legacy=True)
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        out = root / "mel.npy"
-        track = root / "track.mp3"
-        out.touch()
-        track.write_bytes(b"audio")
-        assert not _cache_is_current(out, track, {
-            "sample_rate": 22050,
-            "n_fft": 1024,
-            "hop_length": 256,
-            "n_mels": 80,
-        })
 
     for action in (
         lambda: _level_arg("-1"),

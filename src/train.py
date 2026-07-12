@@ -15,6 +15,7 @@ from dataset import ChartDataset, RotatedDataset, collate_segments
 from content_metrics import content_match_frame_counts
 from infer import decode_segment, overlap_infer
 from maidata_parser import compiler
+from mert_cache import feature_signature
 from tokenizer import EOS, FRAME_END, FRAME_START, PAD, SOS, VOCAB_SIZE
 
 # ─────────────────────── 0. 配置 ───────────────────────
@@ -64,16 +65,12 @@ if DEVICE.type == "cuda":
 # ─────────────────────── 1. 模型 ───────────────────────
 
 dims = ModelDimensions(
-    n_mels=CONFIG.model.audio_state,
-    n_audio_ctx=round(CONFIG.window.mel_frames * CONFIG.audio.hop_length / CONFIG.audio.sample_rate * 75),
-    n_audio_state=CONFIG.model.audio_state,
-    n_audio_head=CONFIG.model.audio_head,
-    n_audio_layer=CONFIG.model.audio_layer,
+    n_audio_ctx=CONFIG.window.mert_frames,
     n_vocab=VOCAB_SIZE,
     n_text_ctx=MAX_TOKENS,
-    n_text_state=CONFIG.model.text_state,
-    n_text_head=CONFIG.model.text_head,
-    n_text_layer=CONFIG.model.text_layer,
+    n_state=CONFIG.model.state,
+    n_head=CONFIG.model.head,
+    n_layer=CONFIG.model.layer,
 )
 model = Whisper(dims).to(DEVICE)
 print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
@@ -83,29 +80,21 @@ print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 print("Loading dataset...")
 train_full_ds = ChartDataset(
     CHARTS_DIR,
-    cache_dir=CONFIG.paths.mel_cache_dir,
+    cache_dir=CONFIG.paths.mert_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    sample_rate=75,
-    n_fft=CONFIG.audio.n_fft,
-    hop_length=1,
-    n_mels=CONFIG.model.audio_state,
     stride_sec=CONFIG.window.train_stride_sec,
-    mel_frames=dims.n_audio_ctx,
+    mert_frames=dims.n_audio_ctx,
     chart_limit=OVERFIT_CHARTS,
     seed=SEED,
 )
 val_full_ds = ChartDataset(
     CHARTS_DIR,
-    cache_dir=CONFIG.paths.mel_cache_dir,
+    cache_dir=CONFIG.paths.mert_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    sample_rate=75,
-    n_fft=CONFIG.audio.n_fft,
-    hop_length=1,
-    n_mels=CONFIG.model.audio_state,
     stride_sec=CONFIG.window.infer_stride_sec,
-    mel_frames=dims.n_audio_ctx,
+    mert_frames=dims.n_audio_ctx,
     valid_pairs=train_full_ds.valid_pairs,
 )
 print(f"Total train windows: {len(train_full_ds)}, val windows: {len(val_full_ds)}")
@@ -172,14 +161,14 @@ else:
 
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    collate_fn=partial(collate_segments, mel_frames=dims.n_audio_ctx),
+    collate_fn=partial(collate_segments, mert_frames=dims.n_audio_ctx),
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
     persistent_workers=NUM_WORKERS > 0,
     prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
 )
 val_loader = DataLoader(
     val_ds, batch_size=BATCH_SIZE, shuffle=False,
-    collate_fn=partial(collate_segments, mel_frames=dims.n_audio_ctx),
+    collate_fn=partial(collate_segments, mert_frames=dims.n_audio_ctx),
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
     persistent_workers=NUM_WORKERS > 0,
     prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
@@ -199,7 +188,7 @@ optimizer = optim.AdamW(
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=1e-6)
 scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
 window_config = {
-    "mel_frames": dims.n_audio_ctx,
+    "mert_frames": dims.n_audio_ctx,
     "prefix_start_sec": CONFIG.window.prefix_start_sec,
     "target_start_sec": CONFIG.window.target_start_sec,
     "target_end_sec": CONFIG.window.target_end_sec,
@@ -213,13 +202,14 @@ if RESUME_PATH:
     if not resume_path.is_file():
         raise ValueError(f"恢复检查点不存在或不是文件: {resume_path}")
     resume_checkpoint = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-    if resume_checkpoint.get("model_kind") != "mert-v1-95m-frozen-decoder":
-        raise ValueError("检查点不是冻结 MERT-v1-95M decoder，不能继续训练")
+    if resume_checkpoint.get("checkpoint_version") != 3 or resume_checkpoint.get("model_kind") != "mert-window-decoder-v2":
+        raise ValueError("检查点来自旧架构，不能继续训练")
+    if resume_checkpoint.get("feature_signature") != feature_signature():
+        raise ValueError("检查点使用的 MERT 特征实现与当前环境不一致")
     validate_checkpoint_config(
         resume_checkpoint.get("config"),
         CONFIG,
         for_training=True,
-        allow_legacy=CONFIG.training.allow_legacy_checkpoint,
     )
     resume_window_config = resume_checkpoint.get("window_config")
     if resume_window_config is None:
@@ -255,7 +245,7 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
     progress = tqdm(loader, desc="训练", leave=False)
 
     for step, batch in enumerate(progress, 1):
-        mel = batch["mel"].to(device, non_blocking=True)       # (B, n_mels, T_mel)
+        mel = batch["mel"].to(device, non_blocking=True)       # (B, MERT帧, 状态维度)
         audio_mask = batch["audio_mask"].to(device, non_blocking=True)
         tokens = batch["tokens"].to(device, non_blocking=True)  # (B, S)
         mask = batch["mask"].to(device, non_blocking=True)      # (B, S)  True=有效
@@ -513,8 +503,8 @@ if __name__ == "__main__":
             bad_epochs = 0
             ckpt_path = CHECKPOINT_DIR / "best.pt"
             torch.save({
-                "checkpoint_version": 2,
-                "model_kind": "mert-v1-95m-frozen-decoder",
+                "checkpoint_version": 3,
+                "model_kind": "mert-window-decoder-v2",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -527,14 +517,15 @@ if __name__ == "__main__":
                 "dims": dims,
                 "window_config": window_config,
                 "config": checkpoint_config(CONFIG),
+                "feature_signature": feature_signature(),
             }, ckpt_path)
             print(f"  -> 保存验证损失最优模型到 {ckpt_path}")
         if val_content_f1 > best_val_content_f1:
             best_val_content_f1 = val_content_f1
             ckpt_path = CHECKPOINT_DIR / "best_gen.pt"
             torch.save({
-                "checkpoint_version": 2,
-                "model_kind": "mert-v1-95m-frozen-decoder",
+                "checkpoint_version": 3,
+                "model_kind": "mert-window-decoder-v2",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -547,12 +538,13 @@ if __name__ == "__main__":
                 "dims": dims,
                 "window_config": window_config,
                 "config": checkpoint_config(CONFIG),
+                "feature_signature": feature_signature(),
             }, ckpt_path)
             print(f"  -> 保存生成效果最优模型到 {ckpt_path}")
         ckpt_path = CHECKPOINT_DIR / "newest.pt"
         torch.save({
-            "checkpoint_version": 2,
-            "model_kind": "mert-v1-95m-frozen-decoder",
+            "checkpoint_version": 3,
+            "model_kind": "mert-window-decoder-v2",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -565,6 +557,7 @@ if __name__ == "__main__":
             "dims": dims,
             "window_config": window_config,
             "config": checkpoint_config(CONFIG),
+            "feature_signature": feature_signature(),
         }, ckpt_path)
         if not val_loss_improved:
             bad_epochs += 1

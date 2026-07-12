@@ -16,7 +16,8 @@ from maidata_parser import _match_music, compiler, load_music_data, music_data_v
 from mert_cache import main as rebuild_mert_cache
 from tokenizer import EOS, SOS, encode_frame
 
-CACHE_VERSION = 7
+CACHE_VERSION = 8
+MERT_FRAMES_PER_SEC = 75
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
 TARGET_START_SEC = CONFIG.window.target_start_sec
 TARGET_END_SEC = CONFIG.window.target_end_sec
@@ -52,15 +53,12 @@ def _state(path: Path) -> dict[str, int]:
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
-def _config(level_idx: int, sample_rate: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, music_version: str) -> dict:
+def _config(level_idx: int, stride_sec: float, mert_frames: int, music_version: str) -> dict:
     return {
         "cache_version": CACHE_VERSION,
         "level_idx": level_idx,
-        "sample_rate": sample_rate,
-        "hop_length": hop_length,
-        "n_mels": n_mels,
         "stride_sec": stride_sec,
-        "mel_frames": mel_frames,
+        "mert_frames": mert_frames,
         "prefix_start_sec": PREFIX_START_SEC,
         "target_start_sec": TARGET_START_SEC,
         "target_end_sec": TARGET_END_SEC,
@@ -153,7 +151,7 @@ def _acquire_lock(lock_path: Path) -> None:
 
 
 def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, sources: list[dict]) -> None:
-    frames_per_sec = config["sample_rate"] / config["hop_length"]
+    frames_per_sec = MERT_FRAMES_PER_SEC
     entries = []
     tokens: list[int] = []
     charts = []
@@ -165,7 +163,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
         mel_path = cache_dir.parent / source["mel"]
         try:
             text = chart_path.read_text(encoding="utf-8")
-            parser = compiler(hop_length=config["hop_length"], sample_rate=config["sample_rate"])
+            parser = compiler()
             parser.parse(text, music_data=songs)
         except Exception as error:
             raise RuntimeError(f"谱面解析失败，终止缓存构建: {source['chart']}") from error
@@ -195,7 +193,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
             window_start = target_start - TARGET_START_SEC
             logical_start = round(window_start * frames_per_sec)
             source_start = max(0, logical_start)
-            source_end = min(mel_total_frames, logical_start + config["mel_frames"])
+            source_end = min(mel_total_frames, logical_start + config["mert_frames"])
             row = [SOS]
             loss_start = 1
             loss_started = False
@@ -235,12 +233,20 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     print(f"[chart-cache] 严格规则排除 {len(rejected)} 首")
 
 
-def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_idx: int, sample_rate: int, n_fft: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, build_mel: bool = True) -> Path:
+def ensure_chart_cache(
+    charts_dir: str | Path,
+    cache_dir: str | Path,
+    *,
+    level_idx: int,
+    stride_sec: float,
+    mert_frames: int,
+    build_mel: bool = True,
+) -> Path:
     charts_dir = Path(charts_dir)
     cache_dir = Path(cache_dir)
     if build_mel:
         rebuild_mert_cache(charts_dir, cache_dir)
-    config = _config(level_idx, sample_rate, hop_length, n_mels, stride_sec, mel_frames, music_data_version())
+    config = _config(level_idx, stride_sec, mert_frames, music_data_version())
     cache_root, lock_path = _paths(cache_dir, config)
     sources = _scan_sources(charts_dir, cache_dir)
     current_path = _current_path(cache_root)
@@ -265,7 +271,7 @@ def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_i
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--charts-dir", type=Path, default=CONFIG.paths.charts_dir)
-    parser.add_argument("--cache-dir", type=Path, default=CONFIG.paths.mel_cache_dir)
+    parser.add_argument("--cache-dir", type=Path, default=CONFIG.paths.mert_cache_dir)
     parser.add_argument("--level", type=_level_arg, default=CONFIG.training.level_idx)
     parser.add_argument("--stride-sec", type=_positive_float_arg, default=CONFIG.window.train_stride_sec)
     args = parser.parse_args()
@@ -273,12 +279,8 @@ def main() -> None:
         args.charts_dir,
         args.cache_dir,
         level_idx=args.level,
-        sample_rate=CONFIG.audio.sample_rate,
-        n_fft=CONFIG.audio.n_fft,
-        hop_length=CONFIG.audio.hop_length,
-        n_mels=CONFIG.audio.n_mels,
         stride_sec=args.stride_sec,
-        mel_frames=CONFIG.window.mel_frames,
+        mert_frames=CONFIG.window.mert_frames,
     )
     print(f"[chart-cache] 就绪: {path}")
 

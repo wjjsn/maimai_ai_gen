@@ -1,11 +1,4 @@
-"""ChartDataset — §6 Data Loader for maimai chart generation.
-
-Four-step workflow:
-  Step 1: 重建缓存    — walk charts/, compute mel spectrograms, save to .cache/
-  Step 2: 验证数据集  — check audio↔chart pairing, parse without errors
-  Step 3: 编译谱面    — parse → to_tensor → build index (mel_path + slice coords + tokens)
-  Step 4: 迭代读取    — __getitem__ loads mel from disk, slices on the fly
-"""
+"""读取冻结 MERT 特征和持久化滑窗谱面索引。"""
 
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -169,10 +162,8 @@ class RotatedDataset(Dataset):
 def compile_index(
     valid_pairs: list[tuple[Path, Path]],
     level_idx: int,
-    sample_rate: int = CONFIG.audio.sample_rate,
-    hop_length: int = CONFIG.audio.hop_length,
     stride_sec: float = CONFIG.window.train_stride_sec,
-    mel_frames: int = CONFIG.window.mel_frames,
+    mert_frames: int = CONFIG.window.mert_frames,
 ) -> tuple[list[_IndexEntry], int, dict[str, int]]:
     """构建平移窗口：6..12 秒谱面前缀，12..22 秒训练目标。"""
     index: list[_IndexEntry] = []
@@ -180,9 +171,9 @@ def compile_index(
     total_windows = 0
     total_frames = 0
     parse_errors = 0
-    c = compiler(hop_length=hop_length, sample_rate=sample_rate)
-    frames_per_sec = sample_rate / hop_length
-    window_sec = mel_frames / frames_per_sec
+    c = compiler()
+    frames_per_sec = 75
+    window_sec = mert_frames / frames_per_sec
 
     for maidata_path, mel_path in valid_pairs:
         try:
@@ -209,7 +200,7 @@ def compile_index(
             window_start = target_start - TARGET_START_SEC
             logical_start_frame = round(window_start * frames_per_sec)
             source_start = max(0, logical_start_frame)
-            source_end = min(mel_total_frames, logical_start_frame + mel_frames)
+            source_end = min(mel_total_frames, logical_start_frame + mert_frames)
             left_pad = source_start - logical_start_frame
 
             tl = [SOS]
@@ -275,26 +266,19 @@ class ChartDataset(Dataset):
         cache_dir: str | Path | None = None,
         level_idx: int = CONFIG.training.level_idx,
         max_tokens: int = 0,
-        sample_rate: int = CONFIG.audio.sample_rate,
-        n_fft: int = CONFIG.audio.n_fft,
-        hop_length: int = CONFIG.audio.hop_length,
-        n_mels: int = CONFIG.audio.n_mels,
         stride_sec: float = CONFIG.window.train_stride_sec,
-        mel_frames: int = CONFIG.window.mel_frames,
+        mert_frames: int = CONFIG.window.mert_frames,
         valid_pairs: list[tuple[Path, Path]] | None = None,
         chart_limit: int = 0,
         seed: int = CONFIG.training.seed,
     ):
         self.charts_dir = Path(charts_dir)
-        self.cache_dir = Path(cache_dir) if cache_dir else CONFIG.paths.mel_cache_dir
+        self.cache_dir = Path(cache_dir) if cache_dir else CONFIG.paths.mert_cache_dir
         self.level_idx = level_idx
-        self.sample_rate = sample_rate
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.n_mels = n_mels
+        self.feature_size = CONFIG.model.state
         self.stride_sec = stride_sec
-        self.mel_frames = mel_frames
-        self._mel_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
+        self.mert_frames = mert_frames
+        self._mert_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
 
         if not self.charts_dir.is_dir():
             raise ValueError(f"谱面目录不存在或不是目录: {self.charts_dir}")
@@ -305,12 +289,8 @@ class ChartDataset(Dataset):
             self.charts_dir,
             self.cache_dir,
             level_idx=level_idx,
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
             stride_sec=stride_sec,
-            mel_frames=mel_frames,
+            mert_frames=mert_frames,
             build_mel=valid_pairs is None,
         )
         all_index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir)
@@ -337,26 +317,26 @@ class ChartDataset(Dataset):
         entry = self._index[idx]
 
         # 每个 DataLoader worker 复用 mmap，避免同一首歌的分段反复从磁盘读整文件。
-        mel_full = self._mel_cache.get(entry.mel_path)
-        if mel_full is None:
-            mel_full = np.load(str(entry.mel_path), mmap_mode="r")
-            if mel_full.ndim != 2 or mel_full.shape[1] != self.n_mels:
+        mert_full = self._mert_cache.get(entry.mel_path)
+        if mert_full is None:
+            mert_full = np.load(str(entry.mel_path), mmap_mode="r")
+            if mert_full.ndim != 2 or mert_full.shape[1] != self.feature_size:
                 raise ValueError(
-                    f"梅尔缓存形状错误: {entry.mel_path} 为 {mel_full.shape}，"
-                    f"当前配置需要 (时间帧数, {self.n_mels})"
+                    f"MERT 缓存形状错误: {entry.mel_path} 为 {mert_full.shape}，"
+                    f"当前配置需要 (时间帧数, {self.feature_size})"
                 )
-            self._mel_cache[entry.mel_path] = mel_full
+            self._mert_cache[entry.mel_path] = mert_full
             # ponytail: 每个 worker 最多保持 8 个 mmap；需要更多时再按命中率调大。
-            if len(self._mel_cache) > 8:
-                self._mel_cache.popitem(last=False)
+            if len(self._mert_cache) > 8:
+                self._mert_cache.popitem(last=False)
         else:
-            self._mel_cache.move_to_end(entry.mel_path)
+            self._mert_cache.move_to_end(entry.mel_path)
         source = torch.from_numpy(
-            mel_full[entry.source_start_frame:entry.source_end_frame].copy()
+            mert_full[entry.source_start_frame:entry.source_end_frame].copy()
         ).float()
-        mel_slice = torch.zeros(self.mel_frames, self.n_mels)
-        audio_mask = torch.zeros(self.mel_frames, dtype=torch.bool)
-        copy_len = min(source.shape[0], self.mel_frames - entry.left_pad_frames)
+        mel_slice = torch.zeros(self.mert_frames, self.feature_size)
+        audio_mask = torch.zeros(self.mert_frames, dtype=torch.bool)
+        copy_len = min(source.shape[0], self.mert_frames - entry.left_pad_frames)
         if copy_len > 0:
             mel_slice[entry.left_pad_frames:entry.left_pad_frames + copy_len] = source[:copy_len]
             audio_mask[entry.left_pad_frames:entry.left_pad_frames + copy_len] = True
@@ -392,25 +372,20 @@ class ChartDataset(Dataset):
 
 # ── collate ───────────────────────────────────────────────────────────────
 
-def collate_segments(batch: list[dict], mel_frames: int = 0) -> dict:
-    """Collate function: pads/trims mel to exactly mel_frames time steps.
+def collate_segments(batch: list[dict], mert_frames: int = 0) -> dict:
+    """把固定长度 MERT 窗口组成 batch。"""
+    feature_size = batch[0]["mel"].shape[1]
 
-    mel_frames defaults to 0 → fall back to max-in-batch (legacy behaviour).
-    When mel_frames > 0 each mel is trimmed or zero-padded to that exact width
-    so the encoder's positional embedding always matches.
-    """
-    n_mels = batch[0]["mel"].shape[1]
+    if mert_frames <= 0:
+        mert_frames = max(item["mel"].shape[0] for item in batch)
 
-    if mel_frames <= 0:
-        mel_frames = max(item["mel"].shape[0] for item in batch)
-
-    mels = torch.zeros(len(batch), mel_frames, n_mels)
-    audio_masks = torch.zeros(len(batch), mel_frames, dtype=torch.bool)
+    mels = torch.zeros(len(batch), mert_frames, feature_size)
+    audio_masks = torch.zeros(len(batch), mert_frames, dtype=torch.bool)
     for i, item in enumerate(batch):
-        mel = item["mel"]                        # (n_mels, T)
+        mel = item["mel"]
         T = mel.shape[0]
-        mels[i, :min(T, mel_frames)] = mel[:mel_frames]
-        audio_masks[i, :min(T, mel_frames)] = item["audio_mask"][:mel_frames]
+        mels[i, :min(T, mert_frames)] = mel[:mert_frames]
+        audio_masks[i, :min(T, mert_frames)] = item["audio_mask"][:mert_frames]
 
     return {
         "mel": mels,
@@ -441,7 +416,7 @@ def _self_check():
         non_pad = t[t != 0]
         assert non_pad[-1].item() == EOS, f"Expected EOS, got {non_pad[-1].item()}"
         assert item["audio_mask"].dtype == torch.bool
-        assert item["audio_mask"].shape == (ds.mel_frames,)
+        assert item["audio_mask"].shape == (ds.mert_frames,)
         assert item["audio_mask"].any()
         print(f"  mel={item['mel'].shape} tokens={item['tokens'].shape} "
               f"mask_true={item['mask'].sum().item()}")
