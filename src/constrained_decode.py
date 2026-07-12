@@ -3,14 +3,48 @@
 约束目标
 ========
 
-约束器应把模型输出限制在项目 token 编码能够表达、parser 能够解析、且符合普通
-Master 谱面物理语义的范围内。约束分为四层：序列结构、单音符结构、同一逻辑帧
-资源冲突、跨帧持续资源占用。硬约束只能用于确定非法或训练数据清洗后已无反例的
-情况，不能把低频但合法的谱面写法当作非法。
+约束器应把模型输出限制在项目 token 编码能够表达、parser 能够解析、且符合高质量
+普通 Master 谱面物理语义的范围内。约束分为序列结构、单音符结构、同一逻辑帧
+资源冲突、跨帧持续资源占用和普通谱面质量限制。
 
-时间统一使用 TS token 的 10ms 精度。所有持续区间采用半开区间 ``[start, end)``：
-音符开始时间小于 ``end`` 时资源仍被占用，恰好等于 ``end`` 时已经释放，不添加
-10ms、50ms 或其他人为冷却时间。
+本规范不以“兼容当前全部训练标签”为目标。训练源中可能混有宴会场风格、特殊
+谱面、转换错误、parser 误解析和物理上不合理的配置。规则有少量反例不代表规则
+错误；对于高置信异常，宁可排除数据，也不能为了保留少数脏标签放宽生成语言。
+
+训练数据采用整曲排除：一首歌的 Master 只要命中任一默认硬规则，整首歌都不得进入
+训练集、验证集和整曲生成指标。禁止只删除单个 Note 或 frame，因为局部删除会破坏
+节奏结构、Slide/Hold 上下文、滑窗 decoder 前缀和整曲真值的一致性。所有排除必须
+记录歌曲路径、规则编号、时间、lane/area 和相关 Note，供离线审计。
+
+训练缓存构建、离线数据审计和推理结构化解码必须共享同一套规则及时间量化方式，
+不能分别维护近似实现。缓存规则或 token 语义变化时必须提升 CACHE_VERSION，并对
+全部训练源重新审计和重建缓存。
+
+时间统一使用 TS token 的 10ms 精度：``1cs = 10ms``。持续资源的实际占用区间为
+半开区间 ``[start, end)``；此外，为普通谱面手感增加 ``50ms = 5cs`` 的同位置释放
+冷却。也就是说，HOLD/TOUCH_HOLD 在 ``end`` 时结束物理占用，但同 lane/area 的新
+独立输入只有在 ``frame_time > end + 5cs`` 时才允许。``frame_time == end`` 仍属于
+冷却冲突，不再作为合法的瞬间 release-tap 例外。
+
+默认质量阈值
+------------
+
+- HOLD/TOUCH_HOLD 结束后同位置冷却：50ms，包含边界，即 ``0 <= gap <= 5cs`` 禁止。
+- 同 lane 两个独立 press 的最小间隔：30ms；``gap < 3cs`` 判为硬冲突。
+- HOLD/TOUCH_HOLD duration 必须为正，不能是 TS_0；现有零时长标签应修正 parser、
+  归一化或整曲排除，不能继续作为普通 HOLD 学习。
+- duration 不能超过 TS_2999；编码时不得静默 clamp 超范围值。
+- 30ms 到 50ms 的同 lane press、极短 HOLD、高密度 jack 和异常长 HOLD 属于质量
+  审计候选。它们可以升级为整曲排除规则，但不能悄悄修改单个 Note。
+
+规则分级
+--------
+
+- 默认硬规则：结构确定非法、物理资源冲突，或统计上高度集中于特殊/异常谱面的
+  配置。训练和推理都必须拒绝，旧数据有反例时排除整首歌。
+- 质量审计规则：尚不能证明普遍非法，但不符合普通 Master 目标。先报告命中规模和
+  典型谱面，经确认后整体升级为硬规则。
+- 明确保留规则：真实普通谱面中广泛存在的写法，不能因实现方便而粗粒度禁止。
 
 一、序列与帧结构
 ----------------
@@ -48,8 +82,9 @@ HOLD
 
 ``NOTE_HOLD -> LANE -> TS(duration) -> [IS_BREAK] -> [IS_EX]``。
 
-- duration 使用 TS_0..TS_2999。普通谱面规范应要求 TS_1..TS_2999，但训练集中仍有
-  零时长 HOLD；在将它们归一化为 TAP 或排除前，不能直接屏蔽 TS_0。
+- duration 必须使用 TS_1..TS_2999。TS_0 HOLD 没有持续动作，不能进入普通 Master
+  训练目标；若源谱使用 pseudo-HOLD，应在 parser/清洗阶段归一化为 TAP，不能要求
+  解码器保留脏标签。
 - 属性去重、顺序及组合规则与 TAP 相同。
 
 TOUCH / TOUCH_HOLD
@@ -69,7 +104,7 @@ SLIDE NOTE
 ``NOTE_SLIDE -> [IS_BREAK] -> [IS_EX] -> SEGMENT+``。
 
 - Slide 必须至少包含一个完整 segment，不允许 ``NOTE_SLIDE FRAME_END`` 空 Slide。
-  当前训练源仍有一个 parser 异常空 Slide，启用该硬约束前应先清洗该样本。
+  当前训练源中的 parser 异常空 Slide 应导致整曲排除，不能成为放宽规则的理由。
 - Note 级 IS_BREAK 和 IS_EX 可同时存在；Note 级 IS_BREAK 与 segment 级
   IS_SLIDE_BREAK 也不互斥。
 - 同一 Slide 可以有多个 segment，不能把 segment 数量当作 action note 数量。
@@ -90,9 +125,9 @@ SLIDE SEGMENT
   选择最短方向。非 Circle 不能输出方向属性。
 - segment 属性各最多一次，并按编码器顺序出现：方向、IS_FORCE_STAR、
   IS_FAKE_ROTATE、IS_SLIDE_BREAK、IS_SLIDE_NO_HEAD。
-- IS_FORCE_STAR、IS_FAKE_ROTATE、IS_SLIDE_NO_HEAD 属于 Slide 头部语义，原则上只应
-  出现在第一段。当前 parser 会在一个特殊谱面中把 no-head 复制到第二段，清洗或
-  修正编码前不能直接屏蔽该训练标签。
+- IS_FORCE_STAR、IS_FAKE_ROTATE、IS_SLIDE_NO_HEAD 属于 Slide 头部语义，只应出现
+  在第一段。parser 若把头部属性复制到后续段，应修正 parser 或排除整曲，不能要求
+  解码器接受非规范 token。
 - 当前 parser 会把整条 Slide 的 Break 复制到多个 segment，训练中存在大量非末段
   IS_SLIDE_BREAK。不能在未统一 parser/token 语义前强制“只有末段可 Break”。
 
@@ -142,22 +177,64 @@ SLIDE SEGMENT
 HOLD 占用普通 lane。若 lane L 上存在 HOLD ``[start, end)``：
 
 - ``frame_time < end`` 时，禁止 TAP(L)、HOLD(L)，以及第一段从 L 开始的 SLIDE。
-- ``frame_time == end`` 时允许同 lane 新音符，不设置额外冷却。
+- ``end <= frame_time <= end + 5cs`` 时仍处于释放冷却，禁止同 lane TAP、HOLD 和
+  有头 Slide；只有 ``frame_time > end + 5cs`` 才允许同 lane 新独立 press。
+- Slide 是否产生独立 press 由第一段 IS_SLIDE_NO_HEAD 决定。有头 Slide 受 lane
+  占用与冷却限制；no-head Slide 不要求重新按下，不能无条件按有头 Slide 处理。
 - 其他 lane 的 TAP/HOLD/SLIDE 和所有 TOUCH 仍然允许。
 - decoder 的 6 秒 token 前缀中可能已有尚未结束的 HOLD，状态必须从完整前缀恢复，
   不能只追踪当前目标区新生成的 HOLD。
+- 同 lane 两个正时长 HOLD 的占用区间不得重叠。
 
 TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, end)``：
 
 - ``frame_time < end`` 时禁止 TOUCH(A) 和 TOUCH_HOLD(A)。
-- ``frame_time == end`` 时允许重新进入。
+- ``end <= frame_time <= end + 5cs`` 时仍处于释放冷却，继续禁止同 area TOUCH 和
+  TOUCH_HOLD；只有 ``frame_time > end + 5cs`` 才允许重新进入。
 - 只占用具体 area，不得把整个 A/B/C/D/E 大区一起锁定。
 
-六、明确不能采用的粗粒度规则
+六、普通谱面质量规则
+--------------------
+
+独立 press 定义为 TAP、HOLD_START 和有头 SLIDE_HEAD。一个 Slide Note 即使包含多个
+``*`` 分支或链式 segment，也只按一个 Slide head 计算；no-head Slide 不算新 press。
+
+默认硬规则：
+
+- 同一逻辑帧、同一 lane 的独立 press 数不能超过 1。
+- 同 lane 相邻独立 press 的间隔不能小于 30ms，即 ``gap < 3cs`` 时整曲排除。
+- HOLD 活跃期间以及结束后 50ms 冷却内，不得出现同 lane 独立 press。
+- TOUCH_HOLD 活跃期间以及结束后 50ms 冷却内，不得出现同 area TOUCH/TOUCH_HOLD。
+- 同 lane HOLD 区间不得重叠，同 area TOUCH_HOLD 区间不得重叠。
+- 同一逻辑帧不得有完全相同的独立 Note；同 Touch area 不得重复或同时出现 TOUCH
+  与 TOUCH_HOLD。
+- HOLD、TOUCH_HOLD duration 必须为 TS_1..TS_2999；Slide wait/trace 不得同时为
+  TS_0；任何 duration 超出词表范围都应拒绝，不能 clamp 后继续训练。
+- 空 Slide、断开的多段 Slide、非法 Shape 几何、非 Circle 方向属性、属性倒序或
+  重复、malformed frame/sequence 都属于整曲排除条件。
+- parser 失败、无法稳定 round-trip、Master 等级元数据明显异常或被标记为特殊谱面
+  时，默认不进入普通 Master 数据集。
+
+质量审计候选，不在没有统计报告时直接扩大为硬规则：
+
+- ``30ms <= gap < 50ms`` 的同 lane 独立 press。
+- ``0 < HOLD duration < 50ms`` 的极短 HOLD。
+- 250ms 内同 lane 独立 press 至少 5 次，或 500ms 内至少 9 次。
+- HOLD duration 大于 10 秒；大于 15 秒时应优先人工复核。
+- Slide 的重复完整路线、异常多 segment、异常长 wait/trace，以及 Slide 结束后极短
+  间隔的端点 lane 输入。这些不能仅靠端点共享就判非法，必须结合实际头部和轨迹。
+
+已知高优先级异常模式包括：长 HOLD 内同 lane TAP、HOLD 结束点瞬间接同 lane TAP、
+连续 30ms 到 50ms 极短 HOLD、低于 30ms 的同 lane Slide head，以及零时长 HOLD。
+这类模式即使只集中于少数歌曲，也应排除歌曲，而不是作为“合法少数派”放行。
+
+七、明确不能采用的粗粒度规则
 ----------------------------
 
 - 不能禁止 HOLD 持续期间的所有其他音符；不同 lane 音符非常常见。
-- 不能禁止 HOLD 结束瞬间接音符，也不能添加任意冷却时间。
+- 不能把 50ms 冷却扩大到所有 lane；它只限制刚释放的同 lane/area。
+- 不能未经统计把冷却提高到 80ms 或 100ms。现有分布在 80ms 附近开始大量覆盖正常
+  高 BPM 谱面，阈值变化必须重新审计整库影响。
 - 不能禁止 Slide 活跃期间出现其他音符，或禁止使用 Slide 起终点 lane。
 - 不能禁止同起点多 Slide、多段 Slide、路线分叉或汇合。
 - 不能禁止所有 start=end Slide；Circle/P/Q/PP/QQ 有真实合法样本。
@@ -165,15 +242,34 @@ TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, e
   area 的 TOUCH 同时出现。
 - 不能把每帧 action 上限降为 2，也不能给 TOUCH 设置很低的总数上限。
 
-七、当前实现状态
+八、数据清洗与验证要求
+----------------------
+
+1. 离线审计以整首歌为单位输出通过/拒绝和全部原因，不能遇到第一条错误就丢失其他
+   诊断信息。
+2. 拒绝记录至少包含规则 ID、歌曲相对路径、level、绝对时间、量化时间、lane/area、
+   Note 类型、持续时间和相关前后事件。
+3. 训练集和验证集只能从审计通过的歌曲中划分；同一首违规歌曲不能只从训练集删除
+   却留在验证或整曲生成评估中。
+4. 旋转增强不改变规则结果。原谱通过时，8 个旋转版本都必须通过；原谱违规时不得
+   通过旋转掩盖 lane 冲突。
+5. 滑窗前缀必须携带足够状态，使跨窗口 HOLD/TOUCH_HOLD 占用和 50ms 冷却在训练、
+   teacher forcing、正式递推推理中完全一致。
+6. 每次修改规则都要报告：扫描歌曲数、通过/拒绝歌曲数、各规则命中歌曲数和事件数、
+   典型样本，以及对窗口数和 train/val 歌曲数的影响。
+7. 约束器的自检应同时包含合法边界和拒绝边界：HOLD 结束后 50ms 必须拒绝，60ms
+   必须允许；不同 lane 在 HOLD 期间必须允许；no-head Slide 不能误算独立 press。
+
+九、当前实现状态
 ----------------
 
 当前文件已经实现基础序列、Note 字段、时间非递减、属性去重、CW/CCW 互斥，以及
 33 Note / 4 action 的观察上限；尚未完整实现上文的 canonical 属性顺序、Slide
 几何、多段连接、同帧资源冲突、HOLD/TOUCH_HOLD 跨帧占用和严格 malformed prefix
-校验。修改状态机后必须对全部训练 token 逐 token 重放，默认硬约束应达到
-``constraint_violations = 0``；有反例的规则必须先清洗数据或修正 parser，不能仅在
-推理端强行屏蔽。
+校验，也尚未实现 50ms 释放冷却和整曲质量审计。后续实现不能再以旧训练 token 的
+``constraint_violations = 0`` 作为放宽规则的前提；正确流程是先按规范审计并排除违规
+歌曲，再要求清洗后的训练 token 达到 ``constraint_violations = 0``。推理端必须使用
+同一规范，不能生成训练阶段已经拒绝的结构。
 """
 
 from maidata_parser import (
