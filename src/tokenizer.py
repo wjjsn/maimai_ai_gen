@@ -87,7 +87,7 @@ def encode_note(note: "Note") -> list[int]:
             tokens.append(IS_BREAK)
         if note.isEx:
             tokens.append(IS_EX)
-        for segment in note.data:
+        for segment_index, segment in enumerate(note.data):
             tokens.extend((
                 SEGMENT_START,
                 SLIDE_SHAPE_BASE + segment.shape.value - 1,
@@ -101,13 +101,15 @@ def encode_note(note: "Note") -> list[int]:
                 tokens.append(IS_CW)
             elif segment.isClockwise is False:
                 tokens.append(IS_CCW)
-            if segment.isForceStar:
+            # 这些是整条 Slide 的头部属性，parser 会把状态复制到后续段，
+            # token 只在第一段编码一次，避免产生多个星头或 no-head 标记。
+            if segment_index == 0 and segment.isForceStar:
                 tokens.append(IS_FORCE_STAR)
-            if segment.isFakeRotate:
+            if segment_index == 0 and segment.isFakeRotate:
                 tokens.append(IS_FAKE_ROTATE)
             if segment.isSlideBreak:
                 tokens.append(IS_SLIDE_BREAK)
-            if segment.isSlideNoHead:
+            if segment_index == 0 and segment.isSlideNoHead:
                 tokens.append(IS_SLIDE_NO_HEAD)
             tokens.append(SEGMENT_END)
     return tokens

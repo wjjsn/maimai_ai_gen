@@ -61,10 +61,11 @@
 5. malformed prefix 不能靠在末尾追加 token“修复”。例如已经出现
    ``NOTE_TAP FRAME_END`` 时缺失的 LANE 无法再插入，应返回空 allowed set。
    FRAME_END 后的垃圾 token、重复 SOS、内部 EOS 等也必须判为死路，不能静默忽略。
-6. 每个物理 frame 最多 33 个 Note；TAP/HOLD/SLIDE 合计最多 4 个，TOUCH 不计入
-   action 上限。这两个值是当前普通 Master 训练集观察上限，不是 simai 语法常量。
-   达到上限后不能再开始新 Note，但已经开始的 Note 必须允许合法闭合，不能生成
-   半个 Note 后强制 FRAME_END。
+6. 每个物理 frame 最多 33 个 Note；同一逻辑 TS 最多两个独立 press。独立 press 是
+   TAP、HOLD_START 和有头 SLIDE_HEAD；TOUCH、TOUCH_HOLD 与 no-head Slide 不计入。
+   达到两个 press 后仍可生成 TOUCH 或 no-head Slide，但不能生成新的 TAP、HOLD 或
+   有头 Slide。已经开始的 Note 必须允许按合法形式闭合，不能生成半个 Note 后强制
+   FRAME_END。
 
 二、单音符规范
 --------------
@@ -240,7 +241,8 @@ TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, e
 - 不能禁止所有 start=end Slide；Circle/P/Q/PP/QQ 有真实合法样本。
 - 不能禁止 trace=TS_0、Break+EX、Circle 无方向属性、非 C TouchHold，或大量不同
   area 的 TOUCH 同时出现。
-- 不能把每帧 action 上限降为 2，也不能给 TOUCH 设置很低的总数上限。
+- 不能把两个 press 的上限错误套到 TOUCH、TOUCH_HOLD、no-head Slide 或 Slide 的
+  后续 segment，也不能给 TOUCH 设置很低的总数上限。
 
 八、数据清洗与验证要求
 ----------------------
@@ -263,14 +265,18 @@ TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, e
 九、当前实现状态
 ----------------
 
-当前文件已经实现基础序列、Note 字段、时间非递减、属性去重、CW/CCW 互斥，以及
-33 Note / 4 action 的观察上限；尚未完整实现上文的 canonical 属性顺序、Slide
-几何、多段连接、同帧资源冲突、HOLD/TOUCH_HOLD 跨帧占用和严格 malformed prefix
-校验，也尚未实现 50ms 释放冷却和整曲质量审计。后续实现不能再以旧训练 token 的
-``constraint_violations = 0`` 作为放宽规则的前提；正确流程是先按规范审计并排除违规
-歌曲，再要求清洗后的训练 token 达到 ``constraint_violations = 0``。推理端必须使用
-同一规范，不能生成训练阶段已经拒绝的结构。
+当前文件已经用严格前缀重放状态机实现：SOS/EOS/frame 结构、canonical Note 字段和
+属性顺序、时间非递减、同 TS 逻辑帧合并、33 Note / 2 press 上限、Slide 几何与
+多段连接、同帧 lane/Touch 资源冲突、HOLD/TOUCH_HOLD 跨帧占用、50ms 释放冷却、
+30ms 独立 press 最小间隔、no-head Slide 例外，以及 malformed prefix 死路处理。
+
+尚未实现的是 chart_cache 构建前的整曲质量审计和自动排除报告。因此当前推理解码已
+执行严格规范，但旧缓存仍可能包含会被新规则拒绝的歌曲。后续应让缓存构建先按同一
+规则排除整曲，再要求清洗后的训练 token 达到 ``constraint_violations = 0``。
 """
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from tokenizer import (
     EOS,
@@ -302,234 +308,558 @@ from tokenizer import (
     SHAPES,
     TIMES,
     TOUCHES,
+    encode_frame,
+    encode_note,
 )
+
+if TYPE_CHECKING:
+    from maidata_parser import Frame
 
 
 GRAND_V = SLIDE_SHAPE_BASE + 3
-TAP_ATTRS = (IS_BREAK, IS_EX)
-SLIDE_NOTE_ATTRS = (IS_BREAK, IS_EX)
-SLIDE_SEG_ATTRS = (IS_CW, IS_CCW, IS_FORCE_STAR, IS_FAKE_ROTATE, IS_SLIDE_BREAK, IS_SLIDE_NO_HEAD)
+LINE = SLIDE_SHAPE_BASE
+CIRCLE = SLIDE_SHAPE_BASE + 1
+V_SHAPE = SLIDE_SHAPE_BASE + 2
+S_SHAPE = SLIDE_SHAPE_BASE + 8
+Z_SHAPE = SLIDE_SHAPE_BASE + 9
+WIFI = SLIDE_SHAPE_BASE + 10
+POSITIVE_TIMES = TIMES[1:]
+RELEASE_COOLDOWN_CS = 5
+MIN_PRESS_GAP_CS = 3
+
+
+class _NeedToken(Exception):
+    def __init__(self, allowed: tuple[int, ...]):
+        self.allowed = allowed
+
+
+class _InvalidPrefix(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _NoteRecord:
+    signature: tuple
+    press_lane: int | None = None
+    hold: tuple[int, int] | None = None
+    touch_hold: tuple[int, int] | None = None
+    touch_area: int | None = None
+
+
+@dataclass
+class _ReplayState:
+    frame_time: int | None = None
+    previous_frame_time: int = 0
+    logical_time: int | None = None
+    logical_signatures: set[tuple] = field(default_factory=set)
+    logical_press_lanes: set[int] = field(default_factory=set)
+    logical_touch_areas: set[int] = field(default_factory=set)
+    active_holds: dict[int, int] = field(default_factory=dict)
+    active_touch_holds: dict[int, int] = field(default_factory=dict)
+    last_press_time: dict[int, int] = field(default_factory=dict)
+    frame_notes: int = 0
+    frame_actions: int = 0
+
+    def begin_frame(self, time_cs: int) -> None:
+        if time_cs < self.previous_frame_time:
+            raise _InvalidPrefix
+        self.previous_frame_time = time_cs
+        self.frame_time = time_cs
+        self.frame_notes = 0
+        self.frame_actions = 0
+        if self.logical_time != time_cs:
+            self.logical_time = time_cs
+            self.logical_signatures.clear()
+            self.logical_press_lanes.clear()
+            self.logical_touch_areas.clear()
+
+    def lane_blocked(self, lane: int) -> bool:
+        assert self.frame_time is not None
+        hold_end = self.active_holds.get(lane)
+        if hold_end is not None and self.frame_time <= hold_end + RELEASE_COOLDOWN_CS:
+            return True
+        last_press = self.last_press_time.get(lane)
+        return last_press is not None and self.frame_time - last_press < MIN_PRESS_GAP_CS
+
+    def touch_blocked(self, area: int) -> bool:
+        assert self.frame_time is not None
+        hold_end = self.active_touch_holds.get(area)
+        return hold_end is not None and self.frame_time <= hold_end + RELEASE_COOLDOWN_CS
+
+    def add_note(self, note: _NoteRecord, action: bool) -> None:
+        assert self.frame_time is not None
+        if note.signature in self.logical_signatures:
+            raise _InvalidPrefix
+        if note.press_lane is not None:
+            if note.press_lane in self.logical_press_lanes or self.lane_blocked(note.press_lane):
+                raise _InvalidPrefix
+            self.logical_press_lanes.add(note.press_lane)
+            self.last_press_time[note.press_lane] = self.frame_time
+        if note.touch_area is not None:
+            if note.touch_area in self.logical_touch_areas or self.touch_blocked(note.touch_area):
+                raise _InvalidPrefix
+            self.logical_touch_areas.add(note.touch_area)
+        if note.hold is not None:
+            lane, duration = note.hold
+            self.active_holds[lane] = self.frame_time + duration
+        if note.touch_hold is not None:
+            area, duration = note.touch_hold
+            self.active_touch_holds[area] = self.frame_time + duration
+        self.logical_signatures.add(note.signature)
+        self.frame_notes += 1
+        self.frame_actions += int(action)
+
+
+@dataclass(frozen=True)
+class ConstraintViolation:
+    rule: str
+    time_sec: float
+    detail: str
+
+
+def validate_frames(frames: list["Frame"]) -> list[ConstraintViolation]:
+    """审计整首解析结果；返回全部违规，调用方据此整曲排除。"""
+    violations: list[ConstraintViolation] = []
+    state = _ReplayState()
+    previous_time = 0
+    for frame in frames:
+        time_cs = round(frame.time_sec * 100)
+        if time_cs < previous_time:
+            violations.append(ConstraintViolation("FRAME_TIME_BACKWARD", frame.time_sec, f"{time_cs} < {previous_time}"))
+            continue
+        previous_time = time_cs
+        frame_tokens = [SOS, *encode_frame(frame, time_cs / 100.0), EOS]
+        frame_valid = True
+        for pos, target in enumerate(frame_tokens):
+            allowed = allowed_tokens(frame_tokens[:pos])
+            if target not in allowed:
+                violations.append(ConstraintViolation(
+                    "FRAME_TOKEN_INVALID",
+                    frame.time_sec,
+                    f"位置={pos} token={target} allowed={allowed[:16]}",
+                ))
+                frame_valid = False
+                break
+
+        if not frame_valid:
+            continue
+        try:
+            state.begin_frame(time_cs)
+            _add_frame_records(state, frame)
+        except _InvalidPrefix:
+            violations.append(ConstraintViolation("RESOURCE_CONFLICT", frame.time_sec, "同位置 press、持续占用或冷却冲突"))
+    return violations
+
+
+def _add_frame_records(state: _ReplayState, frame: "Frame") -> None:
+    from maidata_parser import NoteType
+
+    for note in frame.notes:
+        tokens = tuple(encode_note(note))
+        if note.type is NoteType.TAP:
+            lane = LANE_BASE + note.data.value - 1
+            state.add_note(_NoteRecord(tokens, press_lane=lane), action=True)
+        elif note.type is NoteType.HOLD:
+            lane = LANE_BASE + note.data.lane.value - 1
+            duration = round(note.data.holdTime * 100)
+            if not 1 <= duration <= 2999:
+                raise _InvalidPrefix
+            state.add_note(_NoteRecord(tokens, press_lane=lane, hold=(lane, duration)), action=True)
+        elif note.type is NoteType.TOUCH:
+            area = TOUCH_BASE + note.data.Touch_area.value - 1
+            state.add_note(_NoteRecord(tokens, touch_area=area), action=False)
+        elif note.type is NoteType.TOUCH_HOLD:
+            area = TOUCH_BASE + note.data.Touch_area.value - 1
+            duration = round(note.data.holdTime * 100)
+            if not 1 <= duration <= 2999:
+                raise _InvalidPrefix
+            state.add_note(_NoteRecord(tokens, touch_area=area, touch_hold=(area, duration)), action=False)
+        else:
+            if not note.data:
+                raise _InvalidPrefix
+            first = note.data[0]
+            lane = LANE_BASE + first.start_lane.value - 1
+            press_lane = None if first.isSlideNoHead else lane
+            for segment in note.data:
+                wait = round(segment.wait_duration * 100)
+                trace = round(segment.trace_duration * 100)
+                if not 0 <= wait <= 2999 or not 0 <= trace <= 2999 or wait == trace == 0:
+                    raise _InvalidPrefix
+            state.add_note(_NoteRecord(tokens, press_lane=press_lane), action=press_lane is not None)
 
 
 def allowed_tokens(
     tokens: list[int],
     max_notes_per_frame: int = 33,
-    max_action_notes_per_frame: int = 4,
+    max_action_notes_per_frame: int = 2,
     min_frame_time: int = 0,
     max_frame_time: int = 2999,
 ) -> tuple[int, ...]:
-    """返回下一步允许的 token。只做语法约束，不判断音乐合理性。"""
+    """重放完整前缀，返回符合严格普通 Master 规范的下一批 token。"""
     if not tokens:
         return (SOS,)
-    if tokens[-1] in (EOS, PAD):
+    try:
+        return _PrefixReplay(
+            tokens,
+            max_notes_per_frame=max_notes_per_frame,
+            max_action_notes_per_frame=max_action_notes_per_frame,
+            min_frame_time=min_frame_time,
+            max_frame_time=max_frame_time,
+        ).run()
+    except _NeedToken as need:
+        return need.allowed
+    except _InvalidPrefix:
         return ()
-    if tokens == [SOS]:
-        return (FRAME_START, EOS)
-
-    start = _last_frame_start(tokens)
-    if start < 0:
-        return (FRAME_START, EOS)
-
-    frame = tokens[start:]
-    if len(frame) == 1:
-        return _times_from(max(_previous_frame_time(tokens[:start]), min_frame_time), max_frame_time)
-    if len(frame) == 2:
-        return NOTE_TYPES
-
-    return _allowed_in_frame(frame[2:], max_notes_per_frame, max_action_notes_per_frame)
 
 
-def _last_frame_start(tokens: list[int]) -> int:
-    try:
-        end = len(tokens) - 1 - tokens[::-1].index(FRAME_END)
-    except ValueError:
-        end = 0
-    try:
-        return len(tokens) - 1 - tokens[::-1].index(FRAME_START)
-    except ValueError:
-        return -1 if end == 0 else end + 1
+class _PrefixReplay:
+    def __init__(self, tokens: list[int], *, max_notes_per_frame: int, max_action_notes_per_frame: int,
+                 min_frame_time: int, max_frame_time: int):
+        self.tokens = tokens
+        self.i = 0
+        self.max_notes = max_notes_per_frame
+        self.max_actions = max_action_notes_per_frame
+        self.min_time = max(0, min_frame_time)
+        self.max_time = min(2999, max_frame_time)
+        self.state = _ReplayState()
 
+    def run(self) -> tuple[int, ...]:
+        self._take_exact(SOS)
+        if self._at_end():
+            raise _NeedToken((FRAME_START, EOS))
+        while True:
+            token = self._peek()
+            if token == EOS:
+                self.i += 1
+                if not self._at_end():
+                    raise _InvalidPrefix
+                return ()
+            if token != FRAME_START:
+                raise _InvalidPrefix
+            self.i += 1
+            self._parse_frame()
+            if self._at_end():
+                raise _NeedToken((FRAME_START, EOS))
 
-def _previous_frame_time(tokens: list[int]) -> int:
-    for i in range(len(tokens) - 2, -1, -1):
-        if tokens[i] == FRAME_START and TS_BASE <= tokens[i + 1] < TS_BASE + 3000:
-            return tokens[i + 1] - TS_BASE
-    return 0
+    def _parse_frame(self) -> None:
+        min_time = max(self.state.previous_frame_time, self.min_time)
+        if self._at_end():
+            raise _NeedToken(tuple(range(TS_BASE + min_time, TS_BASE + self.max_time + 1)))
+        time_token = self._take_from(TIMES)
+        time_cs = time_token - TS_BASE
+        if time_cs > self.max_time or time_cs < self.state.previous_frame_time:
+            raise _InvalidPrefix
+        self.state.begin_frame(time_cs)
+        self._parse_note()
+        while True:
+            if self._at_end():
+                raise _NeedToken(self._note_boundary_tokens())
+            if self._peek() == FRAME_END:
+                self.i += 1
+                return
+            self._parse_note()
 
-
-def _times_from(min_time: int, max_time: int = 2999) -> tuple[int, ...]:
-    return tuple(range(TS_BASE + min_time, TS_BASE + min(max_time, 2999) + 1))
-
-
-def _allowed_in_frame(body: list[int], max_notes_per_frame: int, max_action_notes_per_frame: int) -> tuple[int, ...]:
-    if not body:
-        return NOTE_TYPES
-    i = 0
-    notes = 0
-    action_notes = 0
-    while i < len(body):
-        tok = body[i]
-        rest = body[i:]
-        if tok == NOTE_TAP:
-            done, allowed = _consume_tap(rest)
-        elif tok == NOTE_HOLD:
-            done, allowed = _consume_hold(rest)
-        elif tok == NOTE_TOUCH:
-            done, allowed = _consume_touch(rest)
-        elif tok == NOTE_SLIDE:
-            done, allowed = _consume_slide(rest)
-        elif tok == FRAME_END:
-            return (FRAME_START, EOS)
+    def _parse_note(self) -> None:
+        allowed_types = self._note_types()
+        note_type = self._take_from(allowed_types)
+        if note_type == NOTE_TAP:
+            note = self._parse_tap()
+            self.state.add_note(note, action=True)
+        elif note_type == NOTE_HOLD:
+            note = self._parse_hold()
+            self.state.add_note(note, action=True)
+        elif note_type == NOTE_TOUCH:
+            note = self._parse_touch()
+            self.state.add_note(note, action=False)
         else:
-            return (FRAME_END,)
+            note = self._parse_slide()
+            self.state.add_note(note, action=note.press_lane is not None)
 
-        if allowed:
-            if notes >= max_notes_per_frame:
-                return (FRAME_END,)
-            if action_notes >= max_action_notes_per_frame:
-                return tuple(t for t in allowed if t not in (NOTE_TAP, NOTE_HOLD, NOTE_SLIDE)) or (FRAME_END,)
-            return allowed
-        i += done
-        notes += 1
-        if tok in (NOTE_TAP, NOTE_HOLD, NOTE_SLIDE):
-            action_notes += 1
+    def _parse_tap(self) -> _NoteRecord:
+        lane = self._take_from(self._available_press_lanes())
+        attrs, remaining = self._parse_note_attrs()
+        note = _NoteRecord((NOTE_TAP, lane, *attrs), press_lane=lane)
+        if self._at_end():
+            self._finish_note_options(note, action=True, extras=remaining)
+        return note
 
-    if notes >= max_notes_per_frame:
-        return (FRAME_END,)
-    if action_notes >= max_action_notes_per_frame:
-        return (NOTE_TOUCH, FRAME_END)
-    return NOTE_TYPES + (FRAME_END,)
+    def _parse_hold(self) -> _NoteRecord:
+        lane = self._take_from(self._available_press_lanes())
+        duration = self._take_from(POSITIVE_TIMES) - TS_BASE
+        attrs, remaining = self._parse_note_attrs()
+        note = _NoteRecord((NOTE_HOLD, lane, duration, *attrs), press_lane=lane, hold=(lane, duration))
+        if self._at_end():
+            self._finish_note_options(note, action=True, extras=remaining)
+        return note
+
+    def _parse_touch(self) -> _NoteRecord:
+        areas = tuple(area for area in TOUCHES if not self._touch_unavailable(area))
+        area = self._take_from(areas)
+        duration = None
+        firework = False
+        if self._at_end():
+            note = _NoteRecord((NOTE_TOUCH, area, None, False), touch_area=area)
+            self._finish_note_options(note, action=False, extras=POSITIVE_TIMES + (IS_FIREWORK,))
+        if self._peek() in TIMES:
+            duration = self._take_from(POSITIVE_TIMES) - TS_BASE
+            if self._at_end():
+                note = _NoteRecord((NOTE_TOUCH, area, duration, False), touch_hold=(area, duration), touch_area=area)
+                self._finish_note_options(note, action=False, extras=(IS_FIREWORK,))
+        if self._peek() == IS_FIREWORK:
+            self.i += 1
+            firework = True
+            if self._at_end():
+                hold = (area, duration) if duration is not None else None
+                note = _NoteRecord((NOTE_TOUCH, area, duration, True), touch_hold=hold, touch_area=area)
+                self._finish_note_options(note, action=False, extras=())
+        signature = (NOTE_TOUCH, area, duration, firework)
+        hold = (area, duration) if duration is not None else None
+        return _NoteRecord(signature, touch_hold=hold, touch_area=area)
+
+    def _parse_slide(self) -> _NoteRecord:
+        note_attrs, remaining_attrs = self._parse_note_attrs()
+        if self._at_end():
+            raise _NeedToken(remaining_attrs + (SEGMENT_START,))
+        if self._peek() != SEGMENT_START:
+            raise _InvalidPrefix
+        segments = []
+        first_start = previous_end = None
+        first_headed = True
+        while True:
+            self._take_exact(SEGMENT_START)
+            segment, no_head = self._parse_slide_segment(
+                first_start=first_start,
+                previous_end=previous_end,
+                first_segment=not segments,
+            )
+            segments.append(segment)
+            if first_start is None:
+                first_start = segment[1]
+                first_headed = not no_head
+            previous_end = segment[2]
+            if self._at_end():
+                signature = (NOTE_SLIDE, *note_attrs, tuple(segments))
+                note = _NoteRecord(signature, press_lane=first_start if first_headed else None)
+                self._finish_note_options(note, action=first_headed, extras=(SEGMENT_START,))
+            if self._peek() != SEGMENT_START:
+                break
+        assert first_start is not None
+        signature = (NOTE_SLIDE, *note_attrs, tuple(segments))
+        return _NoteRecord(signature, press_lane=first_start if first_headed else None)
+
+    def _parse_slide_segment(self, *, first_start: int | None, previous_end: int | None,
+                             first_segment: bool) -> tuple[tuple, bool]:
+        shape = self._take_from(SHAPES)
+        starts = LANES if first_segment else tuple(dict.fromkeys((first_start, previous_end)))
+        start = self._take_from(starts)
+        end = self._take_from(self._slide_end_lanes(shape, start))
+        middle = None
+        if shape == GRAND_V:
+            middle = self._take_from(tuple(lane for lane in LANES if lane not in (start, end)))
+        wait = self._take_from(TIMES) - TS_BASE
+        traces = POSITIVE_TIMES if wait == 0 else TIMES
+        trace = self._take_from(traces) - TS_BASE
+
+        attrs = []
+        attr_order = []
+        if shape == CIRCLE:
+            attr_order.append((IS_CW, IS_CCW))
+        if first_segment:
+            attr_order.extend(((IS_FORCE_STAR,), (IS_FAKE_ROTATE,)))
+        attr_order.append((IS_SLIDE_BREAK,))
+        if first_segment:
+            attr_order.append((IS_SLIDE_NO_HEAD,))
+
+        no_head = False
+        for index, group in enumerate(attr_order):
+            if self._at_end():
+                remaining = tuple(token for rest in attr_order[index:] for token in rest)
+                if self._slide_head_must_be_no_head(start, first_segment, no_head):
+                    if IS_SLIDE_NO_HEAD not in remaining:
+                        raise _InvalidPrefix
+                    raise _NeedToken(remaining)
+                raise _NeedToken(remaining + (SEGMENT_END,))
+            if self._peek() in group:
+                token = self._peek()
+                self.i += 1
+                attrs.append(token)
+                no_head |= token == IS_SLIDE_NO_HEAD
+
+        if self._slide_head_must_be_no_head(start, first_segment, no_head):
+            raise _InvalidPrefix
+        self._take_exact(SEGMENT_END)
+        return (shape, start, end, middle, wait, trace, tuple(attrs)), no_head
+
+    def _parse_note_attrs(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        attrs = []
+        if not self._at_end() and self._peek() == IS_BREAK:
+            self.i += 1
+            attrs.append(IS_BREAK)
+        if not self._at_end() and self._peek() == IS_EX:
+            self.i += 1
+            attrs.append(IS_EX)
+        remaining = () if IS_EX in attrs else ((IS_EX,) if IS_BREAK in attrs else (IS_BREAK, IS_EX))
+        return tuple(attrs), remaining
+
+    def _finish_note_options(self, note: _NoteRecord, *, action: bool, extras: tuple[int, ...]) -> None:
+        self.state.add_note(note, action=action)
+        raise _NeedToken(extras + self._note_boundary_tokens())
+
+    def _slide_head_must_be_no_head(self, start: int, first_segment: bool, no_head: bool) -> bool:
+        return first_segment and not no_head and (
+            len(self.state.logical_press_lanes) >= self.max_actions
+            or start in self.state.logical_press_lanes
+            or self.state.lane_blocked(start)
+        )
+
+    def _slide_end_lanes(self, shape: int, start: int) -> tuple[int, ...]:
+        start_index = start - LANE_BASE
+        if shape == LINE:
+            deltas = (2, 3, 4, 5, 6)
+        elif shape in (S_SHAPE, Z_SHAPE, WIFI):
+            deltas = (4,)
+        elif shape in (V_SHAPE, GRAND_V):
+            deltas = (1, 2, 3, 4, 5, 6, 7)
+        else:
+            deltas = tuple(range(8))
+        return tuple(LANE_BASE + (start_index + delta) % 8 for delta in deltas)
+
+    def _available_press_lanes(self) -> tuple[int, ...]:
+        return tuple(lane for lane in LANES if lane not in self.state.logical_press_lanes and not self.state.lane_blocked(lane))
+
+    def _touch_unavailable(self, area: int) -> bool:
+        return area in self.state.logical_touch_areas or self.state.touch_blocked(area)
+
+    def _note_types(self) -> tuple[int, ...]:
+        if self.state.frame_notes >= self.max_notes:
+            return ()
+        types = [NOTE_TOUCH]
+        if len(self.state.logical_press_lanes) < self.max_actions:
+            if self._available_press_lanes():
+                types.extend((NOTE_TAP, NOTE_HOLD))
+        # 达到 press 上限后仍允许 Slide，但第一段只能以 no-head 闭合。
+        types.append(NOTE_SLIDE)
+        return tuple(types)
+
+    def _note_boundary_tokens(self) -> tuple[int, ...]:
+        allowed = list(self._note_types())
+        if self.state.frame_notes:
+            allowed.append(FRAME_END)
+        return tuple(allowed)
+
+    def _take_exact(self, expected: int) -> int:
+        return self._take_from((expected,))
+
+    def _take_from(self, allowed: tuple[int, ...]) -> int:
+        if not allowed:
+            raise _InvalidPrefix
+        if self._at_end():
+            raise _NeedToken(allowed)
+        token = self.tokens[self.i]
+        if token not in allowed:
+            raise _InvalidPrefix
+        self.i += 1
+        return token
+
+    def _peek(self) -> int:
+        if self._at_end():
+            raise _NeedToken(())
+        return self.tokens[self.i]
+
+    def _at_end(self) -> bool:
+        return self.i == len(self.tokens)
 
 
-def _consume_tap(tokens: list[int]) -> tuple[int, tuple[int, ...]]:
-    if len(tokens) == 1:
-        return 0, LANES
-    if tokens[1] not in LANES:
-        return 0, LANES
-    i = 2
-    used = set()
-    while i < len(tokens) and tokens[i] in TAP_ATTRS and tokens[i] not in used:
-        used.add(tokens[i])
-        i += 1
-    if i < len(tokens):
-        return i, ()
-    return i, tuple(t for t in TAP_ATTRS if t not in used) + NOTE_TYPES + (FRAME_END,)
+def _self_check() -> None:
+    t = lambda cs: TS_BASE + cs
+    l = lambda lane: LANE_BASE + lane - 1
+    a = lambda area: TOUCH_BASE + area - 1
+
+    assert allowed_tokens([]) == (SOS,)
+    assert allowed_tokens([SOS]) == (FRAME_START, EOS)
+    assert allowed_tokens([NOTE_TAP]) == ()
+    assert allowed_tokens([SOS, SOS]) == ()
+    assert allowed_tokens([SOS, EOS, FRAME_START]) == ()
+    assert allowed_tokens([SOS, FRAME_START, t(1200), NOTE_TAP, FRAME_END]) == ()
+
+    tap = [SOS, FRAME_START, t(1200), NOTE_TAP, l(1)]
+    assert IS_BREAK in allowed_tokens(tap)
+    assert IS_EX in allowed_tokens(tap)
+    assert NOTE_TAP in allowed_tokens(tap)
+    assert allowed_tokens(tap + [IS_EX, IS_BREAK]) == ()
+
+    hold = [SOS, FRAME_START, t(1200), NOTE_HOLD, l(1)]
+    assert t(0) not in allowed_tokens(hold)
+    assert t(1) in allowed_tokens(hold)
+
+    touch = [SOS, FRAME_START, t(1200), NOTE_TOUCH, a(1)]
+    assert t(0) not in allowed_tokens(touch)
+    assert t(1) in allowed_tokens(touch)
+
+    # HOLD 结束于 13.00s；同 lane 在 13.05s 仍处于冷却，13.06s 才允许。
+    hold_frame = [SOS, FRAME_START, t(1200), NOTE_HOLD, l(1), t(100), FRAME_END]
+    blocked = hold_frame + [FRAME_START, t(1305), NOTE_TAP]
+    released = hold_frame + [FRAME_START, t(1306), NOTE_TAP]
+    assert l(1) not in allowed_tokens(blocked)
+    assert l(2) in allowed_tokens(blocked)
+    assert l(1) in allowed_tokens(released)
+
+    # 同 lane 独立 press 小于 30ms 时禁止，刚好 30ms 时允许。
+    tap_frame = [SOS, FRAME_START, t(1200), NOTE_TAP, l(1), FRAME_END]
+    assert l(1) not in allowed_tokens(tap_frame + [FRAME_START, t(1202), NOTE_TAP])
+    assert l(1) in allowed_tokens(tap_frame + [FRAME_START, t(1203), NOTE_TAP])
+
+    # 同一逻辑 TS 最多两个独立 press；第三个有头 press 禁止，TOUCH 和 no-head Slide 允许。
+    double_press = [
+        SOS, FRAME_START, t(1200),
+        NOTE_TAP, l(1), NOTE_HOLD, l(2), t(10),
+    ]
+    double_allowed = allowed_tokens(double_press)
+    assert NOTE_TAP not in double_allowed
+    assert NOTE_HOLD not in double_allowed
+    assert NOTE_TOUCH in double_allowed
+    assert NOTE_SLIDE in double_allowed
+    third_slide = double_press + [NOTE_SLIDE, SEGMENT_START, LINE, l(3), l(5), t(10), t(10)]
+    assert IS_SLIDE_NO_HEAD in allowed_tokens(third_slide)
+    assert SEGMENT_END not in allowed_tokens(third_slide)
+    assert SEGMENT_END in allowed_tokens(third_slide + [IS_SLIDE_NO_HEAD])
+
+    # 相同 TS 即同一逻辑帧，同 lane 重复 press 仍然冲突。
+    same_time = tap_frame + [FRAME_START, t(1200), NOTE_HOLD]
+    assert l(1) not in allowed_tokens(same_time)
+
+    # HOLD 占用 lane 上允许 no-head Slide，但有头 Slide 不能闭合第一段。
+    slide = hold_frame + [FRAME_START, t(1250), NOTE_SLIDE, SEGMENT_START, LINE, l(1), l(3), t(10), t(10)]
+    assert IS_SLIDE_NO_HEAD in allowed_tokens(slide)
+    assert SEGMENT_END not in allowed_tokens(slide)
+    assert SEGMENT_END in allowed_tokens(slide + [IS_SLIDE_NO_HEAD])
+
+    # Slide 几何和方向属性。
+    slide_start = [SOS, FRAME_START, t(1200), NOTE_SLIDE, SEGMENT_START, LINE, l(1)]
+    assert l(1) not in allowed_tokens(slide_start)
+    assert l(2) not in allowed_tokens(slide_start)
+    assert l(3) in allowed_tokens(slide_start)
+    line_attrs = slide_start + [l(3), t(10), t(10)]
+    assert IS_CW not in allowed_tokens(line_attrs)
+    circle_attrs = [SOS, FRAME_START, t(1200), NOTE_SLIDE, SEGMENT_START, CIRCLE, l(1), l(1), t(10), t(10)]
+    assert IS_CW in allowed_tokens(circle_attrs)
+    assert IS_CCW in allowed_tokens(circle_attrs)
+
+    # 后续 segment 只能从第一段起点或前段终点开始。
+    first_segment = [
+        SOS, FRAME_START, t(1200), NOTE_SLIDE,
+        SEGMENT_START, LINE, l(1), l(3), t(10), t(10), SEGMENT_END,
+        SEGMENT_START, LINE,
+    ]
+    assert set(allowed_tokens(first_segment)) == {l(1), l(3)}
+
+    # 同区域 TOUCH_HOLD 的 50ms 冷却。
+    touch_hold = [SOS, FRAME_START, t(1200), NOTE_TOUCH, a(1), t(100), FRAME_END]
+    assert a(1) not in allowed_tokens(touch_hold + [FRAME_START, t(1305), NOTE_TOUCH])
+    assert a(1) in allowed_tokens(touch_hold + [FRAME_START, t(1306), NOTE_TOUCH])
+
+    print("[constrained-decode] 自检通过")
 
 
-def _consume_hold(tokens: list[int]) -> tuple[int, tuple[int, ...]]:
-    if len(tokens) == 1:
-        return 0, LANES
-    if tokens[1] not in LANES:
-        return 0, LANES
-    if len(tokens) == 2:
-        return 0, TIMES
-    if tokens[2] not in TIMES:
-        return 0, TIMES
-    i = 3
-    used = set()
-    while i < len(tokens) and tokens[i] in TAP_ATTRS and tokens[i] not in used:
-        used.add(tokens[i])
-        i += 1
-    if i < len(tokens):
-        return i, ()
-    return i, tuple(t for t in TAP_ATTRS if t not in used) + NOTE_TYPES + (FRAME_END,)
-
-
-def _consume_touch(tokens: list[int]) -> tuple[int, tuple[int, ...]]:
-    if len(tokens) == 1:
-        return 0, TOUCHES
-    if tokens[1] not in TOUCHES:
-        return 0, TOUCHES
-    i = 2
-    has_time = False
-    has_firework = False
-    if i < len(tokens) and tokens[i] in TIMES:
-        has_time = True
-        i += 1
-    if i < len(tokens) and tokens[i] == IS_FIREWORK:
-        has_firework = True
-        i += 1
-    if i < len(tokens):
-        return i, ()
-    allowed = []
-    if not has_time:
-        allowed.extend(TIMES)
-    if not has_firework:
-        allowed.append(IS_FIREWORK)
-    allowed.extend(NOTE_TYPES)
-    allowed.append(FRAME_END)
-    return i, tuple(allowed)
-
-
-def _consume_slide(tokens: list[int]) -> tuple[int, tuple[int, ...]]:
-    i = 1
-    used_note_attrs = set()
-    while i < len(tokens) and tokens[i] in SLIDE_NOTE_ATTRS and tokens[i] not in used_note_attrs:
-        used_note_attrs.add(tokens[i])
-        i += 1
-    if i == len(tokens):
-        return 0, tuple(t for t in SLIDE_NOTE_ATTRS if t not in used_note_attrs) + (SEGMENT_START, FRAME_END)
-
-    saw_segment = False
-    while i < len(tokens):
-        if tokens[i] != SEGMENT_START:
-            if tokens[i] == FRAME_END and not saw_segment:
-                return i, ()
-            if saw_segment:
-                return i, ()
-            return i, (SEGMENT_START,)
-        done, allowed = _consume_slide_segment(tokens[i:])
-        if allowed:
-            return 0, allowed
-        i += done
-        saw_segment = True
-
-    return i, (SEGMENT_START,) + NOTE_TYPES + (FRAME_END,)
-
-
-def _consume_slide_segment(tokens: list[int]) -> tuple[int, tuple[int, ...]]:
-    if len(tokens) == 1:
-        return 0, SHAPES
-    if tokens[1] not in SHAPES:
-        return 0, SHAPES
-    if len(tokens) == 2:
-        return 0, LANES
-    if tokens[2] not in LANES:
-        return 0, LANES
-    if len(tokens) == 3:
-        return 0, LANES
-    if tokens[3] not in LANES:
-        return 0, LANES
-
-    i = 4
-    if tokens[1] == GRAND_V:
-        if i == len(tokens):
-            return 0, LANES
-        if tokens[i] not in LANES:
-            return 0, LANES
-        i += 1
-    if i == len(tokens):
-        return 0, TIMES
-    if tokens[i] not in TIMES:
-        return 0, TIMES
-    i += 1
-    if i == len(tokens):
-        return 0, TIMES
-    if tokens[i] not in TIMES:
-        return 0, TIMES
-    i += 1
-
-    used = set()
-    while i < len(tokens) and tokens[i] in SLIDE_SEG_ATTRS and tokens[i] not in used:
-        if tokens[i] == IS_CW and IS_CCW in used:
-            break
-        if tokens[i] == IS_CCW and IS_CW in used:
-            break
-        used.add(tokens[i])
-        i += 1
-    if i < len(tokens):
-        if tokens[i] == SEGMENT_END:
-            return i + 1, ()
-        return i, ()
-    allowed = tuple(t for t in SLIDE_SEG_ATTRS if t not in used) + (SEGMENT_END,)
-    return i, allowed
+if __name__ == "__main__":
+    _self_check()

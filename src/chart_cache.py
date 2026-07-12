@@ -11,11 +11,12 @@ from pathlib import Path
 import numpy as np
 
 from config import CONFIG
+from constrained_decode import validate_frames
 from maidata_parser import _match_music, compiler, load_music_data, music_data_version
 from mel_cache import main as rebuild_mel_cache
 from tokenizer import EOS, SOS, encode_frame
 
-CACHE_VERSION = 4
+CACHE_VERSION = 6
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
 TARGET_START_SEC = CONFIG.window.target_start_sec
 TARGET_END_SEC = CONFIG.window.target_end_sec
@@ -158,6 +159,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     charts = []
     songs = load_music_data()
     excluded = 0
+    rejected = []
     for source in sources:
         chart_path = charts_dir / source["chart"]
         mel_path = cache_dir.parent / source["mel"]
@@ -173,6 +175,17 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
             continue
         level = parser.chart.all_levels[config["level_idx"]]
         if level is None:
+            continue
+        violations = validate_frames(level.frames)
+        if violations:
+            rejected.append({
+                "chart": source["chart"],
+                "violations": [
+                    {"rule": item.rule, "time_sec": item.time_sec, "detail": item.detail}
+                    for item in violations
+                ],
+            })
+            print(f"[chart-cache] 严格规则排除 {source['chart']}: {len(violations)} 处违规")
             continue
         chart_id = len(charts)
         charts.append({"chart": source["chart"], "mel": source["mel"]})
@@ -209,10 +222,17 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
     build_path.mkdir(parents=True)
     np.save(build_path / "entries.npy", np.array(entries, dtype=ENTRY_DTYPE))
     np.save(build_path / "tokens.npy", np.asarray(tokens, dtype=np.uint16))
-    manifest = {"config": config, "sources": sources, "charts": charts, "windows": len(entries)}
+    manifest = {
+        "config": config,
+        "sources": sources,
+        "charts": charts,
+        "windows": len(entries),
+        "rejected": rejected,
+    }
     (build_path / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=True), encoding="utf-8")
     (build_path / "COMPLETE").touch()
     print(f"[chart-cache] 宴会場排除 {excluded} 首")
+    print(f"[chart-cache] 严格规则排除 {len(rejected)} 首")
 
 
 def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_idx: int, sample_rate: int, n_fft: int, hop_length: int, n_mels: int, stride_sec: float, mel_frames: int, build_mel: bool = True) -> Path:
