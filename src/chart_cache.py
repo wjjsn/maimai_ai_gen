@@ -11,8 +11,9 @@ from pathlib import Path
 import numpy as np
 
 from config import CONFIG
-from maidata_parser import EOS, FRAME_END, FRAME_START, SOS, _match_music, compiler, load_music_data, music_data_version
+from maidata_parser import _match_music, compiler, load_music_data, music_data_version
 from mel_cache import main as rebuild_mel_cache
+from tokenizer import EOS, SOS, encode_frame
 
 CACHE_VERSION = 3
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
@@ -197,10 +198,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
                 if target and not loss_started:
                     loss_start = len(row)
                     loss_started = True
-                row.extend([FRAME_START, parser._ts_token(rel_cs / 100.0)])
-                for note in frame.notes:
-                    row.extend(parser._encode_note_tokens(note))
-                row.append(FRAME_END)
+                row.extend(encode_frame(frame, rel_cs / 100.0))
             if not loss_started:
                 loss_start = len(row)
             row.append(EOS)

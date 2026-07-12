@@ -18,7 +18,8 @@ import torch
 from torch.utils.data import Dataset
 from chart_cache import ensure_chart_cache
 from config import CONFIG
-from maidata_parser import EOS, FRAME_END, FRAME_START, LANE_BASE, SOS, TOUCH_BASE, compiler
+from maidata_parser import compiler
+from tokenizer import EOS, FRAME_END, FRAME_START, SOS, encode_frame, rotate_token_id, rotate_tokens
 
 
 # ── Step 2: Validate dataset ─────────────────────────────────────────────
@@ -138,33 +139,8 @@ class _CachedIndex:
         )
 
 
-def rotate_token_id(token: int, steps: int) -> int:
-    """把 8 轨相关 token 向右旋转 steps 次；旋转 8 次必须还原。"""
-    steps %= 8
-    if steps == 0:
-        return token
-
-    if LANE_BASE <= token < LANE_BASE + 8:
-        return LANE_BASE + ((token - LANE_BASE + steps) % 8)
-
-    if TOUCH_BASE <= token < TOUCH_BASE + 33:
-        offset = token - TOUCH_BASE
-        if 0 <= offset < 8:       # A1~A8
-            return TOUCH_BASE + ((offset + steps) % 8)
-        if 8 <= offset < 16:      # B1~B8
-            return TOUCH_BASE + 8 + ((offset - 8 + steps) % 8)
-        if offset == 16:          # C 不随 8 轨旋转
-            return token
-        if 17 <= offset < 25:     # D1~D8
-            return TOUCH_BASE + 17 + ((offset - 17 + steps) % 8)
-        if 25 <= offset < 33:     # E1~E8
-            return TOUCH_BASE + 25 + ((offset - 25 + steps) % 8)
-
-    return token
-
-
 def rotate_token_list(tokens: list[int], steps: int) -> list[int]:
-    return [rotate_token_id(token, steps) for token in tokens]
+    return rotate_tokens(tokens, steps)
 
 
 class RotatedDataset(Dataset):
@@ -247,10 +223,7 @@ def compile_index(
                 if not (is_prefix or is_target):
                     continue
 
-                frame_tokens = [FRAME_START, c._ts_token(rel_cs / 100.0)]
-                for note in frame.notes:
-                    frame_tokens.extend(c._encode_note_tokens(note))
-                frame_tokens.append(FRAME_END)
+                frame_tokens = encode_frame(frame, rel_cs / 100.0)
                 tl.extend(frame_tokens)
                 loss_mask.extend([is_target] * len(frame_tokens))
             tl.append(EOS)
@@ -451,8 +424,6 @@ def _self_check():
     if not charts_dir.exists():
         print("[dataset] charts/ not found, skipping self-check")
         return
-
-    from maidata_parser import SOS, EOS
 
     ds = ChartDataset(charts_dir, max_tokens=CONFIG.model.max_tokens, level_idx=CONFIG.training.level_idx)
     print(f"[dataset] total: {len(ds)} segments")

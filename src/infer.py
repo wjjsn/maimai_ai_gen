@@ -16,9 +16,9 @@ from config import CONFIG, validate_checkpoint_config
 from model import Whisper, ModelDimensions
 from constrained_decode import allowed_tokens
 from maidata_parser import (
-    PAD, SOS, EOS, VOCAB_SIZE, FRAME_START, FRAME_END,
     compiler, Chart, Level, Frame, Note, NoteType, TapType,
 )
+from tokenizer import PAD, SOS, EOS, VOCAB_SIZE, FRAME_END, decode_frames, encode_frame
 
 # ──────────────────── defaults ────────────────────
 
@@ -180,17 +180,19 @@ def fit_logical_window(mel: np.ndarray, logical_start_frame: int, window: int) -
     return torch.from_numpy(out.copy()).float()
 
 
+def _prefix_relative_cs(frame: Frame, window_start_sec: float) -> int | None:
+    """与训练缓存一致：先量化到厘秒，再判断前缀区间。"""
+    rel_cs = round((frame.time_sec - window_start_sec) * 100)
+    return rel_cs if round(PREFIX_START_SEC * 100) <= rel_cs < round(TARGET_START_SEC * 100) else None
+
+
 def frames_to_prefix_tokens(frames: list[Frame], window_start_sec: float) -> list[int]:
-    c = compiler()
     tokens = [SOS]
     for frame in frames:
-        rel_time = frame.time_sec - window_start_sec
-        if not (PREFIX_START_SEC <= rel_time < TARGET_START_SEC):
+        rel_cs = _prefix_relative_cs(frame, window_start_sec)
+        if rel_cs is None:
             continue
-        tokens.extend((FRAME_START, c._ts_token(rel_time)))
-        for note in frame.notes:
-            tokens.extend(c._encode_note_tokens(note))
-        tokens.append(FRAME_END)
+        tokens.extend(encode_frame(frame, rel_cs / 100.0))
     return tokens
 
 
@@ -211,7 +213,6 @@ def overlap_infer(
     window_sec = window / frames_per_sec
     if abs(commit_sec - DEFAULT_COMMIT_SEC) > 1e-6:
         raise ValueError(f"当前模型窗口固定提交 {DEFAULT_COMMIT_SEC:.0f}s，不支持 commit_sec={commit_sec}")
-    parser = compiler()
     committed: list[Frame] = []
     limit_windows = 0
     total_new_tokens = 0
@@ -224,8 +225,7 @@ def overlap_infer(
         window_end_sec = window_start + window_sec
         commit_end = min(commit_start + commit_sec, total_sec)
 
-        prefix_start = commit_start - (TARGET_START_SEC - PREFIX_START_SEC)
-        prefix_frames = [f for f in committed if prefix_start <= f.time_sec < commit_start]
+        prefix_frames = [f for f in committed if _prefix_relative_cs(f, window_start) is not None]
         prefix_tokens = frames_to_prefix_tokens(prefix_frames, window_start)
         mel_tensor = fit_logical_window(mel, logical_start_frame, window)
         tokens, decode_stats = decode_segment(
@@ -240,7 +240,7 @@ def overlap_infer(
         limit_windows += int(decode_stats["hit_limit"])
         total_new_tokens += int(decode_stats["new_tokens"])
         generated_body = [t for t in tokens[len(prefix_tokens):] if t not in (SOS, EOS, PAD)]
-        rel_frames = parser._parse_token_segment(generated_body)
+        rel_frames = decode_frames(generated_body)
 
         accepted = 0
         for frame in rel_frames:

@@ -1,4 +1,5 @@
-from maidata_parser import EOS, PAD, SOS, NoteType, compiler
+from maidata_parser import NoteType
+from tokenizer import EOS, PAD, SOS, decode_frames
 
 
 def content_match_counts(generated, truth, tolerance_sec=0.01):
@@ -32,7 +33,7 @@ def _match_events(pred_events, target_events, tolerance_sec):
 
 def note_events(tokens):
     body = [t for t in tokens if t not in (PAD, SOS, EOS)]
-    frames = compiler()._parse_token_segment(body)
+    frames = decode_frames(body)
     return frame_events(frames)
 
 

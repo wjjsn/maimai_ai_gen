@@ -272,7 +272,7 @@ TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, e
 同一规范，不能生成训练阶段已经拒绝的结构。
 """
 
-from maidata_parser import (
+from tokenizer import (
     EOS,
     FRAME_END,
     FRAME_START,
@@ -297,15 +297,15 @@ from maidata_parser import (
     SOS,
     TOUCH_BASE,
     TS_BASE,
+    LANES,
+    NOTE_TYPES,
+    SHAPES,
+    TIMES,
+    TOUCHES,
 )
 
 
-LANES = tuple(range(LANE_BASE, LANE_BASE + 8))
-TOUCHES = tuple(range(TOUCH_BASE, TOUCH_BASE + 33))
-SHAPES = tuple(range(SLIDE_SHAPE_BASE, SLIDE_SHAPE_BASE + 11))
 GRAND_V = SLIDE_SHAPE_BASE + 3
-TIMES = tuple(range(TS_BASE, TS_BASE + 3000))
-NOTE_TYPES = (NOTE_TAP, NOTE_TOUCH, NOTE_HOLD, NOTE_SLIDE)
 TAP_ATTRS = (IS_BREAK, IS_EX)
 SLIDE_NOTE_ATTRS = (IS_BREAK, IS_EX)
 SLIDE_SEG_ATTRS = (IS_CW, IS_CCW, IS_FORCE_STAR, IS_FAKE_ROTATE, IS_SLIDE_BREAK, IS_SLIDE_NO_HEAD)

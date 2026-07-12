@@ -8,6 +8,13 @@ from urllib.request import urlopen
 
 import torch
 
+from tokenizer import (
+    EOS, FRAME_END, FRAME_START, IS_BREAK, IS_CCW, IS_CW, IS_EX, IS_FAKE_ROTATE,
+    IS_FIREWORK, IS_FORCE_STAR, IS_SLIDE_BREAK, IS_SLIDE_NO_HEAD, LANE_BASE,
+    NOTE_HOLD, NOTE_SLIDE, NOTE_TAP, NOTE_TOUCH, PAD, SEGMENT_END, SEGMENT_START,
+    SLIDE_SHAPE_BASE, SOS, TOUCH_BASE, TS_BASE, VOCAB_SIZE,
+)
+
 
 # ── Note ──────────────────────────────────────────────────────────────────
 
@@ -152,34 +159,6 @@ class Chart:
     # EASY/BASIC/ADVANCED/EXPERT/MASTER/Re:MASTER/ORIGINAL
     # lv_1/lv_2 /lv_3   /lv_4/  lv_5/     lv_6/  lv_7
 
-
-# ── Token vocabulary (from doc/token化设计.md) ─────────────────────────────
-
-PAD = 0
-SOS = 1
-EOS = 2
-FRAME_START = 3
-FRAME_END = 4
-TS_BASE = 5          # TS_0 .. TS_2999  →  5 ~ 3004
-LANE_BASE = 3005     # LANE_1 .. LANE_8 → 3005 ~ 3012
-TOUCH_BASE = 3013    # TOUCH_1 .. TOUCH_33 → 3013 ~ 3045
-NOTE_TAP = 3046
-NOTE_TOUCH = 3047
-NOTE_HOLD = 3048
-NOTE_SLIDE = 3049
-SEGMENT_START = 3050
-SEGMENT_END = 3051
-SLIDE_SHAPE_BASE = 3052  # SLIDE_SHAPE_1 .. _11 → 3052 ~ 3062
-IS_BREAK = 3063
-IS_EX = 3064
-IS_FIREWORK = 3065
-IS_CW = 3066
-IS_CCW = 3067
-IS_FORCE_STAR = 3068
-IS_FAKE_ROTATE = 3069
-IS_SLIDE_BREAK = 3070
-IS_SLIDE_NO_HEAD = 3071
-VOCAB_SIZE = 3072
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -890,17 +869,9 @@ class compiler:
 
     @staticmethod
     def _ts_token(seconds: float) -> int:
-        """Convert time in seconds to a TS token ID (100 fps).
+        from tokenizer import seconds_to_token
 
-        Clamps to [0, 2999].  For positive inputs that would round to 0
-        (i.e. < 5 ms), returns TS_1 (0.01 s) to avoid information loss
-        on round-trip (a zero hold-duration would turn a HOLD into a
-        pseudo-hold TAP).
-        """
-        raw = int(round(seconds * 100))
-        if seconds > 0 and raw == 0:
-            raw = 1  # minimum non-zero: 0.01 s
-        return TS_BASE + max(0, min(2999, raw))
+        return seconds_to_token(seconds)
 
     @staticmethod
     def _lane_token(lane: TapType) -> int:
@@ -915,75 +886,9 @@ class compiler:
         return SLIDE_SHAPE_BASE + shape.value - 1
 
     def _encode_note_tokens(self, note: Note) -> list[int]:
-        """Encode a single Note into a flat list of token IDs.
+        from tokenizer import encode_note
 
-        Encodes only the note payload — the caller is responsible for
-        emitting FRAME_START / FRAME_END / TS_xxx around it.
-        """
-        t = note.type
-        tokens: list[int] = []
-
-        if t == NoteType.TAP:
-            tokens.append(NOTE_TAP)
-            tokens.append(self._lane_token(note.data))
-            if note.isBreak:
-                tokens.append(IS_BREAK)
-            if note.isEx:
-                tokens.append(IS_EX)
-
-        elif t == NoteType.HOLD:
-            tokens.append(NOTE_HOLD)
-            tokens.append(self._lane_token(note.data.lane))
-            tokens.append(self._ts_token(note.data.holdTime))
-            if note.isBreak:
-                tokens.append(IS_BREAK)
-            if note.isEx:
-                tokens.append(IS_EX)
-
-        elif t == NoteType.TOUCH:
-            tokens.append(NOTE_TOUCH)
-            tokens.append(self._touch_token(note.data.Touch_area))
-            if note.data.isFirework:
-                tokens.append(IS_FIREWORK)
-
-        elif t == NoteType.TOUCH_HOLD:
-            tokens.append(NOTE_TOUCH)
-            tokens.append(self._touch_token(note.data.Touch_area))
-            hold_sec = note.data.holdTime if note.data.holdTime > 0 else 0.0
-            tokens.append(self._ts_token(hold_sec))
-            if note.data.isFirework:
-                tokens.append(IS_FIREWORK)
-
-        elif t == NoteType.SLIDE:
-            tokens.append(NOTE_SLIDE)
-            if note.isBreak:
-                tokens.append(IS_BREAK)
-            if note.isEx:
-                tokens.append(IS_EX)
-            for seg in note.data:
-                tokens.append(SEGMENT_START)
-                tokens.append(self._shape_token(seg.shape))
-                tokens.append(self._lane_token(seg.start_lane))
-                tokens.append(self._lane_token(seg.end_lane))
-                if seg.middle_lane is not None:
-                    tokens.append(self._lane_token(seg.middle_lane))
-                tokens.append(self._ts_token(seg.wait_duration))
-                tokens.append(self._ts_token(seg.trace_duration))
-                if seg.isClockwise is True:
-                    tokens.append(IS_CW)
-                elif seg.isClockwise is False:
-                    tokens.append(IS_CCW)
-                if seg.isForceStar:
-                    tokens.append(IS_FORCE_STAR)
-                if seg.isFakeRotate:
-                    tokens.append(IS_FAKE_ROTATE)
-                if seg.isSlideBreak:
-                    tokens.append(IS_SLIDE_BREAK)
-                if seg.isSlideNoHead:
-                    tokens.append(IS_SLIDE_NO_HEAD)
-                tokens.append(SEGMENT_END)
-
-        return tokens
+        return encode_note(note)
 
     # ── tensor export (token vocabulary) ──────────────────────────────────
 
@@ -1208,216 +1113,9 @@ class compiler:
 
         Returns a list of Frame with relative time_sec (caller adds offset).
         """
-        frames: list[Frame] = []
-        i = 0
-        n = len(tok)
-        skipped_tokens: list[tuple[int, int]] = []  # (pos, token_id)
+        from tokenizer import decode_frames
 
-        while i < n:
-            if tok[i] in (SOS, PAD):
-                i += 1
-                continue
-            if tok[i] == EOS:
-                break
-            if tok[i] != FRAME_START:
-                skipped_tokens.append((i, tok[i]))
-                i += 1
-                continue
-            i += 1
-
-            # ── timestamp ──
-            if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
-                time_sec = (tok[i] - TS_BASE) / 100.0
-                i += 1
-            else:
-                if i < n:
-                    print(f"[parse] WARNING: expected TS token at pos {i}, got {tok[i]} (0x{tok[i]:04x})")
-                time_sec = 0.0
-
-            # ── notes until FRAME_END ──
-            notes: list[Note] = []
-            while i < n and tok[i] != FRAME_END:
-                t = tok[i]
-
-                if t == NOTE_TAP:
-                    i += 1
-                    if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
-                        lane = TapType(tok[i] - LANE_BASE + 1)
-                        i += 1
-                    else:
-                        lane_tok = tok[i] if i < n else -1
-                        print(f"[parse] WARNING: TAP at pos {i-1} missing valid LANE, got {lane_tok}, fallback LANE1")
-                        lane = TapType.LANE1
-                        i += 1 if i < n else 0
-                    is_break = False
-                    is_ex = False
-                    while i < n and tok[i] in (IS_BREAK, IS_EX):
-                        if tok[i] == IS_BREAK:
-                            is_break = True
-                        elif tok[i] == IS_EX:
-                            is_ex = True
-                        i += 1
-                    notes.append(Note(NoteType.TAP, lane, isBreak=is_break, isEx=is_ex))
-
-                elif t == NOTE_HOLD:
-                    i += 1
-                    if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
-                        lane = TapType(tok[i] - LANE_BASE + 1)
-                        i += 1
-                    else:
-                        lane_tok = tok[i] if i < n else -1
-                        print(f"[parse] WARNING: HOLD at pos {i-1} missing valid LANE, got {lane_tok}, fallback LANE1")
-                        lane = TapType.LANE1
-                        i += 1 if i < n else 0
-                    hold_sec = 0.0
-                    if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
-                        hold_sec = (tok[i] - TS_BASE) / 100.0
-                        i += 1
-                    is_break = False
-                    is_ex = False
-                    while i < n and tok[i] in (IS_BREAK, IS_EX):
-                        if tok[i] == IS_BREAK:
-                            is_break = True
-                        elif tok[i] == IS_EX:
-                            is_ex = True
-                        i += 1
-                    notes.append(Note(NoteType.HOLD, Hold_data(lane, hold_sec), isBreak=is_break, isEx=is_ex))
-
-                elif t == NOTE_TOUCH:
-                    i += 1
-                    if i < n and TOUCH_BASE <= tok[i] < TOUCH_BASE + 33:
-                        touch_area = TouchType(tok[i] - TOUCH_BASE + 1)
-                        i += 1
-                    else:
-                        touch_tok = tok[i] if i < n else -1
-                        print(f"[parse] WARNING: TOUCH at pos {i-1} missing valid TOUCH area, got {touch_tok}, fallback A1")
-                        touch_area = TouchType.A1
-                        i += 1 if i < n else 0
-                    hold_sec = 0.0
-                    if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
-                        hold_sec = (tok[i] - TS_BASE) / 100.0
-                        i += 1
-                    is_firework = False
-                    if i < n and tok[i] == IS_FIREWORK:
-                        is_firework = True
-                        i += 1
-                    if hold_sec > 0:
-                        notes.append(Note(NoteType.TOUCH_HOLD, Touch_data(touch_area, isFirework=is_firework, holdTime=hold_sec)))
-                    else:
-                        notes.append(Note(NoteType.TOUCH, Touch_data(touch_area, isFirework=is_firework)))
-
-                elif t == NOTE_SLIDE:
-                    i += 1
-                    note_break = False
-                    note_ex = False
-                    while i < n and tok[i] in (IS_BREAK, IS_EX):
-                        if tok[i] == IS_BREAK:
-                            note_break = True
-                        elif tok[i] == IS_EX:
-                            note_ex = True
-                        i += 1
-
-                    segments: list[SlideSegment] = []
-                    while i < n and tok[i] == SEGMENT_START:
-                        i += 1
-                        if i < n and SLIDE_SHAPE_BASE <= tok[i] < SLIDE_SHAPE_BASE + 11:
-                            shape = SlideShape(tok[i] - SLIDE_SHAPE_BASE + 1)
-                        else:
-                            shape_tok = tok[i] if i < n else -1
-                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid SHAPE, got {shape_tok}, fallback Line")
-                            shape = SlideShape.Line
-                        i += 1
-
-                        if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
-                            start_lane = TapType(tok[i] - LANE_BASE + 1)
-                        else:
-                            start_tok = tok[i] if i < n else -1
-                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid start LANE, got {start_tok}, fallback LANE1")
-                            start_lane = TapType.LANE1
-                        i += 1
-
-                        if i < n and LANE_BASE <= tok[i] < LANE_BASE + 8:
-                            end_lane = TapType(tok[i] - LANE_BASE + 1)
-                        else:
-                            end_tok = tok[i] if i < n else -1
-                            print(f"[parse] WARNING: SLIDE SEGMENT at pos {i-1} missing valid end LANE, got {end_tok}, fallback LANE1")
-                            end_lane = TapType.LANE1
-                        i += 1
-
-                        # optional middle_lane for GrandV (non-TS, non-SEGMENT_END, non-attribute)
-                        middle_lane = None
-                        if (i < n and LANE_BASE <= tok[i] < LANE_BASE + 8
-                                and shape == SlideShape.GrandV):
-                            middle_lane = TapType(tok[i] - LANE_BASE + 1)
-                            i += 1
-
-                        wait_sec = 0.0
-                        trace_sec = 0.0
-                        if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
-                            wait_sec = (tok[i] - TS_BASE) / 100.0
-                            i += 1
-                        if i < n and TS_BASE <= tok[i] < TS_BASE + 3000:
-                            trace_sec = (tok[i] - TS_BASE) / 100.0
-                            i += 1
-
-                        # segment-level attributes (until SEGMENT_END)
-                        is_cw = None
-                        seg_force_star = False
-                        seg_fake_rotate = False
-                        seg_break = False
-                        seg_no_head = False
-                        while i < n and tok[i] != SEGMENT_END:
-                            if tok[i] == IS_CW:
-                                is_cw = True
-                            elif tok[i] == IS_CCW:
-                                is_cw = False
-                            elif tok[i] == IS_FORCE_STAR:
-                                seg_force_star = True
-                            elif tok[i] == IS_FAKE_ROTATE:
-                                seg_fake_rotate = True
-                            elif tok[i] == IS_SLIDE_BREAK:
-                                seg_break = True
-                            elif tok[i] == IS_SLIDE_NO_HEAD:
-                                seg_no_head = True
-                            else:
-                                break  # unexpected token, stop
-                            i += 1
-
-                        # consume SEGMENT_END
-                        if i < n and tok[i] == SEGMENT_END:
-                            i += 1
-
-                        segments.append(SlideSegment(
-                            shape=shape,
-                            start_lane=start_lane,
-                            end_lane=end_lane,
-                            wait_duration=wait_sec,
-                            trace_duration=trace_sec,
-                            isClockwise=is_cw,
-                            middle_lane=middle_lane,
-                            isForceStar=seg_force_star,
-                            isFakeRotate=seg_fake_rotate,
-                            isSlideBreak=seg_break,
-                            isSlideNoHead=seg_no_head,
-                        ))
-
-                    notes.append(Note(NoteType.SLIDE, segments, isBreak=note_break, isEx=note_ex))
-
-                else:
-                    print(f"[parse_token] 警告: 未知 token {tok[i]} (位置 {i})，跳过")
-                    i += 1
-
-            # consume FRAME_END
-            if i < n and tok[i] == FRAME_END:
-                i += 1
-            elif notes:
-                print(f"[parse_token] 警告: 帧结束于位置 {i}，但未找到 FRAME_END")
-
-            if notes:
-                frames.append(Frame(notes=tuple(notes), time_sec=time_sec))
-
-        frames.sort(key=lambda f: f.time_sec)
-        return frames
+        return decode_frames(tok)
 
     def parse_from_tensor(
         self,
@@ -1776,7 +1474,7 @@ class compiler:
 
 # ── batch tool ────────────────────────────────────────────────────────────
 
-def main():
+def batch_main():
     import difflib
 
     charts_dir = Path(__file__).resolve().parent.parent / "charts"
@@ -1852,5 +1550,47 @@ def main():
     print(f"Overall extremes per field: {overall}")
 
 
+def _self_check() -> None:
+    from unittest.mock import patch
+
+    from chart_cache import _config, _scan_sources
+
+    chart = compiler().parse("&title=test\n&shortid=1\n&lv_2=13\n&lv_3=13+\n&inote_2=E\n&inote_3=E")
+    assert chart.all_levels[2].level_query == 13.0
+    assert chart.all_levels[3].level_query == 13.5
+
+    song = {"id": "1", "ds": [2.3, 5.7], "basic_info": {"genre": "宴会場"}}
+    chart = compiler().parse(
+        "&title=test\n&shortid=1\n&lv_2=1\n&lv_3=2\n&inote_2=E\n&inote_3=E",
+        music_data=[song],
+    )
+    assert chart.all_levels[2].level_query == 2.3
+    assert chart.all_levels[3].level_query == 5.7
+
+    song = {"id": "1", "title": "test", "level": ["13+"], "ds": [13.7]}
+    assert compiler().parse("&title=test\n&lv_2=13+\n&inote_2=E", music_data=[song]).all_levels[2].level_query == 13.7
+    assert compiler().parse("&title=test\n&shortid=999\n&lv_2=13+\n&inote_2=E", music_data=[song]).all_levels[2].level_query == 13.7
+
+    different_level = {"id": "1", "title": "test", "level": ["14"], "ds": [14.0]}
+    assert compiler().parse(
+        "&title=test\n&lv_2=13+\n&inote_2=E", music_data=[different_level],
+    ).all_levels[2].level_query == 13.5
+    assert compiler().parse("&title=test\n&lv_2=13+\n&inote_2=E").all_levels[2].level_query == 13.5
+
+    common = (5, 22050, 256, 80, 1.0, 3000)
+    assert _config(*common, "old") != _config(*common, "new")
+    with patch("maidata_parser.load_music_data", side_effect=AssertionError):
+        assert compiler().parse("&title=test\n&lv_2=13+\n&inote_2=E").all_levels[2].level_query == 13.5
+
+    song = {"id": "1", "basic_info": {"genre": "宴会場"}}
+    assert _match_music("&shortid=1", "test", [song]) is song
+    with patch("chart_cache.compiler", side_effect=AssertionError):
+        with patch("chart_cache.Path.rglob", return_value=[]):
+            assert _scan_sources(Path("charts"), Path(".cache/charts")) == []
+    print("[maidata-parser] 自检通过")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+
+    batch_main() if "--batch" in sys.argv else _self_check()

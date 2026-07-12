@@ -14,7 +14,8 @@ from config import CONFIG, checkpoint_config, validate_checkpoint_config
 from dataset import ChartDataset, RotatedDataset, collate_segments
 from content_metrics import content_match_frame_counts
 from infer import decode_segment, overlap_infer
-from maidata_parser import EOS, FRAME_END, FRAME_START, PAD, SOS, VOCAB_SIZE, compiler
+from maidata_parser import compiler
+from tokenizer import EOS, FRAME_END, FRAME_START, PAD, SOS, VOCAB_SIZE
 
 # ─────────────────────── 0. 配置 ───────────────────────
 

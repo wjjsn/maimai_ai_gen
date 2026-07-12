@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
+import tempfile
 from typing import Any, get_args, get_origin, get_type_hints
 
 import yaml
@@ -387,3 +388,134 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
 
 
 CONFIG = load_config()
+
+
+def _expect_error(message: str, action) -> None:
+    try:
+        action()
+    except Exception as error:
+        assert message in str(error), error
+    else:
+        raise AssertionError(f"预期异常: {message}")
+
+
+def _self_check() -> None:
+    from infer import _level_arg, _nonnegative_float_arg, _prefix_relative_cs, frames_to_prefix_tokens
+    from maidata_parser import Frame, Note, NoteType, TapType
+    from mel_cache import _cache_is_current
+    from tokenizer import TS_BASE
+
+    assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
+    assert CONFIG.audio.sample_rate == 22050
+    assert CONFIG.window.target_end_sec - CONFIG.window.target_start_sec == 10.0
+    assert CONFIG.model.max_tokens == 2048
+    assert CONFIG.training.level_idx == 5
+    assert load_config() == CONFIG
+
+    window_start = 10.0
+    just_below_prefix = Frame((Note(NoteType.TAP, TapType.LANE1),), 15.9949)
+    rounded_to_prefix = Frame((Note(NoteType.TAP, TapType.LANE2),), 15.999999999999998)
+    just_below_target = Frame((Note(NoteType.TAP, TapType.LANE3),), 21.9949)
+    rounded_to_target = Frame((Note(NoteType.TAP, TapType.LANE4),), 21.999999999999998)
+    assert _prefix_relative_cs(just_below_prefix, window_start) is None
+    assert _prefix_relative_cs(rounded_to_prefix, window_start) == 600
+    assert _prefix_relative_cs(just_below_target, window_start) == 1199
+    assert _prefix_relative_cs(rounded_to_target, window_start) is None
+    prefix_tokens = frames_to_prefix_tokens(
+        [just_below_prefix, rounded_to_prefix, just_below_target, rounded_to_target],
+        window_start,
+    )
+    assert prefix_tokens.count(TS_BASE + 600) == 1
+    assert prefix_tokens.count(TS_BASE + 1199) == 1
+
+    _expect_error(
+        "目标结束秒 超出音频窗口",
+        lambda: _validate_config(replace(CONFIG, window=replace(CONFIG.window, mel_frames=1000))),
+    )
+    _expect_error(
+        "音频状态维度 必须能被",
+        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, audio_head=5))),
+    )
+    _expect_error(
+        "音频状态维度 必须等于 文本状态维度",
+        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, text_state=192))),
+    )
+    _expect_error(
+        "音频状态维度 至少为 4",
+        lambda: _validate_config(replace(
+            CONFIG,
+            model=replace(CONFIG.model, audio_state=2, text_state=2, audio_head=1, text_head=1),
+        )),
+    )
+    _expect_error(
+        "时间戳上限",
+        lambda: _validate_config(replace(
+            CONFIG,
+            window=replace(CONFIG.window, target_end_sec=30.01, infer_stride_sec=18.01),
+        )),
+    )
+
+    saved = checkpoint_config(CONFIG)
+    _expect_error(
+        "音频.跳步长度",
+        lambda: validate_checkpoint_config(
+            saved, replace(CONFIG, audio=replace(CONFIG.audio, hop_length=128)),
+            for_training=False, allow_legacy=False,
+        ),
+    )
+    validate_checkpoint_config(
+        saved, replace(CONFIG, window=replace(CONFIG.window, train_stride_sec=2.0)),
+        for_training=False, allow_legacy=False,
+    )
+    _expect_error(
+        "优化器.学习率",
+        lambda: validate_checkpoint_config(
+            saved, replace(CONFIG, training=replace(CONFIG.training, learning_rate=0.001)),
+            for_training=True, allow_legacy=False,
+        ),
+    )
+    _expect_error(
+        "训练任务.难度编号",
+        lambda: validate_checkpoint_config(
+            saved, replace(CONFIG, training=replace(CONFIG.training, level_idx=4)),
+            for_training=True, allow_legacy=False,
+        ),
+    )
+    _expect_error(
+        "允许旧检查点",
+        lambda: validate_checkpoint_config(None, CONFIG, for_training=False, allow_legacy=False),
+    )
+    validate_checkpoint_config(None, CONFIG, for_training=False, allow_legacy=True)
+    partial = checkpoint_config(CONFIG)
+    del partial["优化器"]
+    _expect_error(
+        "允许旧检查点",
+        lambda: validate_checkpoint_config(partial, CONFIG, for_training=True, allow_legacy=False),
+    )
+    validate_checkpoint_config(partial, CONFIG, for_training=True, allow_legacy=True)
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        out = root / "mel.npy"
+        track = root / "track.mp3"
+        out.touch()
+        track.write_bytes(b"audio")
+        assert not _cache_is_current(out, track, {
+            "sample_rate": 22050,
+            "n_fft": 1024,
+            "hop_length": 256,
+            "n_mels": 80,
+        })
+
+    for action in (
+        lambda: _level_arg("-1"),
+        lambda: _level_arg("7"),
+        lambda: _nonnegative_float_arg("nan"),
+        lambda: _nonnegative_float_arg("-1"),
+    ):
+        _expect_error("", action)
+    print("[config] 自检通过")
+
+
+if __name__ == "__main__":
+    _self_check()
