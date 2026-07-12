@@ -64,8 +64,8 @@ if DEVICE.type == "cuda":
 # ─────────────────────── 1. 模型 ───────────────────────
 
 dims = ModelDimensions(
-    n_mels=CONFIG.audio.n_mels,
-    n_audio_ctx=CONFIG.window.mel_frames // 2,
+    n_mels=CONFIG.model.audio_state,
+    n_audio_ctx=round(CONFIG.window.mel_frames * CONFIG.audio.hop_length / CONFIG.audio.sample_rate * 75),
     n_audio_state=CONFIG.model.audio_state,
     n_audio_head=CONFIG.model.audio_head,
     n_audio_layer=CONFIG.model.audio_layer,
@@ -86,12 +86,12 @@ train_full_ds = ChartDataset(
     cache_dir=CONFIG.paths.mel_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    sample_rate=CONFIG.audio.sample_rate,
+    sample_rate=75,
     n_fft=CONFIG.audio.n_fft,
-    hop_length=CONFIG.audio.hop_length,
-    n_mels=CONFIG.audio.n_mels,
+    hop_length=1,
+    n_mels=CONFIG.model.audio_state,
     stride_sec=CONFIG.window.train_stride_sec,
-    mel_frames=CONFIG.window.mel_frames,
+    mel_frames=dims.n_audio_ctx,
     chart_limit=OVERFIT_CHARTS,
     seed=SEED,
 )
@@ -100,12 +100,12 @@ val_full_ds = ChartDataset(
     cache_dir=CONFIG.paths.mel_cache_dir,
     level_idx=LEVEL_IDX,
     max_tokens=MAX_TOKENS,
-    sample_rate=CONFIG.audio.sample_rate,
+    sample_rate=75,
     n_fft=CONFIG.audio.n_fft,
-    hop_length=CONFIG.audio.hop_length,
-    n_mels=CONFIG.audio.n_mels,
+    hop_length=1,
+    n_mels=CONFIG.model.audio_state,
     stride_sec=CONFIG.window.infer_stride_sec,
-    mel_frames=CONFIG.window.mel_frames,
+    mel_frames=dims.n_audio_ctx,
     valid_pairs=train_full_ds.valid_pairs,
 )
 print(f"Total train windows: {len(train_full_ds)}, val windows: {len(val_full_ds)}")
@@ -172,14 +172,14 @@ else:
 
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
-    collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
+    collate_fn=partial(collate_segments, mel_frames=dims.n_audio_ctx),
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
     persistent_workers=NUM_WORKERS > 0,
     prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
 )
 val_loader = DataLoader(
     val_ds, batch_size=BATCH_SIZE, shuffle=False,
-    collate_fn=partial(collate_segments, mel_frames=2 * dims.n_audio_ctx),
+    collate_fn=partial(collate_segments, mel_frames=dims.n_audio_ctx),
     num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY,
     persistent_workers=NUM_WORKERS > 0,
     prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
@@ -199,7 +199,7 @@ optimizer = optim.AdamW(
 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=1e-6)
 scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
 window_config = {
-    "mel_frames": CONFIG.window.mel_frames,
+    "mel_frames": dims.n_audio_ctx,
     "prefix_start_sec": CONFIG.window.prefix_start_sec,
     "target_start_sec": CONFIG.window.target_start_sec,
     "target_end_sec": CONFIG.window.target_end_sec,
@@ -213,6 +213,8 @@ if RESUME_PATH:
     if not resume_path.is_file():
         raise ValueError(f"恢复检查点不存在或不是文件: {resume_path}")
     resume_checkpoint = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+    if resume_checkpoint.get("model_kind") != "mert-v1-95m-frozen-decoder":
+        raise ValueError("检查点不是冻结 MERT-v1-95M decoder，不能继续训练")
     validate_checkpoint_config(
         resume_checkpoint.get("config"),
         CONFIG,
@@ -254,6 +256,7 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
 
     for step, batch in enumerate(progress, 1):
         mel = batch["mel"].to(device, non_blocking=True)       # (B, n_mels, T_mel)
+        audio_mask = batch["audio_mask"].to(device, non_blocking=True)
         tokens = batch["tokens"].to(device, non_blocking=True)  # (B, S)
         mask = batch["mask"].to(device, non_blocking=True)      # (B, S)  True=有效
         loss_mask = batch["loss_mask"].to(device, non_blocking=True)
@@ -263,7 +266,7 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device):
         target = tokens[:, 1:]
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            logits = model(mel, dec_input)      # (B, S, vocab)
+            logits = model(mel, dec_input, audio_mask)      # (B, S, vocab)
             token_loss = criterion(
                 logits.reshape(-1, logits.size(-1)),
                 target.reshape(-1),
@@ -303,6 +306,7 @@ def validate(model, loader, criterion, device):
     progress = tqdm(loader, desc="验证", leave=False)
     for step, batch in enumerate(progress, 1):
         mel = batch["mel"].to(device, non_blocking=True)
+        audio_mask = batch["audio_mask"].to(device, non_blocking=True)
         tokens = batch["tokens"].to(device, non_blocking=True)
         loss_mask = batch["loss_mask"].to(device, non_blocking=True)
 
@@ -311,7 +315,7 @@ def validate(model, loader, criterion, device):
         target_mask = loss_mask[:, 1:]
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            logits = model(mel, dec_input)
+            logits = model(mel, dec_input, audio_mask)
             token_loss = criterion(
                 logits.reshape(-1, logits.size(-1)),
                 target.reshape(-1),
@@ -359,13 +363,21 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
     total_target = 0
     total_windows = 0
     total_limit_windows = 0
+    total_dead_end_windows = 0
+    total_eos_windows = 0
     total_new_tokens = 0
+    total_raw_new_tokens = 0
+    total_dropped_tokens = 0
     for mel_path in tqdm(mel_paths, desc="整曲生成验证", leave=False):
         mel = np.load(mel_path)
         generated_frames, infer_stats = overlap_infer(model, mel, device, verbose=False, return_stats=True)
         total_windows += infer_stats["windows"]
         total_limit_windows += infer_stats["limit_windows"]
+        total_dead_end_windows += infer_stats["dead_end_windows"]
+        total_eos_windows += infer_stats["eos_windows"]
         total_new_tokens += infer_stats["new_tokens"]
+        total_raw_new_tokens += infer_stats["raw_new_tokens"]
+        total_dropped_tokens += infer_stats["dropped_tokens"]
         c = compiler()
         c.parse(chart_by_mel[mel_path].read_text(encoding="utf-8"))
         level = c.chart.all_levels[level_idx]
@@ -382,8 +394,12 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
         recall * 100,
         f1 * 100,
         total_limit_windows,
+        total_dead_end_windows,
+        total_eos_windows,
         total_windows,
+        total_raw_new_tokens / max(total_windows, 1),
         total_new_tokens / max(total_windows, 1),
+        total_dropped_tokens / max(total_windows, 1),
     )
 
 
@@ -392,11 +408,21 @@ def validate_oracle_prefix(model, loader, device, max_windows):
     model.eval()
     checked = 0
     limit_windows = 0
+    dead_end_windows = 0
     total_new_tokens = 0
+    total_raw_new_tokens = 0
+    total_dropped_tokens = 0
     for batch in loader:
         for i in range(batch["tokens"].size(0)):
             if checked >= max_windows:
-                return limit_windows, checked, total_new_tokens / max(checked, 1)
+                return (
+                    limit_windows,
+                    dead_end_windows,
+                    checked,
+                    total_raw_new_tokens / max(checked, 1),
+                    total_new_tokens / max(checked, 1),
+                    total_dropped_tokens / max(checked, 1),
+                )
             valid_len = int(batch["mask"][i].sum().item())
             loss_positions = batch["loss_mask"][i, :valid_len].nonzero()
             first_target = int(loss_positions[0].item())
@@ -407,13 +433,24 @@ def validate_oracle_prefix(model, loader, device, max_windows):
                 device,
                 max_tokens=MAX_TOKENS,
                 prefix_tokens=prefix,
+                audio_mask=batch["audio_mask"][i],
                 return_stats=True,
                 verbose=False,
             )
             checked += 1
             limit_windows += int(stats["hit_limit"])
+            dead_end_windows += int(stats["grammar_dead_end"])
             total_new_tokens += int(stats["new_tokens"])
-    return limit_windows, checked, total_new_tokens / max(checked, 1)
+            total_raw_new_tokens += int(stats["raw_new_tokens"])
+            total_dropped_tokens += int(stats["dropped_tokens"])
+    return (
+        limit_windows,
+        dead_end_windows,
+        checked,
+        total_raw_new_tokens / max(checked, 1),
+        total_new_tokens / max(checked, 1),
+        total_dropped_tokens / max(checked, 1),
+    )
 
 
 # ─────────────────────── 5. 主循环 ───────────────────────
@@ -428,10 +465,21 @@ if __name__ == "__main__":
         val_loss, val_acc, eos_acc, eos_prob, eos_rank, eos_to_frame = validate(
             model, val_loader, criterion, DEVICE
         )
-        oracle_limits, oracle_windows, oracle_avg_tokens = validate_oracle_prefix(
+        oracle_limits, oracle_dead_ends, oracle_windows, oracle_avg_raw_tokens, oracle_avg_tokens, oracle_avg_dropped = validate_oracle_prefix(
             model, val_loader, DEVICE, VAL_ORACLE_WINDOWS
         )
-        val_precision, val_recall, val_content_f1, limit_windows, gen_windows, avg_new_tokens = validate_generation(
+        (
+            val_precision,
+            val_recall,
+            val_content_f1,
+            limit_windows,
+            dead_end_windows,
+            eos_windows,
+            gen_windows,
+            avg_raw_tokens,
+            avg_new_tokens,
+            avg_dropped_tokens,
+        ) = validate_generation(
             model, gen_val_paths, chart_by_mel, LEVEL_IDX, DEVICE
         )
         scheduler.step()
@@ -449,12 +497,15 @@ if __name__ == "__main__":
             f"EOS平均排名={eos_rank:.1f}  "
             f"EOS误判FRAME_START={eos_to_frame:.2f}%  "
             f"真值前缀撞上限={oracle_limits}/{oracle_windows}  "
-            f"真值前缀平均新增token={oracle_avg_tokens:.1f}  "
+            f"真值前缀约束死路={oracle_dead_ends}/{oracle_windows}  "
+            f"真值前缀原始/保留/丢弃token={oracle_avg_raw_tokens:.1f}/{oracle_avg_tokens:.1f}/{oracle_avg_dropped:.1f}  "
             f"整曲生成P={val_precision:.2f}%  "
             f"整曲生成R={val_recall:.2f}%  "
             f"整曲生成F1={val_content_f1:.2f}%  "
             f"撞上限={limit_windows}/{gen_windows}  "
-            f"平均新增token={avg_new_tokens:.1f}"
+            f"约束死路={dead_end_windows}/{gen_windows}  "
+            f"正常结束={eos_windows}/{gen_windows}  "
+            f"原始/保留/丢弃token={avg_raw_tokens:.1f}/{avg_new_tokens:.1f}/{avg_dropped_tokens:.1f}"
         )
 
         if val_loss_improved:
@@ -462,6 +513,8 @@ if __name__ == "__main__":
             bad_epochs = 0
             ckpt_path = CHECKPOINT_DIR / "best.pt"
             torch.save({
+                "checkpoint_version": 2,
+                "model_kind": "mert-v1-95m-frozen-decoder",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -480,6 +533,8 @@ if __name__ == "__main__":
             best_val_content_f1 = val_content_f1
             ckpt_path = CHECKPOINT_DIR / "best_gen.pt"
             torch.save({
+                "checkpoint_version": 2,
+                "model_kind": "mert-v1-95m-frozen-decoder",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -496,6 +551,8 @@ if __name__ == "__main__":
             print(f"  -> 保存生成效果最优模型到 {ckpt_path}")
         ckpt_path = CHECKPOINT_DIR / "newest.pt"
         torch.save({
+            "checkpoint_version": 2,
+            "model_kind": "mert-v1-95m-frozen-decoder",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),

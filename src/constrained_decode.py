@@ -61,7 +61,10 @@
 5. malformed prefix 不能靠在末尾追加 token“修复”。例如已经出现
    ``NOTE_TAP FRAME_END`` 时缺失的 LANE 无法再插入，应返回空 allowed set。
    FRAME_END 后的垃圾 token、重复 SOS、内部 EOS 等也必须判为死路，不能静默忽略。
-6. 每个物理 frame 最多 33 个 Note；同一逻辑 TS 最多两个独立 press。独立 press 是
+6. 状态机不得暴露已知必然走入死路的下一 token。无可用 frame 时间或 frame 不允许
+   生成任何 Note 时，序列边界只能输出 EOS，不能先允许 FRAME_START 再在后续返回空
+   allowed set。所有 Touch area 都不可用时，也不能继续暴露 NOTE_TOUCH。
+7. 每个物理 frame 最多 33 个 Note；同一逻辑 TS 最多两个独立 press。独立 press 是
    TAP、HOLD_START 和有头 SLIDE_HEAD；TOUCH、TOUCH_HOLD 与 no-head Slide 不计入。
    达到两个 press 后仍可生成 TOUCH 或 no-head Slide，但不能生成新的 TAP、HOLD 或
    有头 Slide。已经开始的 Note 必须允许按合法形式闭合，不能生成半个 Note 后强制
@@ -155,6 +158,11 @@ SLIDE SEGMENT
 
 允许同起点多条不同路线、路线汇合、相同局部 segment，以及一个 Slide Note 内的
 多个同起点 segment。只因 segment 重复或数量较多就硬过滤会误杀合法谱面。
+
+完全重复检查发生在 Slide Note 边界，而不是 segment 边界。一个新 Slide 的当前
+segment 即使与已有 Slide 完全相同，也必须允许 SEGMENT_END，因为它还可以继续增加
+segment 形成不同路线；只有当前完整 Slide Note 已与同一逻辑帧中的已有 Note 重复
+时，才禁止结束 Note，并只允许继续输出 SEGMENT_START。
 
 四、同一逻辑帧的资源约束
 ------------------------
@@ -269,6 +277,9 @@ TOUCH_HOLD 占用具体 Touch area。若 area A 上存在 TOUCH_HOLD ``[start, e
 属性顺序、时间非递减、同 TS 逻辑帧合并、33 Note / 2 press 上限、Slide 几何与
 多段连接、同帧 lane/Touch 资源冲突、HOLD/TOUCH_HOLD 跨帧占用、50ms 释放冷却、
 30ms 独立 press 最小间隔、no-head Slide 例外，以及 malformed prefix 死路处理。
+序列边界只在至少存在一个合法 frame 时间且 frame 可容纳 Note 时暴露 FRAME_START；
+重复 Slide 在完整 Note 边界强制继续扩展，不会错误禁止可形成不同路线的相同局部
+segment；耗尽的 Touch 类型不会继续作为候选暴露。
 
 尚未实现的是 chart_cache 构建前的整曲质量审计和自动排除报告。因此当前推理解码已
 执行严格规范，但旧缓存仍可能包含会被新规则拒绝的歌曲。后续应让缓存构建先按同一
@@ -526,7 +537,7 @@ class _PrefixReplay:
     def run(self) -> tuple[int, ...]:
         self._take_exact(SOS)
         if self._at_end():
-            raise _NeedToken((FRAME_START, EOS))
+            raise _NeedToken(self._sequence_boundary_tokens())
         while True:
             token = self._peek()
             if token == EOS:
@@ -539,7 +550,7 @@ class _PrefixReplay:
             self.i += 1
             self._parse_frame()
             if self._at_end():
-                raise _NeedToken((FRAME_START, EOS))
+                raise _NeedToken(self._sequence_boundary_tokens())
 
     def _parse_frame(self) -> None:
         min_time = max(self.state.previous_frame_time, self.min_time)
@@ -639,6 +650,8 @@ class _PrefixReplay:
             previous_end = segment[2]
             if self._at_end():
                 signature = (NOTE_SLIDE, *note_attrs, tuple(segments))
+                if signature in self.state.logical_signatures:
+                    raise _NeedToken((SEGMENT_START,))
                 note = _NoteRecord(signature, press_lane=first_start if first_headed else None)
                 self._finish_note_options(note, action=first_headed, extras=(SEGMENT_START,))
             if self._peek() != SEGMENT_START:
@@ -733,7 +746,9 @@ class _PrefixReplay:
     def _note_types(self) -> tuple[int, ...]:
         if self.state.frame_notes >= self.max_notes:
             return ()
-        types = [NOTE_TOUCH]
+        types = []
+        if any(not self._touch_unavailable(area) for area in TOUCHES):
+            types.append(NOTE_TOUCH)
         if len(self.state.logical_press_lanes) < self.max_actions:
             if self._available_press_lanes():
                 types.extend((NOTE_TAP, NOTE_HOLD))
@@ -746,6 +761,12 @@ class _PrefixReplay:
         if self.state.frame_notes:
             allowed.append(FRAME_END)
         return tuple(allowed)
+
+    def _sequence_boundary_tokens(self) -> tuple[int, ...]:
+        min_time = max(self.state.previous_frame_time, self.min_time)
+        if self.max_notes >= 1 and min_time <= self.max_time:
+            return (FRAME_START, EOS)
+        return (EOS,)
 
     def _take_exact(self, expected: int) -> int:
         return self._take_from((expected,))
@@ -777,6 +798,8 @@ def _self_check() -> None:
 
     assert allowed_tokens([]) == (SOS,)
     assert allowed_tokens([SOS]) == (FRAME_START, EOS)
+    assert allowed_tokens([SOS], min_frame_time=2200, max_frame_time=2199) == (EOS,)
+    assert allowed_tokens([SOS], max_notes_per_frame=0) == (EOS,)
     assert allowed_tokens([NOTE_TAP]) == ()
     assert allowed_tokens([SOS, SOS]) == ()
     assert allowed_tokens([SOS, EOS, FRAME_START]) == ()
@@ -853,10 +876,38 @@ def _self_check() -> None:
     ]
     assert set(allowed_tokens(first_segment)) == {l(1), l(3)}
 
+    # 重复的局部 segment 可以继续扩展，但完整 Slide 不能以重复状态结束。
+    slide_frame = [
+        SOS, FRAME_START, t(1200), NOTE_SLIDE,
+        SEGMENT_START, LINE, l(1), l(3), t(10), t(10), IS_SLIDE_NO_HEAD, SEGMENT_END,
+    ]
+    duplicate_slide = slide_frame + [
+        NOTE_SLIDE, SEGMENT_START, LINE, l(1), l(3), t(10), t(10), IS_SLIDE_NO_HEAD,
+    ]
+    assert SEGMENT_END in allowed_tokens(duplicate_slide)
+    duplicate_closed = duplicate_slide + [SEGMENT_END]
+    assert allowed_tokens(duplicate_closed) == (SEGMENT_START,)
+    extended_slide = duplicate_closed + [
+        SEGMENT_START, LINE, l(3), l(5), t(10), t(10), SEGMENT_END,
+    ]
+    extended_allowed = allowed_tokens(extended_slide)
+    assert SEGMENT_START in extended_allowed
+    assert NOTE_TOUCH in extended_allowed
+    assert FRAME_END in extended_allowed
+
     # 同区域 TOUCH_HOLD 的 50ms 冷却。
     touch_hold = [SOS, FRAME_START, t(1200), NOTE_TOUCH, a(1), t(100), FRAME_END]
     assert a(1) not in allowed_tokens(touch_hold + [FRAME_START, t(1305), NOTE_TOUCH])
     assert a(1) in allowed_tokens(touch_hold + [FRAME_START, t(1306), NOTE_TOUCH])
+
+    # 所有 Touch 区域都已在同一逻辑帧使用时，不能再暴露无法闭合的 NOTE_TOUCH。
+    full_touch_frame = [SOS, FRAME_START, t(1200)]
+    for area in TOUCHES:
+        full_touch_frame.extend((NOTE_TOUCH, area))
+    full_touch_allowed = allowed_tokens(full_touch_frame)
+    assert NOTE_TOUCH not in full_touch_allowed
+    assert FRAME_END in full_touch_allowed
+    assert IS_FIREWORK in full_touch_allowed
 
     print("[constrained-decode] 自检通过")
 

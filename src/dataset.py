@@ -200,7 +200,7 @@ def compile_index(
 
         # 只读 shape；实际 mel 数据仍在 __getitem__ 里按需 mmap。
         mel_arr = np.load(str(mel_path))
-        mel_total_frames = mel_arr.shape[1]
+        mel_total_frames = mel_arr.shape[0]
         del mel_arr
         song_end_sec = mel_total_frames / frames_per_sec
 
@@ -340,10 +340,10 @@ class ChartDataset(Dataset):
         mel_full = self._mel_cache.get(entry.mel_path)
         if mel_full is None:
             mel_full = np.load(str(entry.mel_path), mmap_mode="r")
-            if mel_full.ndim != 2 or mel_full.shape[0] != self.n_mels:
+            if mel_full.ndim != 2 or mel_full.shape[1] != self.n_mels:
                 raise ValueError(
                     f"梅尔缓存形状错误: {entry.mel_path} 为 {mel_full.shape}，"
-                    f"当前配置需要 ({self.n_mels}, 时间帧数)"
+                    f"当前配置需要 (时间帧数, {self.n_mels})"
                 )
             self._mel_cache[entry.mel_path] = mel_full
             # ponytail: 每个 worker 最多保持 8 个 mmap；需要更多时再按命中率调大。
@@ -352,12 +352,14 @@ class ChartDataset(Dataset):
         else:
             self._mel_cache.move_to_end(entry.mel_path)
         source = torch.from_numpy(
-            mel_full[:, entry.source_start_frame:entry.source_end_frame].copy()
+            mel_full[entry.source_start_frame:entry.source_end_frame].copy()
         ).float()
-        mel_slice = torch.zeros(self.n_mels, self.mel_frames)
-        copy_len = min(source.shape[1], self.mel_frames - entry.left_pad_frames)
+        mel_slice = torch.zeros(self.mel_frames, self.n_mels)
+        audio_mask = torch.zeros(self.mel_frames, dtype=torch.bool)
+        copy_len = min(source.shape[0], self.mel_frames - entry.left_pad_frames)
         if copy_len > 0:
-            mel_slice[:, entry.left_pad_frames:entry.left_pad_frames + copy_len] = source[:, :copy_len]
+            mel_slice[entry.left_pad_frames:entry.left_pad_frames + copy_len] = source[:copy_len]
+            audio_mask[entry.left_pad_frames:entry.left_pad_frames + copy_len] = True
 
         # ── pad tokens ──
         tl = entry.tokens
@@ -379,6 +381,7 @@ class ChartDataset(Dataset):
         loss_mask[entry.loss_start:length] = True
         return {
             "mel": mel_slice,
+            "audio_mask": audio_mask,
             "tokens": tokens,
             "mask": mask,
             "loss_mask": loss_mask,
@@ -396,19 +399,22 @@ def collate_segments(batch: list[dict], mel_frames: int = 0) -> dict:
     When mel_frames > 0 each mel is trimmed or zero-padded to that exact width
     so the encoder's positional embedding always matches.
     """
-    n_mels = batch[0]["mel"].shape[0]
+    n_mels = batch[0]["mel"].shape[1]
 
     if mel_frames <= 0:
-        mel_frames = max(item["mel"].shape[1] for item in batch)
+        mel_frames = max(item["mel"].shape[0] for item in batch)
 
-    mels = torch.zeros(len(batch), n_mels, mel_frames)
+    mels = torch.zeros(len(batch), mel_frames, n_mels)
+    audio_masks = torch.zeros(len(batch), mel_frames, dtype=torch.bool)
     for i, item in enumerate(batch):
         mel = item["mel"]                        # (n_mels, T)
-        T = mel.shape[1]
-        mels[i, :, :min(T, mel_frames)] = mel[:, :mel_frames]
+        T = mel.shape[0]
+        mels[i, :min(T, mel_frames)] = mel[:mel_frames]
+        audio_masks[i, :min(T, mel_frames)] = item["audio_mask"][:mel_frames]
 
     return {
         "mel": mels,
+        "audio_mask": audio_masks,
         "tokens": torch.stack([item["tokens"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
         "loss_mask": torch.stack([item["loss_mask"] for item in batch]),
@@ -434,12 +440,16 @@ def _self_check():
         assert t[0] == SOS, f"Expected SOS, got {t[0]}"
         non_pad = t[t != 0]
         assert non_pad[-1].item() == EOS, f"Expected EOS, got {non_pad[-1].item()}"
+        assert item["audio_mask"].dtype == torch.bool
+        assert item["audio_mask"].shape == (ds.mel_frames,)
+        assert item["audio_mask"].any()
         print(f"  mel={item['mel'].shape} tokens={item['tokens'].shape} "
               f"mask_true={item['mask'].sum().item()}")
         print(f"  SOS={t[0].item()} EOS={non_pad[-1].item()} ✓")
 
     batch = [ds[i] for i in range(min(4, len(ds)))]
     c = collate_segments(batch)
+    assert torch.equal(c["audio_mask"], torch.stack([item["audio_mask"] for item in batch]))
     print(f"  batch: mel={c['mel'].shape} tokens={c['tokens'].shape}")
     print("[dataset] ✓ self-check passed")
 

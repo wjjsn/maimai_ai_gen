@@ -26,7 +26,7 @@
 - `src/dataset.py`：数据集读取、滑窗标签语义和旋转增强。输入为 `3000` mel 帧，约 34.83 秒；窗口每 1 秒平移。运行时 mmap 读取 `chart_index` 的 token 与窗口坐标，按需读取 Mel；不再在训练启动时重新解析全量谱面。decoder 可见相对 `6..12s` 的谱面 token 前缀，只对相对 `12..22s` 的中间 10 秒 token 和 EOS 计算 loss，音频左右上下文约 12 秒。验证索引使用 10 秒步进。歌曲头尾通过左右补零保持目标区位置固定，不夹动窗口。
 - `src/infer.py`：唯一正式推理入口。每次生成并提交 10 秒，使用前一窗口已生成结果中最后 6 秒的 token 作为当前 decoder 前缀；音频窗口与训练一样把目标固定在相对 `12..22s`。训练中的整曲生成验证直接复用 `overlap_infer()`，不再有 reference/fixed 特殊推理路径。
 - `src/maidata_parser.py`：simai/maidata 与内部 token 之间的转换器，文件很长。重点看这些区域：数据结构和 token 常量在文件前部；`parse()` 负责读 `&inote_*`；`_ts_token()` 负责秒到 TS token，当前会 clamp 到 `0..29.99s`；`to_tensor()` 是旧动态分段逻辑，当前主训练已不依赖它构造滑窗；`_parse_token_segment()` 和 `parse_from_tensor()` 负责把生成 token 还原成 frame；`generate()` 负责输出 maidata 文本。普通训练问题通常不用通读整个文件。
-- `src/constrained_decode.py`：语法约束解码器。`allowed_tokens()` 根据当前 token 前缀返回下一步允许 token，避免生成非法结构。它只保证语法合法，不保证音乐性。
+- `src/constrained_decode.py`：严格前缀重放约束器。`allowed_tokens()` 根据完整 token 前缀恢复 frame、Note、Slide 和持续资源状态，只返回至少能按当前规则继续闭合的下一 token。它同时执行 canonical token 结构、Slide 几何、同帧资源冲突、HOLD/TOUCH_HOLD 跨帧占用、释放冷却和独立 press 间隔等硬规则，但不保证节奏编排、难度和音乐性。
 - `src/model.py`：Whisper 风格模型定义，包括音频 encoder 和文本 decoder。普通训练调参通常不用改它；如果改 mel 输入长度或 `n_audio_ctx`，必须看这里的 encoder positional embedding 长度约束。
 - `src/mel_cache.py`：把 `track.mp3` 转成 log-mel 并缓存；以源音频 `size + mtime_ns` 和 Mel 参数自动失效。旧 `.npy` 首次使用只补写元数据，不会全量重算。
 - `src/chart_cache.py`：编译并缓存滑窗 token、loss 起点和音频切片坐标。`ChartDataset` 自动调用 `ensure_chart_cache()`；源谱面或 Mel 的 `size + mtime_ns`、难度或窗口配置变化时自动重建。构建使用锁和临时 generation，写完后原子更新 `current.json`，不能删除正在被 mmap 使用的旧 generation。
@@ -43,7 +43,7 @@
 - 训练和推理的滑窗定义必须保持一致。改 `PREFIX_START_SEC`、`TARGET_START_SEC`、`TARGET_END_SEC`、`mel_frames`、`n_audio_ctx` 或步长时，要同时检查 `chart_cache.py`、`dataset.py`、`infer.py` 和 `train.py`；同时提升 `CACHE_VERSION`，避免复用语义已变化的 token 缓存。
 - 当前 `3000 mel frames` 实际约 34.83 秒，不是严格 30 秒；而 TS token 只能表达 `0..29.99s`。这是后续改进重点。
 - 8 方向旋转增强只旋转 token，不改音频。它覆盖所有整体旋转；逆时针 1 次等价于顺时针 7 次。
-- `constrained_decode.py` 只做语法约束，不能替代模型学会音乐内容。
+- `constrained_decode.py` 的候选集合不能包含已知必死路径：无可用 frame 时间或 Note 容量时只能允许 `EOS`；所有 Touch area 都不可用时不能允许 `NOTE_TOUCH`；相同局部 Slide segment 可以闭合并继续扩展，只有完整 Slide Note 重复时才强制继续生成 `SEGMENT_START`。这些结构和资源硬规则仍不能替代模型学会音乐内容。
 - `tmp/` 和 `checkpoints/` 里的结果可能来自旧难度或旧方案，使用前要确认命令参数和 checkpoint 来源。
 - 谱面索引中的 token 以 `uint16` 保存，读取后转为 `torch.int64`；词表当前为 `0..3071`。修改词表范围、token 常量、编码或解析语义时，必须提升 `CACHE_VERSION`；若范围不再适合 `uint16`，还要升级缓存格式和存储 dtype。
 - 索引用 `loss_start` 表示连续监督后缀：从第一个目标 frame 的 `FRAME_START` 到 EOS；没有目标 frame 时只监督 EOS。修改 token 窗口构造时必须验证它与逐 token `loss_mask` 等价。
@@ -104,7 +104,7 @@
 
 问：当前约束解码和要求大语言模型格式化输出 JSON 是同类方法吗？
 
-答：是同一类思想，都是 grammar-constrained decoding。`constrained_decode.py` 的 `allowed_tokens()` 在推理时每一步先拿模型 logits，再把非法 token 置为 `-inf`，只在合法集合里选下一个 token。这只能保证 token 结构合法，不能保证谱面跟音乐对齐、难度合理或有音乐性。如果 parser 一直报警告，优先检查 `allowed_tokens()` 和 `_parse_token_segment()` 是否状态机不一致。
+答：是同一类思想，都是 grammar-constrained decoding。`constrained_decode.py` 的 `allowed_tokens()` 在推理时每一步先拿模型 logits，再把非法 token 置为 `-inf`，只在合法集合里选下一个 token。当前实现不仅约束字段顺序，还会重放同 TS 资源、持续 HOLD/TOUCH_HOLD、Slide 几何和 no-head 等状态；返回的候选应避免已知必然走入空 allowed set 的路径。它仍不能保证谱面跟音乐对齐、难度合理或有音乐性。如果 parser 一直报警告或推理出现 `grammar_dead_end`，优先检查 `allowed_tokens()` 的候选可完成性以及它与 `_parse_token_segment()` 的语义是否一致。
 
 问：训练时能不能也用 `allowed_tokens()` 约束着训？
 

@@ -27,6 +27,14 @@ class AudioConfig:
 
 
 @dataclass(frozen=True)
+class MertConfig:
+    model_dir: Path
+    chunk_sec: float
+    context_sec: float
+    cache_float16: bool
+
+
+@dataclass(frozen=True)
 class WindowConfig:
     mel_frames: int
     prefix_start_sec: float
@@ -84,6 +92,7 @@ class InferenceConfig:
 class AppConfig:
     paths: PathsConfig
     audio: AudioConfig
+    mert: MertConfig
     window: WindowConfig
     model: ModelConfig
     training: TrainingConfig
@@ -101,6 +110,12 @@ SECTIONS = {
         "傅里叶窗口": "n_fft",
         "跳步长度": "hop_length",
         "梅尔频带数": "n_mels",
+    }),
+    "MERT": (MertConfig, {
+        "模型目录": "model_dir",
+        "分块秒数": "chunk_sec",
+        "上下文秒数": "context_sec",
+        "缓存半精度": "cache_float16",
     }),
     "滑窗": (WindowConfig, {
         "梅尔帧数": "mel_frames",
@@ -195,6 +210,7 @@ def _require(condition: bool, message: str) -> None:
 
 def _validate_config(config: AppConfig) -> None:
     audio = config.audio
+    mert = config.mert
     window = config.window
     model = config.model
     training = config.training
@@ -225,6 +241,10 @@ def _validate_config(config: AppConfig) -> None:
         audio.n_mels <= audio.n_fft // 2 + 1,
         "配置 音频.梅尔频带数 不能超过傅里叶频谱可提供的频率格数",
     )
+    _require(mert.model_dir.is_dir(), f"配置 MERT.模型目录不存在或不是目录: {mert.model_dir}")
+    _require(math.isfinite(mert.chunk_sec) and mert.chunk_sec > 0, "配置 MERT.分块秒数 必须大于 0")
+    _require(math.isfinite(mert.context_sec) and mert.context_sec >= 0, "配置 MERT.上下文秒数 不能小于 0")
+    _require(mert.context_sec * 2 < mert.chunk_sec, "配置 MERT.上下文秒数的两倍必须小于分块秒数")
 
     _require(window.mel_frames > 0, "配置 滑窗.梅尔帧数 必须大于 0")
     _require(window.mel_frames % 2 == 0, "配置 滑窗.梅尔帧数 必须是偶数")
@@ -302,6 +322,12 @@ def inference_checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | 
             "傅里叶窗口": config.audio.n_fft,
             "跳步长度": config.audio.hop_length,
             "梅尔频带数": config.audio.n_mels,
+        },
+        "MERT": {
+            "模型目录": str(config.mert.model_dir),
+            "分块秒数": config.mert.chunk_sec,
+            "上下文秒数": config.mert.context_sec,
+            "缓存半精度": config.mert.cache_float16,
         },
         "滑窗": {
             "梅尔帧数": config.window.mel_frames,
@@ -407,6 +433,8 @@ def _self_check() -> None:
 
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert CONFIG.audio.sample_rate == 22050
+    assert CONFIG.mert.model_dir == ROOT_DIR / "MERT-v1-95M"
+    assert CONFIG.model.audio_state == 768
     assert CONFIG.window.target_end_sec - CONFIG.window.target_start_sec == 10.0
     assert CONFIG.model.max_tokens == 2048
     assert CONFIG.training.level_idx == 5

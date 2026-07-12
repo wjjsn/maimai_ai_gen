@@ -13,10 +13,10 @@ import numpy as np
 from config import CONFIG
 from constrained_decode import validate_frames
 from maidata_parser import _match_music, compiler, load_music_data, music_data_version
-from mel_cache import main as rebuild_mel_cache
+from mert_cache import main as rebuild_mert_cache
 from tokenizer import EOS, SOS, encode_frame
 
-CACHE_VERSION = 6
+CACHE_VERSION = 7
 PREFIX_START_SEC = CONFIG.window.prefix_start_sec
 TARGET_START_SEC = CONFIG.window.target_start_sec
 TARGET_END_SEC = CONFIG.window.target_end_sec
@@ -100,7 +100,7 @@ def _publish(cache_root: Path, build_path: Path) -> None:
 
 
 def _scan_sources(charts_dir: Path, mel_dir: Path) -> list[dict]:
-    from mel_cache import cache_key
+    from mert_cache import cache_key
 
     sources = []
     for chart_path in sorted(charts_dir.rglob("maidata.txt")):
@@ -189,7 +189,7 @@ def _compile(charts_dir: Path, cache_dir: Path, build_path: Path, config: dict, 
             continue
         chart_id = len(charts)
         charts.append({"chart": source["chart"], "mel": source["mel"]})
-        mel_total_frames = np.load(mel_path, mmap_mode="r").shape[1]
+        mel_total_frames = np.load(mel_path, mmap_mode="r").shape[0]
         target_start = 0.0
         while target_start < mel_total_frames / frames_per_sec:
             window_start = target_start - TARGET_START_SEC
@@ -239,7 +239,7 @@ def ensure_chart_cache(charts_dir: str | Path, cache_dir: str | Path, *, level_i
     charts_dir = Path(charts_dir)
     cache_dir = Path(cache_dir)
     if build_mel:
-        rebuild_mel_cache(charts_dir, cache_dir, sample_rate, n_fft, hop_length, n_mels)
+        rebuild_mert_cache(charts_dir, cache_dir)
     config = _config(level_idx, sample_rate, hop_length, n_mels, stride_sec, mel_frames, music_data_version())
     cache_root, lock_path = _paths(cache_dir, config)
     sources = _scan_sources(charts_dir, cache_dir)
