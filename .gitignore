@@ -30,4 +30,5 @@ Thumbs.db
 charts/
 tmp/
 checkpoints/
+.cache/
 *.pt
