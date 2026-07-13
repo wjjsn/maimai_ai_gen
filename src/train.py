@@ -1,5 +1,6 @@
 from collections import defaultdict
 from functools import partial
+import json
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,8 @@ NUM_EPOCHS = CONFIG.training.num_epochs
 LR = CONFIG.training.learning_rate
 WEIGHT_DECAY = CONFIG.training.weight_decay
 VAL_RATIO = CONFIG.training.val_ratio
+TEST_RATIO = CONFIG.training.test_ratio
+EXPERIMENT = CONFIG.experiment
 GRAD_CLIP = CONFIG.training.grad_clip
 EARLY_STOP_PATIENCE = CONFIG.training.early_stop_patience
 LABEL_SMOOTHING = CONFIG.training.label_smoothing
@@ -52,7 +55,7 @@ VAL_GEN_CHARTS = CONFIG.training.val_gen_charts
 VAL_ORACLE_WINDOWS = CONFIG.training.val_oracle_windows
 OVERFIT_CHARTS = CONFIG.training.overfit_charts
 RESUME_PATH = CONFIG.training.resume_path
-CHECKPOINT_DIR = CONFIG.paths.checkpoint_dir
+CHECKPOINT_DIR = CONFIG.paths.checkpoint_dir / EXPERIMENT.name if EXPERIMENT.enabled else CONFIG.paths.checkpoint_dir
 if CHECKPOINT_DIR.exists() and not CHECKPOINT_DIR.is_dir():
     raise ValueError(f"检查点路径不是目录: {CHECKPOINT_DIR}")
 CHECKPOINT_DIR.mkdir(exist_ok=True, parents=True)
@@ -71,6 +74,9 @@ dims = ModelDimensions(
     n_state=CONFIG.model.state,
     n_head=CONFIG.model.head,
     n_layer=CONFIG.model.layer,
+    n_audio_adapter_layer=CONFIG.model.audio_adapter_layers,
+    audio_adapter_kernel=CONFIG.model.audio_adapter_kernel,
+    audio_adapter_dropout=CONFIG.model.audio_adapter_dropout,
 )
 model = Whisper(dims).to(DEVICE)
 print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
@@ -85,7 +91,7 @@ train_full_ds = ChartDataset(
     max_tokens=MAX_TOKENS,
     stride_sec=CONFIG.window.train_stride_sec,
     mert_frames=dims.n_audio_ctx,
-    chart_limit=OVERFIT_CHARTS,
+    chart_limit=0,
     seed=SEED,
 )
 val_full_ds = ChartDataset(
@@ -105,18 +111,38 @@ for idx, entry in enumerate(train_full_ds._index):
 
 chart_paths = sorted(by_chart)
 perm = torch.randperm(len(chart_paths), generator=torch.Generator().manual_seed(SEED)).tolist()
-if OVERFIT_CHARTS > 0:
+if EXPERIMENT.enabled:
+    needed_charts = EXPERIMENT.train_charts + EXPERIMENT.val_charts + EXPERIMENT.test_charts
+    if len(chart_paths) < needed_charts:
+        raise ValueError(f"实验需要 {needed_charts} 首歌，当前只有 {len(chart_paths)} 首")
+    train_chart_count = EXPERIMENT.train_charts
+    val_chart_count = EXPERIMENT.val_charts
+    test_chart_count = EXPERIMENT.test_charts
+    train_charts = {chart_paths[i] for i in perm[:train_chart_count]}
+    val_charts = {chart_paths[i] for i in perm[train_chart_count:train_chart_count + val_chart_count]}
+    test_charts = {
+        chart_paths[i]
+        for i in perm[train_chart_count + val_chart_count:needed_charts]
+    }
+    train_indices = [i for p in chart_paths if p in train_charts for i in by_chart[p]]
+    val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in val_charts]
+elif OVERFIT_CHARTS > 0:
     selected_charts = {chart_paths[i] for i in perm[:min(OVERFIT_CHARTS, len(chart_paths))]}
     val_charts = selected_charts
+    test_charts = set()
     train_chart_count = len(selected_charts)
     val_chart_count = len(selected_charts)
     train_indices = [i for p in chart_paths if p in selected_charts for i in by_chart[p]]
     val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in selected_charts]
 else:
     val_chart_count = max(1, int(len(chart_paths) * VAL_RATIO))
-    train_chart_count = len(chart_paths) - val_chart_count
+    test_chart_count = max(1, int(len(chart_paths) * TEST_RATIO))
+    if val_chart_count + test_chart_count >= len(chart_paths):
+        raise ValueError("歌曲数量不足，无法划分训练、验证和测试集")
+    train_chart_count = len(chart_paths) - val_chart_count - test_chart_count
     val_charts = {chart_paths[i] for i in perm[:val_chart_count]}
-    train_indices = [i for p in chart_paths if p not in val_charts for i in by_chart[p]]
+    test_charts = {chart_paths[i] for i in perm[val_chart_count:val_chart_count + test_chart_count]}
+    train_indices = [i for p in chart_paths if p not in val_charts | test_charts for i in by_chart[p]]
     val_indices = [i for i, entry in enumerate(val_full_ds._index) if entry.mel_path in val_charts]
 base_train_ds = Subset(train_full_ds, train_indices)
 augmented_train_ds = AudioAugmentedDataset(
@@ -136,6 +162,8 @@ print(
     f"旋转增强后 {len(train_ds)} samples, "
     f"Val: {len(val_ds)} windows / {val_chart_count} charts"
 )
+if OVERFIT_CHARTS == 0:
+    print(f"Test: {len(test_charts)} charts，仅在训练结束后评估")
 supervised_tokens = 0
 eos_targets = 0
 after_frame_end = 0
@@ -163,7 +191,8 @@ if OVERFIT_CHARTS > 0:
         print(f"  {i}. {chart_dir}")
     gen_val_paths = sorted(selected_charts)
 else:
-    gen_val_paths = sorted(val_charts)[:VAL_GEN_CHARTS]
+    gen_val_paths = sorted(val_charts)[:(EXPERIMENT.generation_val_charts if EXPERIMENT.enabled else VAL_GEN_CHARTS)]
+test_paths = sorted(test_charts)
 
 train_loader = DataLoader(
     train_ds, batch_size=BATCH_SIZE, shuffle=True,
@@ -191,7 +220,11 @@ optimizer = optim.AdamW(
     model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY,
     fused=DEVICE.type == "cuda",
 )
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=LR_T_MAX, eta_min=1e-6)
+scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=EXPERIMENT.max_updates if EXPERIMENT.enabled else LR_T_MAX,
+    eta_min=1e-6,
+)
 scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
 window_config = {
     "mert_frames": dims.n_audio_ctx,
@@ -208,7 +241,7 @@ if RESUME_PATH:
     if not resume_path.is_file():
         raise ValueError(f"恢复检查点不存在或不是文件: {resume_path}")
     resume_checkpoint = torch.load(resume_path, map_location=DEVICE, weights_only=False)
-    if resume_checkpoint.get("checkpoint_version") != 3 or resume_checkpoint.get("model_kind") != "mert-window-decoder-v2":
+    if resume_checkpoint.get("checkpoint_version") != 4 or resume_checkpoint.get("model_kind") != "mert-window-decoder-v3":
         raise ValueError("检查点来自旧架构，不能继续训练")
     if resume_checkpoint.get("feature_signature") != feature_signature():
         raise ValueError("检查点使用的 MERT 特征实现与当前环境不一致")
@@ -352,7 +385,7 @@ def validate(model, loader, criterion, device):
 
 
 @torch.no_grad()
-def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
+def validate_generation(model, mel_paths, chart_by_mel, level_idx, device, audio_mode="normal"):
     model.eval()
     total_tp = 0
     total_pred = 0
@@ -364,8 +397,18 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
     total_new_tokens = 0
     total_raw_new_tokens = 0
     total_dropped_tokens = 0
-    for mel_path in tqdm(mel_paths, desc="整曲生成验证", leave=False):
+    song_f1s = []
+    density_ratios = []
+    for song_i, mel_path in enumerate(tqdm(mel_paths, desc="整曲生成验证", leave=False)):
         mel = np.load(mel_path)
+        if audio_mode == "换歌":
+            other = np.load(mel_paths[(song_i + 1) % len(mel_paths)])
+            # 保持原歌曲时长，避免只因音频长度变化影响窗口数和生成结果。
+            mel = other[np.arange(len(mel)) % len(other)]
+        elif audio_mode == "打乱":
+            mel = mel[np.random.default_rng(SEED + song_i).permutation(len(mel))]
+        elif audio_mode == "均值":
+            mel = np.broadcast_to(mel.mean(axis=0, keepdims=True), mel.shape).copy()
         generated_frames, infer_stats = overlap_infer(model, mel, device, verbose=False, return_stats=True)
         total_windows += infer_stats["windows"]
         total_limit_windows += infer_stats["limit_windows"]
@@ -382,6 +425,12 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
         total_tp += tp
         total_pred += pred_count
         total_target += target_count
+        song_precision = tp / max(pred_count, 1)
+        song_recall = tp / max(target_count, 1)
+        song_f1s.append(
+            0.0 if song_precision + song_recall == 0 else 2 * song_precision * song_recall / (song_precision + song_recall)
+        )
+        density_ratios.append(pred_count / max(target_count, 1))
     precision = total_tp / max(total_pred, 1)
     recall = total_tp / max(total_target, 1)
     f1 = 0.0 if precision + recall == 0 else 2 * precision * recall / (precision + recall)
@@ -389,6 +438,9 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
         precision * 100,
         recall * 100,
         f1 * 100,
+        float(np.mean(song_f1s)) * 100,
+        float(np.median(song_f1s)) * 100,
+        float(np.mean(density_ratios)),
         total_limit_windows,
         total_dead_end_windows,
         total_eos_windows,
@@ -397,6 +449,118 @@ def validate_generation(model, mel_paths, chart_by_mel, level_idx, device):
         total_new_tokens / max(total_windows, 1),
         total_dropped_tokens / max(total_windows, 1),
     )
+
+
+def _checkpoint(epoch_count, update_count, **metrics):
+    return {
+        "checkpoint_version": 4,
+        "model_kind": "mert-window-decoder-v3",
+        "epoch": epoch_count,
+        "updates": update_count,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "dims": dims,
+        "window_config": window_config,
+        "config": checkpoint_config(CONFIG),
+        "feature_signature": feature_signature(),
+        **metrics,
+    }
+
+
+def run_experiment():
+    metrics_path = CHECKPOINT_DIR / "metrics.jsonl"
+    if metrics_path.exists():
+        raise ValueError(f"实验目录已存在结果: {metrics_path}；请修改 实验.名称 后重跑")
+    best_macro_f1 = -1.0
+    updates = 0
+    epoch = 0
+    train_iter = iter(train_loader)
+    print(
+        f"短实验 {EXPERIMENT.name}: train/val/test="
+        f"{train_chart_count}/{val_chart_count}/{len(test_paths)} 首，"
+        f"最多 {EXPERIMENT.max_updates} updates，每 {EXPERIMENT.validate_every_updates} updates 验证"
+    )
+    while updates < EXPERIMENT.max_updates:
+        model.train()
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            epoch += 1
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
+        mel = batch["mel"].to(DEVICE, non_blocking=True)
+        audio_mask = batch["audio_mask"].to(DEVICE, non_blocking=True)
+        tokens = batch["tokens"].to(DEVICE, non_blocking=True)
+        loss_mask = batch["loss_mask"].to(DEVICE, non_blocking=True)
+        with torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=DEVICE.type == "cuda"):
+            logits = model(mel, tokens[:, :-1], audio_mask)
+            token_loss = criterion(logits.reshape(-1, logits.size(-1)), tokens[:, 1:].reshape(-1)).view_as(tokens[:, 1:])
+            token_loss = token_loss * torch.where(tokens[:, 1:] == EOS, EOS_LOSS_WEIGHT, 1.0)
+            loss = token_loss[loss_mask[:, 1:]].mean()
+        optimizer.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        updates += 1
+        if updates % 50 == 0:
+            print(f"实验 update={updates}/{EXPERIMENT.max_updates} loss={loss.item():.4f}")
+        if updates % EXPERIMENT.validate_every_updates and updates != EXPERIMENT.max_updates:
+            continue
+        val_loss, val_acc, eos_acc, eos_prob, eos_rank, eos_to_frame = validate(model, val_loader, criterion, DEVICE)
+        result = validate_generation(model, gen_val_paths, chart_by_mel, LEVEL_IDX, DEVICE)
+        val_precision, val_recall, val_f1, val_macro_f1, val_median_f1, val_density_ratio, *generation_stats = result
+        record = {
+            "kind": "validation", "updates": updates, "epoch": epoch,
+            "train_loss": loss.item(), "val_loss": val_loss, "val_acc": val_acc,
+            "eos_acc": eos_acc, "eos_probability": eos_prob, "eos_rank": eos_rank,
+            "eos_to_frame_start": eos_to_frame, "precision": val_precision,
+            "recall": val_recall, "f1": val_f1, "macro_f1": val_macro_f1,
+            "median_f1": val_median_f1, "density_ratio": val_density_ratio,
+            "generation_stats": generation_stats,
+        }
+        with metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"实验 update={updates}: val_loss={val_loss:.4f} 宏F1={val_macro_f1:.2f}% 密度比={val_density_ratio:.2f}")
+        torch.save(_checkpoint(epoch, updates, **record), CHECKPOINT_DIR / "newest.pt")
+        if val_macro_f1 > best_macro_f1:
+            best_macro_f1 = val_macro_f1
+            torch.save(_checkpoint(epoch, updates, **record), CHECKPOINT_DIR / "best_gen.pt")
+            print(f"  -> 保存实验最优模型，宏F1={val_macro_f1:.2f}%")
+
+    best = torch.load(CHECKPOINT_DIR / "best_gen.pt", map_location=DEVICE, weights_only=False)
+    model.load_state_dict(best["model_state_dict"])
+    test_eval_paths = test_paths[:EXPERIMENT.audio_ablation_charts]
+    result = validate_generation(model, test_eval_paths, chart_by_mel, LEVEL_IDX, DEVICE)
+    precision, recall, f1, macro_f1, median_f1, density_ratio, *generation_stats = result
+    record = {
+        "kind": "test", "charts": len(test_eval_paths), "precision": precision,
+        "recall": recall, "f1": f1, "macro_f1": macro_f1,
+        "median_f1": median_f1, "density_ratio": density_ratio,
+        "generation_stats": generation_stats,
+    }
+    with metrics_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"独立测试集: 宏F1={macro_f1:.2f}% 中位F1={median_f1:.2f}% 密度比={density_ratio:.2f}")
+    for mode in ("换歌", "打乱", "均值"):
+        result = validate_generation(
+            model, test_eval_paths, chart_by_mel, LEVEL_IDX, DEVICE, audio_mode=mode
+        )
+        precision, recall, f1, macro_f1, median_f1, density_ratio, *generation_stats = result
+        record = {
+            "kind": "test_audio_ablation", "audio_mode": mode,
+            "charts": len(test_eval_paths),
+            "precision": precision, "recall": recall, "f1": f1,
+            "macro_f1": macro_f1, "median_f1": median_f1,
+            "density_ratio": density_ratio, "generation_stats": generation_stats,
+        }
+        with metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        print(f"测试音频{mode}: 宏F1={macro_f1:.2f}% 中位F1={median_f1:.2f}% 密度比={density_ratio:.2f}")
 
 
 @torch.no_grad()
@@ -452,6 +616,9 @@ def validate_oracle_prefix(model, loader, device, max_windows):
 # ─────────────────────── 5. 主循环 ───────────────────────
 
 if __name__ == "__main__":
+    if EXPERIMENT.enabled:
+        run_experiment()
+        raise SystemExit
     best_val_loss = float("inf")
     best_val_content_f1 = -1.0
     bad_epochs = 0
@@ -468,6 +635,9 @@ if __name__ == "__main__":
             val_precision,
             val_recall,
             val_content_f1,
+            val_macro_f1,
+            val_median_f1,
+            val_density_ratio,
             limit_windows,
             dead_end_windows,
             eos_windows,
@@ -498,6 +668,9 @@ if __name__ == "__main__":
             f"整曲生成P={val_precision:.2f}%  "
             f"整曲生成R={val_recall:.2f}%  "
             f"整曲生成F1={val_content_f1:.2f}%  "
+            f"歌曲宏F1={val_macro_f1:.2f}%  "
+            f"歌曲中位F1={val_median_f1:.2f}%  "
+            f"密度比={val_density_ratio:.2f}  "
             f"撞上限={limit_windows}/{gen_windows}  "
             f"约束死路={dead_end_windows}/{gen_windows}  "
             f"正常结束={eos_windows}/{gen_windows}  "
@@ -509,8 +682,8 @@ if __name__ == "__main__":
             bad_epochs = 0
             ckpt_path = CHECKPOINT_DIR / "best.pt"
             torch.save({
-                "checkpoint_version": 3,
-                "model_kind": "mert-window-decoder-v2",
+                "checkpoint_version": 4,
+                "model_kind": "mert-window-decoder-v3",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -520,18 +693,21 @@ if __name__ == "__main__":
                 "val_precision": val_precision,
                 "val_recall": val_recall,
                 "val_content_f1": val_content_f1,
+                "val_macro_f1": val_macro_f1,
+                "val_median_f1": val_median_f1,
+                "val_density_ratio": val_density_ratio,
                 "dims": dims,
                 "window_config": window_config,
                 "config": checkpoint_config(CONFIG),
                 "feature_signature": feature_signature(),
             }, ckpt_path)
             print(f"  -> 保存验证损失最优模型到 {ckpt_path}")
-        if val_content_f1 > best_val_content_f1:
-            best_val_content_f1 = val_content_f1
+        if val_macro_f1 > best_val_content_f1:
+            best_val_content_f1 = val_macro_f1
             ckpt_path = CHECKPOINT_DIR / "best_gen.pt"
             torch.save({
-                "checkpoint_version": 3,
-                "model_kind": "mert-window-decoder-v2",
+                "checkpoint_version": 4,
+                "model_kind": "mert-window-decoder-v3",
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -541,6 +717,9 @@ if __name__ == "__main__":
                 "val_precision": val_precision,
                 "val_recall": val_recall,
                 "val_content_f1": val_content_f1,
+                "val_macro_f1": val_macro_f1,
+                "val_median_f1": val_median_f1,
+                "val_density_ratio": val_density_ratio,
                 "dims": dims,
                 "window_config": window_config,
                 "config": checkpoint_config(CONFIG),
@@ -549,8 +728,8 @@ if __name__ == "__main__":
             print(f"  -> 保存生成效果最优模型到 {ckpt_path}")
         ckpt_path = CHECKPOINT_DIR / "newest.pt"
         torch.save({
-            "checkpoint_version": 3,
-            "model_kind": "mert-window-decoder-v2",
+            "checkpoint_version": 4,
+            "model_kind": "mert-window-decoder-v3",
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -560,6 +739,9 @@ if __name__ == "__main__":
             "val_precision": val_precision,
             "val_recall": val_recall,
             "val_content_f1": val_content_f1,
+            "val_macro_f1": val_macro_f1,
+            "val_median_f1": val_median_f1,
+            "val_density_ratio": val_density_ratio,
             "dims": dims,
             "window_config": window_config,
             "config": checkpoint_config(CONFIG),
@@ -570,3 +752,32 @@ if __name__ == "__main__":
             if bad_epochs >= EARLY_STOP_PATIENCE:
                 print(f"  -> 验证集连续 {EARLY_STOP_PATIENCE} 轮没有改善，提前停止")
                 break
+
+    if OVERFIT_CHARTS == 0:
+        best_gen_path = CHECKPOINT_DIR / "best_gen.pt"
+        best_gen_checkpoint = torch.load(best_gen_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(best_gen_checkpoint["model_state_dict"])
+        (
+            test_precision,
+            test_recall,
+            test_f1,
+            test_macro_f1,
+            test_median_f1,
+            test_density_ratio,
+            test_limits,
+            test_dead_ends,
+            test_eos,
+            test_windows,
+            test_avg_raw_tokens,
+            test_avg_tokens,
+            test_avg_dropped,
+        ) = validate_generation(model, test_paths, chart_by_mel, LEVEL_IDX, DEVICE)
+        print(
+            f"独立测试集 ({len(test_paths)} 首): "
+            f"P={test_precision:.2f}% R={test_recall:.2f}% F1={test_f1:.2f}% "
+            f"宏F1={test_macro_f1:.2f}% 中位F1={test_median_f1:.2f}% "
+            f"密度比={test_density_ratio:.2f} "
+            f"撞上限={test_limits}/{test_windows} 死路={test_dead_ends}/{test_windows} "
+            f"正常结束={test_eos}/{test_windows} "
+            f"原始/保留/丢弃token={test_avg_raw_tokens:.1f}/{test_avg_tokens:.1f}/{test_avg_dropped:.1f}"
+        )

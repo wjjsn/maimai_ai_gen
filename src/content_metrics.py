@@ -13,21 +13,31 @@ def content_match_frame_counts(generated_frames, target_frames, tolerance_sec=0.
 
 
 def _match_events(pred_events, target_events, tolerance_sec):
-    used = [False] * len(target_events)
+    """按类型分组后在时间轴上贪心匹配，得到最大命中数。"""
+    pred_by_type = {}
+    target_by_type = {}
+    for time, kind in pred_events:
+        pred_by_type.setdefault(kind, []).append(time)
+    for time, kind in target_events:
+        target_by_type.setdefault(kind, []).append(time)
     tp = 0
-    for pred_time, pred_type in pred_events:
-        best_i = -1
-        best_dt = tolerance_sec
-        for i, (target_time, target_type) in enumerate(target_events):
-            if used[i] or pred_type != target_type:
-                continue
-            dt = abs(pred_time - target_time)
-            if dt <= best_dt + 1e-9:
-                best_i = i
-                best_dt = dt
-        if best_i >= 0:
-            used[best_i] = True
-            tp += 1
+    for kind, pred_times in pred_by_type.items():
+        target_times = target_by_type.get(kind, [])
+        pred_times.sort()
+        target_times.sort()
+        pred_i = 0
+        target_i = 0
+        while pred_i < len(pred_times) and target_i < len(target_times):
+            pred_time = pred_times[pred_i]
+            target_time = target_times[target_i]
+            if pred_time < target_time - tolerance_sec - 1e-9:
+                pred_i += 1
+            elif target_time < pred_time - tolerance_sec - 1e-9:
+                target_i += 1
+            else:
+                tp += 1
+                pred_i += 1
+                target_i += 1
     return tp, len(pred_events), len(target_events)
 
 
@@ -94,6 +104,7 @@ def _self_check():
     tap = _note_type(tap_plain)
     assert _match_events([(1.01, tap), (1.01, tap)], [(1.0, tap)], 0.01) == (1, 2, 1)
     assert _match_events([(1.011, tap)], [(1.0, tap)], 0.01) == (0, 1, 1)
+    assert _match_events([(0.010, tap), (0.020, tap)], [(0.000, tap), (0.019, tap)], 0.011) == (2, 2, 2)
 
 
 if __name__ == "__main__":

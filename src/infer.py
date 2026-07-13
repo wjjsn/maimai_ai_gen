@@ -50,7 +50,7 @@ def _nonnegative_float_arg(value: str) -> float:
 
 def load_model(ckpt_path: str | Path, device: torch.device) -> tuple[Whisper, ModelDimensions]:
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if ckpt.get("checkpoint_version") != 3 or ckpt.get("model_kind") != "mert-window-decoder-v2":
+    if ckpt.get("checkpoint_version") != 4 or ckpt.get("model_kind") != "mert-window-decoder-v3":
         raise ValueError("检查点来自旧架构，拒绝加载")
     if ckpt.get("feature_signature") != feature_signature():
         raise ValueError("检查点使用的 MERT 特征实现与当前环境不一致")
@@ -110,19 +110,21 @@ def decode_segment(
         audio_mask = torch.ones(mel_slice.shape[0], dtype=torch.bool)
     audio_mask = audio_mask.unsqueeze(0).to(device)
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        audio_features = model.embed_audio(mel)
+        audio_features = model.embed_audio(mel, audio_mask)
 
     tokens = list(prefix_tokens or [SOS])
     prefix_len = len(tokens)
     if len(tokens) >= max_tokens:
         raise ValueError(f"decoder 前缀长度 {len(tokens)} 已达到 max_tokens={max_tokens}")
 
+    kv_cache = model.new_kv_cache(audio_features)
+    dec_input = torch.tensor([tokens], dtype=torch.long, device=device)
+    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+        logits = model.logits(dec_input, audio_features, audio_mask, kv_cache=kv_cache)
+    next_logits = logits[0, -1, :]
+
     stop_reason = "token_budget"
     while len(tokens) < max_tokens - 1:
-        dec_input = torch.tensor([tokens], dtype=torch.long, device=device)  # (1, S)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            logits = model.logits(dec_input, audio_features, audio_mask)   # (1, S, vocab)
-        next_logits = logits[0, -1, :]   # (vocab,)
         if constrained:
             allowed = allowed_tokens(
                 tokens,
@@ -146,6 +148,10 @@ def decode_segment(
             stop_reason = "pad"
             break
         tokens.append(next_token)
+        dec_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+            logits = model.logits(dec_input, audio_features, audio_mask, kv_cache=kv_cache)
+        next_logits = logits[0, 0, :]
 
     raw_new_tokens = len(tokens) - prefix_len
     dropped_tokens = 0

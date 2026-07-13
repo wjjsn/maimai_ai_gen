@@ -24,6 +24,18 @@ class ModelDimensions:
     n_state: int
     n_head: int
     n_layer: int
+    n_audio_adapter_layer: int
+    audio_adapter_kernel: int
+    audio_adapter_dropout: float
+
+
+@dataclass
+class DecoderKVCache:
+    """单个推理窗口的 decoder KV 缓存，不跨窗口复用。"""
+
+    text_len: int
+    self_kv: list[tuple[Tensor, Tensor]]
+    cross_kv: list[Optional[tuple[Tensor, Tensor]]]
 
 
 class LayerNorm(nn.LayerNorm):
@@ -65,24 +77,41 @@ class MultiHeadAttention(nn.Module):
         self,
         x: Tensor,
         xa: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
         key_padding_mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+        mask: Optional[Tensor] = None,
+        is_causal: bool = False,
+        kv_cache: Optional[tuple[Tensor, Tensor]] = None,
+        cache_len: Optional[int] = None,
     ):
         q = self.query(x)
 
-        if kv_cache is None or xa is None or self.key not in kv_cache:
-            # hooks, if installed (i.e. kv_cache is not None), will prepend the cached kv tensors;
-            # otherwise, perform key/value projections for self- or cross-attention as usual.
-            k = self.key(x if xa is None else xa)
-            v = self.value(x if xa is None else xa)
+        if xa is None:
+            k = self.key(x)
+            v = self.value(x)
+            if kv_cache is not None:
+                if cache_len is None:
+                    raise ValueError("self-attention 缓存缺少文本长度")
+                key_cache, value_cache = kv_cache
+                end = cache_len + x.shape[1]
+                if end > key_cache.shape[1]:
+                    raise ValueError("self-attention 缓存容量不足")
+                key_cache[:, cache_len:end].copy_(k)
+                value_cache[:, cache_len:end].copy_(v)
+                k = key_cache[:, :end]
+                v = value_cache[:, :end]
+            new_kv = None
+        elif kv_cache is None:
+            k = self.key(xa)
+            v = self.value(xa)
+            new_kv = (k, v)
         else:
-            # for cross-attention, calculate keys and values once and reuse in subsequent calls.
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+            k, v = kv_cache
+            new_kv = kv_cache
 
-        wv, qk = self.qkv_attention(q, k, v, mask, key_padding_mask)
-        return self.out(wv), qk
+        wv, qk = self.qkv_attention(
+            q, k, v, mask, key_padding_mask, is_causal=is_causal
+        )
+        return self.out(wv), qk, new_kv
 
     def qkv_attention(
         self,
@@ -91,6 +120,7 @@ class MultiHeadAttention(nn.Module):
         v: Tensor,
         mask: Optional[Tensor] = None,
         key_padding_mask: Optional[Tensor] = None,
+        is_causal: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         n_batch, n_ctx, n_state = q.shape
         scale = (n_state // self.n_head) ** -0.25
@@ -107,13 +137,15 @@ class MultiHeadAttention(nn.Module):
                 k,
                 v,
                 attn_mask=attn_mask,
-                is_causal=mask is not None and n_ctx > 1,
+                is_causal=is_causal,
             )
             out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
             qk = None
         else:
             qk = (q * scale) @ (k * scale).transpose(-1, -2)
-            if mask is not None:
+            if is_causal:
+                if mask is None or n_ctx != k.shape[-2]:
+                    raise ValueError("causal attention 的 query/key 长度不一致")
                 qk = qk + mask[:n_ctx, :n_ctx]
             if key_padding_mask is not None:
                 qk = qk.masked_fill(~key_padding_mask[:, None, None, :], float("-inf"))
@@ -150,18 +182,45 @@ class ResidualAttentionBlock(nn.Module):
         xa: Optional[Tensor] = None,
         mask: Optional[Tensor] = None,
         xa_mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+        self_kv: Optional[tuple[Tensor, Tensor]] = None,
+        cross_kv: Optional[tuple[Tensor, Tensor]] = None,
+        cache_len: Optional[int] = None,
     ):
-        x = x + self.attn(self.attn_ln(x), mask=mask, kv_cache=kv_cache)[0]
+        x = x + self.attn(
+            self.attn_ln(x),
+            mask=mask,
+            is_causal=cache_len is None or cache_len == 0,
+            kv_cache=self_kv,
+            cache_len=cache_len,
+        )[0]
+        new_cross_kv = None
         if self.cross_attn:
-            x = x + self.cross_attn(
+            cross, _, new_cross_kv = self.cross_attn(
                 self.cross_attn_ln(x),
                 xa,
                 key_padding_mask=xa_mask,
-                kv_cache=kv_cache,
-            )[0]
+                kv_cache=cross_kv,
+            )
+            x = x + cross
         x = x + self.mlp(self.mlp_ln(x))
-        return x
+        return x, new_cross_kv
+
+
+class AudioAdapterBlock(nn.Module):
+    """保留 MERT 帧率的轻量局部节奏适配器。"""
+
+    def __init__(self, n_state: int, kernel_size: int, dropout: float):
+        super().__init__()
+        self.norm = LayerNorm(n_state)
+        self.depthwise = nn.Conv1d(
+            n_state, n_state, kernel_size, padding=kernel_size // 2, groups=n_state
+        )
+        self.pointwise = Linear(n_state, n_state)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        local = self.depthwise(self.norm(x).transpose(1, 2)).transpose(1, 2)
+        return x + self.dropout(self.pointwise(F.gelu(local)))
 
 
 class TextDecoder(nn.Module):
@@ -190,7 +249,7 @@ class TextDecoder(nn.Module):
         x: Tensor,
         xa: Tensor,
         xa_mask: Optional[Tensor] = None,
-        kv_cache: Optional[dict] = None,
+        kv_cache: Optional[DecoderKVCache] = None,
     ):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_ctx)
@@ -208,15 +267,48 @@ class TextDecoder(nn.Module):
                 )
             if not xa_mask.any(dim=1).all():
                 raise ValueError("每个音频窗口必须至少包含一个真实 MERT 帧")
-        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        offset = 0 if kv_cache is None else kv_cache.text_len
+        if offset + x.shape[1] > self.positional_embedding.shape[0]:
+            raise ValueError("decoder token 长度超过上下文上限")
+        if kv_cache is not None:
+            if x.shape[0] != kv_cache.self_kv[0][0].shape[0]:
+                raise ValueError("decoder 缓存 batch 大小不匹配")
+            if x.device != kv_cache.self_kv[0][0].device:
+                raise ValueError("decoder 缓存的设备或类型不匹配")
+            if offset and x.shape[1] != 1:
+                raise ValueError("已有 decoder 缓存时每次只能输入一个 token")
+            for layer_i, (self_k, self_v) in enumerate(kv_cache.self_kv):
+                if self_k.shape != self_v.shape or self_k.shape[1] != self.positional_embedding.shape[0]:
+                    raise ValueError(f"第 {layer_i} 层 self-attention 缓存形状错误")
+            for layer_i, cross in enumerate(kv_cache.cross_kv):
+                if cross is not None and (
+                    cross[0].shape != cross[1].shape
+                    or cross[0].shape[:2] != xa.shape[:2]
+                ):
+                    raise ValueError(f"第 {layer_i} 层 cross-attention 缓存形状错误")
         x = (
             self.token_embedding(x)
             + self.positional_embedding[offset : offset + x.shape[-1]]
         )
         x = x.to(xa.dtype)
+        if kv_cache is not None and x.dtype != kv_cache.self_kv[0][0].dtype:
+            raise ValueError("decoder 缓存的设备或类型不匹配")
 
-        for block in self.blocks:
-            x = block(x, xa, mask=self.mask, xa_mask=xa_mask, kv_cache=kv_cache)
+        for layer_i, block in enumerate(self.blocks):
+            x, cross_kv = block(
+                x,
+                xa,
+                mask=self.mask,
+                xa_mask=xa_mask,
+                self_kv=None if kv_cache is None else kv_cache.self_kv[layer_i],
+                cross_kv=None if kv_cache is None else kv_cache.cross_kv[layer_i],
+                cache_len=None if kv_cache is None else offset,
+            )
+            if kv_cache is not None:
+                kv_cache.cross_kv[layer_i] = cross_kv
+
+        if kv_cache is not None:
+            kv_cache.text_len += x.shape[1]
 
         x = self.ln(x)
         logits = (
@@ -225,12 +317,33 @@ class TextDecoder(nn.Module):
 
         return logits
 
+    def new_kv_cache(self, batch_size: int, device: torch.device, dtype: torch.dtype) -> DecoderKVCache:
+        shape = (batch_size, self.positional_embedding.shape[0], self.positional_embedding.shape[1])
+        return DecoderKVCache(
+            text_len=0,
+            self_kv=[
+                (torch.empty(shape, device=device, dtype=dtype), torch.empty(shape, device=device, dtype=dtype))
+                for _ in self.blocks
+            ],
+            cross_kv=[None] * len(self.blocks),
+        )
+
 
 class Whisper(nn.Module):
     def __init__(self, dims: ModelDimensions):
         super().__init__()
         self.dims = dims
         self.audio_ln = LayerNorm(self.dims.n_state)
+        self.audio_adapter: Iterable[AudioAdapterBlock] = nn.ModuleList(
+            [
+                AudioAdapterBlock(
+                    self.dims.n_state,
+                    self.dims.audio_adapter_kernel,
+                    self.dims.audio_adapter_dropout,
+                )
+                for _ in range(self.dims.n_audio_adapter_layer)
+            ]
+        )
         self.audio_position = nn.Parameter(
             torch.empty(self.dims.n_audio_ctx, self.dims.n_state)
         )
@@ -243,20 +356,36 @@ class Whisper(nn.Module):
             self.dims.n_layer,
         )
 
-    def embed_audio(self, features: torch.Tensor):
+    def embed_audio(
+        self, features: torch.Tensor, audio_mask: Optional[torch.Tensor] = None
+    ):
         if features.shape[1:] != self.audio_position.shape:
             raise ValueError(
                 f"MERT 特征形状错误: {features.shape[1:]}，需要 {self.audio_position.shape}"
             )
-        return self.audio_ln(features) + self.audio_position.to(features.dtype)
+        if audio_mask is not None:
+            if audio_mask.dtype != torch.bool or audio_mask.shape != features.shape[:2]:
+                raise ValueError("音频 mask 形状或类型错误")
+            # 卷积会访问相邻帧，因此要在适配器前消除 padding 的任意原始值。
+            features = features.masked_fill(~audio_mask.unsqueeze(-1), 0)
+        x = self.audio_ln(features)
+        for block in self.audio_adapter:
+            x = block(x)
+        return x + self.audio_position.to(features.dtype)
 
     def logits(
         self,
         tokens: torch.Tensor,
         audio_features: torch.Tensor,
         audio_mask: Optional[torch.Tensor] = None,
+        kv_cache: Optional[DecoderKVCache] = None,
     ):
-        return self.decoder(tokens, audio_features, xa_mask=audio_mask)
+        return self.decoder(tokens, audio_features, xa_mask=audio_mask, kv_cache=kv_cache)
+
+    def new_kv_cache(self, audio_features: torch.Tensor) -> DecoderKVCache:
+        return self.decoder.new_kv_cache(
+            audio_features.shape[0], audio_features.device, audio_features.dtype
+        )
 
     def forward(
         self,
@@ -264,11 +393,11 @@ class Whisper(nn.Module):
         tokens: torch.Tensor,
         audio_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        return self.decoder(tokens, self.embed_audio(features), xa_mask=audio_mask)
+        return self.decoder(tokens, self.embed_audio(features, audio_mask), xa_mask=audio_mask)
 
 
 def _self_check() -> None:
-    dims = ModelDimensions(100, 3072, 64, 768, 12, 4)
+    dims = ModelDimensions(100, 3072, 64, 768, 12, 4, 2, 5, 0.05)
     model = Whisper(dims)
     audio = torch.randn(2, 100, 768)
     tokens = torch.randint(0, 3072, (2, 16))
@@ -279,9 +408,10 @@ def _self_check() -> None:
     assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
     model.eval()
     audio_mask = torch.ones(2, 100, dtype=torch.bool)
-    audio_mask[:, :10] = False
+    audio_mask[0, :10] = False
+    audio_mask[1, -10:] = False
     changed_padding = audio.clone()
-    changed_padding[:, :10] = 1e4
+    changed_padding[~audio_mask] = 1e4
     with torch.no_grad():
         masked_logits = model(audio, tokens, audio_mask)
         changed_logits = model(changed_padding, tokens, audio_mask)
@@ -290,6 +420,45 @@ def _self_check() -> None:
         fallback_logits = model(audio, tokens, audio_mask)
         fallback_changed_logits = model(changed_padding, tokens, audio_mask)
     assert torch.allclose(fallback_logits, fallback_changed_logits, atol=1e-5, rtol=1e-5)
+
+    def check_cached_logits() -> None:
+        with torch.no_grad():
+            audio_features = model.embed_audio(audio, audio_mask)
+            reference = model.logits(tokens, audio_features, audio_mask)
+            cache = model.new_kv_cache(audio_features)
+            prefix_len = 5
+            parts = [model.logits(tokens[:, :prefix_len], audio_features, audio_mask, cache)]
+            for token_i in range(prefix_len, tokens.shape[1]):
+                parts.append(
+                    model.logits(tokens[:, token_i : token_i + 1], audio_features, audio_mask, cache)
+                )
+            cached = torch.cat(parts, dim=1)
+            assert cache.text_len == tokens.shape[1]
+            assert all(k.shape == v.shape == (2, 64, 768) for k, v in cache.self_kv)
+            assert all(kv is not None and kv[0].shape == kv[1].shape == (2, 100, 768) for kv in cache.cross_kv)
+            # 不同 query 长度的 SDPA 归约顺序略有不同，但 greedy 结果必须一致。
+            assert torch.allclose(reference, cached, atol=3e-4, rtol=3e-4)
+            assert torch.equal(reference.argmax(dim=-1), cached.argmax(dim=-1))
+
+            changed_features = model.embed_audio(changed_padding, audio_mask)
+            changed_cache = model.new_kv_cache(changed_features)
+            changed_parts = [model.logits(tokens[:, :prefix_len], changed_features, audio_mask, changed_cache)]
+            for token_i in range(prefix_len, tokens.shape[1]):
+                changed_parts.append(
+                    model.logits(tokens[:, token_i : token_i + 1], changed_features, audio_mask, changed_cache)
+                )
+            assert torch.allclose(cached, torch.cat(changed_parts, dim=1), atol=1e-5, rtol=1e-5)
+
+            try:
+                model.logits(tokens[:, :2], audio_features, audio_mask, cache)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("已有缓存时必须拒绝多个 token")
+
+    check_cached_logits()
+    with disable_sdpa():
+        check_cached_logits()
     print("[model] 自检通过")
 
 

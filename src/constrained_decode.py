@@ -287,6 +287,7 @@ segment；耗尽的 Touch 类型不会继续作为候选暴露。
 """
 
 from dataclasses import dataclass, field
+import time
 from typing import TYPE_CHECKING
 
 from tokenizer import (
@@ -428,12 +429,15 @@ class ConstraintViolation:
     detail: str
 
 
-def validate_frames(frames: list["Frame"]) -> list[ConstraintViolation]:
+def validate_frames(frames: list["Frame"], timeout_sec: float | None = None) -> list[ConstraintViolation]:
     """审计整首解析结果；返回全部违规，调用方据此整曲排除。"""
     violations: list[ConstraintViolation] = []
     state = _ReplayState()
     previous_time = 0
+    deadline = None if timeout_sec is None else time.monotonic() + timeout_sec
     for frame in frames:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"严格规则校验超过 {timeout_sec:g}s")
         time_cs = round(frame.time_sec * 100)
         if time_cs < previous_time:
             violations.append(ConstraintViolation("FRAME_TIME_BACKWARD", frame.time_sec, f"{time_cs} < {previous_time}"))
@@ -442,6 +446,8 @@ def validate_frames(frames: list["Frame"]) -> list[ConstraintViolation]:
         frame_tokens = [SOS, *encode_frame(frame, time_cs / 100.0), EOS]
         frame_valid = True
         for pos, target in enumerate(frame_tokens):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"严格规则校验超过 {timeout_sec:g}s")
             allowed = allowed_tokens(frame_tokens[:pos])
             if target not in allowed:
                 violations.append(ConstraintViolation(

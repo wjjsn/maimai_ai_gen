@@ -9,7 +9,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from chart_cache import ensure_chart_cache
+from chart_cache import require_chart_cache
 from config import CONFIG
 from maidata_parser import compiler
 from tokenizer import EOS, FRAME_END, FRAME_START, SOS, encode_frame, rotate_token_id, rotate_tokens
@@ -326,13 +326,12 @@ class ChartDataset(Dataset):
         if self.cache_dir.exists() and not self.cache_dir.is_dir():
             raise ValueError(f"梅尔缓存路径不是目录: {self.cache_dir}")
 
-        cache_path = ensure_chart_cache(
+        cache_path = require_chart_cache(
             self.charts_dir,
             self.cache_dir,
             level_idx=level_idx,
             stride_sec=stride_sec,
             mert_frames=mert_frames,
-            build_mel=valid_pairs is None,
         )
         all_index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir)
         all_valid = list(zip(all_index.chart_paths, all_index.mel_paths))

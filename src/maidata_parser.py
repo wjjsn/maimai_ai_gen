@@ -365,8 +365,7 @@ class compiler:
         if kind in self._warned:
             return
         self._warned.add(kind)
-        level = "警告: " if warning else ""
-        print(f"[maidata-parser] {level}歌曲={self.chart.title!r} {message}")
+        # 批量索引由调用方汇总这些可恢复兼容处理，避免逐首刷屏。
 
     # ── note parsing ──────────────────────────────────────────────────────
 
@@ -401,8 +400,7 @@ class compiler:
         """Parse note token, normalizing pseudo-EACH (`` ` ``) to ordinary EACH."""
         if not token or token == "E":
             return None
-        if "`" in token:
-            self._log_once("pseudo-each", f"伪 EACH 已合并为普通 EACH，示例: {token}")
+        # 反引号是伪 EACH 分隔符，和普通 EACH 一样拆分，不需要额外日志。
         parts = re.split(r"[/`]", token)
         notes: list[Note] = []
         for part in parts:
@@ -430,8 +428,7 @@ class compiler:
             token = token[:bracket.start()]
         if any(ch not in "bx$" for ch in token[1:]):
             raise ValueError(f"TAP 含未知修饰符: {token}")
-        if "$" in token:
-            self._log_once("star-tap", f"星形 TAP 已归一化为普通 TAP，示例: {token}")
+        # 星形标记不改变 TAP 的内部表达，直接归一化。
         lane = _lane(token[0])
         is_break = "b" in token
         is_ex = "x" in token
@@ -451,8 +448,7 @@ class compiler:
                 isEx=is_ex,
             )
         else:
-            # pseudo-hold (no bracket): treat as TAP
-            self._log_once("pseudo-hold", f"伪 HOLD 已归一化为 TAP，示例: {token}")
+            # 无时长的伪 HOLD 按 TAP 归一化。
             return Note(
                 type=NoteType.TAP,
                 data=lane,
@@ -483,8 +479,7 @@ class compiler:
                     data=Touch_data(Touch_area=area, isFirework=has_f, holdTime=hold_sec),
                 )
             else:
-                # pseudo-touch-hold (no bracket): treat as TOUCH
-                self._log_once("pseudo-touch-hold", f"伪 TOUCH HOLD 已归一化为 TOUCH，示例: {token}")
+                # 无时长的伪 TOUCH HOLD 按 TOUCH 归一化。
                 return Note(
                     type=NoteType.TOUCH,
                     data=Touch_data(Touch_area=area, isFirework=has_f),

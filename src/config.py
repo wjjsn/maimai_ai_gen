@@ -25,6 +25,9 @@ class MertConfig:
     cache_float16: bool
     audio_workers: int
     batch_size: int
+    cache_max_bytes: int
+    preflight_workers: int
+    validation_timeout_sec: float
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,9 @@ class ModelConfig:
     state: int
     head: int
     layer: int
+    audio_adapter_layers: int
+    audio_adapter_kernel: int
+    audio_adapter_dropout: float
     max_tokens: int
 
 
@@ -56,6 +62,7 @@ class TrainingConfig:
     learning_rate: float
     weight_decay: float
     val_ratio: float
+    test_ratio: float
     grad_clip: float
     early_stop_patience: int
     label_smoothing: float
@@ -73,6 +80,19 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class ExperimentConfig:
+    enabled: bool
+    name: str
+    train_charts: int
+    val_charts: int
+    test_charts: int
+    max_updates: int
+    validate_every_updates: int
+    generation_val_charts: int
+    audio_ablation_charts: int
+
+
+@dataclass(frozen=True)
 class InferenceConfig:
     checkpoint: Path
     level_idx: int
@@ -86,6 +106,7 @@ class AppConfig:
     window: WindowConfig
     model: ModelConfig
     training: TrainingConfig
+    experiment: ExperimentConfig
     inference: InferenceConfig
 
 
@@ -102,6 +123,9 @@ SECTIONS = {
         "缓存半精度": "cache_float16",
         "音频工作线程数": "audio_workers",
         "最大批大小": "batch_size",
+        "允许最大的缓存大小": "cache_max_bytes",
+        "谱面预检进程数": "preflight_workers",
+        "严格规则校验超时秒": "validation_timeout_sec",
     }),
     "滑窗": (WindowConfig, {
         "MERT帧数": "mert_frames",
@@ -115,6 +139,9 @@ SECTIONS = {
         "状态维度": "state",
         "注意力头数": "head",
         "层数": "layer",
+        "音频适配器层数": "audio_adapter_layers",
+        "音频适配器卷积核": "audio_adapter_kernel",
+        "音频适配器丢弃率": "audio_adapter_dropout",
         "最大词元数": "max_tokens",
     }),
     "训练": (TrainingConfig, {
@@ -127,6 +154,7 @@ SECTIONS = {
         "学习率": "learning_rate",
         "权重衰减": "weight_decay",
         "验证集比例": "val_ratio",
+        "测试集比例": "test_ratio",
         "梯度裁剪": "grad_clip",
         "提前停止耐心轮数": "early_stop_patience",
         "标签平滑": "label_smoothing",
@@ -141,6 +169,17 @@ SECTIONS = {
         "音频增强概率": "audio_augment_probability",
         "特征噪声强度": "feature_noise_std",
         "最大时间遮挡帧数": "max_time_mask_frames",
+    }),
+    "实验": (ExperimentConfig, {
+        "启用": "enabled",
+        "名称": "name",
+        "训练歌曲数": "train_charts",
+        "验证歌曲数": "val_charts",
+        "测试歌曲数": "test_charts",
+        "最大更新次数": "max_updates",
+        "验证间隔更新次数": "validate_every_updates",
+        "整曲验证歌曲数": "generation_val_charts",
+        "音频消融歌曲数": "audio_ablation_charts",
     }),
     "推理": (InferenceConfig, {
         "检查点": "checkpoint",
@@ -163,6 +202,17 @@ def _is_type(value: Any, expected: Any) -> bool:
     return isinstance(value, expected)
 
 
+def _byte_size(value: Any) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        suffix = value[-1:].upper()
+        factors = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+        if suffix in factors and value[:-1].isdigit():
+            return int(value[:-1]) * factors[suffix]
+    raise TypeError(f"缓存大小必须是正整数或 K/M/G 整数单位: {value!r}")
+
+
 def _load_section(raw: dict, section_name: str):
     cls, key_map = SECTIONS[section_name]
     section = raw.get(section_name)
@@ -177,6 +227,8 @@ def _load_section(raw: dict, section_name: str):
     for yaml_key, field_name in key_map.items():
         value = section[yaml_key]
         expected = hints[field_name]
+        if field_name == "cache_max_bytes":
+            value = _byte_size(value)
         if not _is_type(value, expected):
             raise TypeError(f"配置 {section_name}.{yaml_key} 类型错误: {value!r}")
         if expected is Path or (get_origin(expected) is not None and Path in get_args(expected)):
@@ -208,6 +260,7 @@ def _validate_config(config: AppConfig) -> None:
         (training.learning_rate, "训练.学习率"),
         (training.weight_decay, "训练.权重衰减"),
         (training.val_ratio, "训练.验证集比例"),
+        (training.test_ratio, "训练.测试集比例"),
         (training.grad_clip, "训练.梯度裁剪"),
         (training.label_smoothing, "训练.标签平滑"),
         (training.eos_loss_weight, "训练.结束词元损失权重"),
@@ -221,6 +274,9 @@ def _validate_config(config: AppConfig) -> None:
     _require(mert.context_sec * 2 < mert.chunk_sec, "配置 MERT.上下文秒数的两倍必须小于分块秒数")
     _require(mert.audio_workers > 0, "配置 MERT.音频工作线程数 必须大于 0")
     _require(mert.batch_size > 0, "配置 MERT.最大批大小 必须大于 0")
+    _require(mert.cache_max_bytes > 0, "配置 MERT.允许最大的缓存大小 必须大于 0")
+    _require(mert.preflight_workers > 0, "配置 MERT.谱面预检进程数 必须大于 0")
+    _require(math.isfinite(mert.validation_timeout_sec) and mert.validation_timeout_sec > 0, "配置 MERT.严格规则校验超时秒 必须大于 0")
 
     _require(window.mert_frames > 0, "配置 滑窗.MERT帧数 必须大于 0")
     _require(window.prefix_start_sec >= 0, "配置 滑窗.前缀开始秒 不能小于 0")
@@ -246,6 +302,7 @@ def _validate_config(config: AppConfig) -> None:
         (model.state, "状态维度"),
         (model.head, "注意力头数"),
         (model.layer, "层数"),
+        (model.audio_adapter_kernel, "音频适配器卷积核"),
         (model.max_tokens, "最大词元数"),
     ):
         _require(value > 0, f"配置 模型.{name} 必须大于 0")
@@ -255,6 +312,9 @@ def _validate_config(config: AppConfig) -> None:
         "配置 模型.状态维度 必须能被 注意力头数 整除",
     )
     _require(model.max_tokens >= 2, "配置 模型.最大词元数 至少为 2，才能容纳开始和结束词元")
+    _require(model.audio_adapter_layers >= 0, "配置 模型.音频适配器层数 不能小于 0")
+    _require(model.audio_adapter_kernel % 2 == 1, "配置 模型.音频适配器卷积核 必须是奇数")
+    _require(0 <= model.audio_adapter_dropout < 1, "配置 模型.音频适配器丢弃率 必须大于等于 0 且小于 1")
 
     _require(0 <= training.level_idx <= 6, "配置 训练.难度编号 必须在 0 到 6 之间")
     _require(training.batch_size > 0, "配置 训练.批大小 必须大于 0")
@@ -264,6 +324,8 @@ def _validate_config(config: AppConfig) -> None:
     _require(training.learning_rate > 0, "配置 训练.学习率 必须大于 0")
     _require(training.weight_decay >= 0, "配置 训练.权重衰减 不能小于 0")
     _require(0 < training.val_ratio < 1, "配置 训练.验证集比例 必须大于 0 且小于 1")
+    _require(0 < training.test_ratio < 1, "配置 训练.测试集比例 必须大于 0 且小于 1")
+    _require(training.val_ratio + training.test_ratio < 1, "配置 训练.验证集比例与测试集比例之和必须小于 1")
     _require(training.grad_clip > 0, "配置 训练.梯度裁剪 必须大于 0")
     _require(training.early_stop_patience > 0, "配置 训练.提前停止耐心轮数 必须大于 0")
     _require(0 <= training.label_smoothing < 1, "配置 训练.标签平滑 必须大于等于 0 且小于 1")
@@ -276,6 +338,18 @@ def _validate_config(config: AppConfig) -> None:
     _require(0 <= training.audio_augment_probability <= 1, "配置 训练.音频增强概率 必须在 0 到 1 之间")
     _require(training.feature_noise_std >= 0, "配置 训练.特征噪声强度 不能小于 0")
     _require(training.max_time_mask_frames >= 0, "配置 训练.最大时间遮挡帧数 不能小于 0")
+    experiment = config.experiment
+    _require(experiment.name and all(c.isalnum() or c in "_-" for c in experiment.name), "配置 实验.名称 只能包含字母、数字、下划线和连字符")
+    for value, name in (
+        (experiment.train_charts, "训练歌曲数"),
+        (experiment.val_charts, "验证歌曲数"),
+        (experiment.test_charts, "测试歌曲数"),
+        (experiment.max_updates, "最大更新次数"),
+        (experiment.validate_every_updates, "验证间隔更新次数"),
+        (experiment.generation_val_charts, "整曲验证歌曲数"),
+        (experiment.audio_ablation_charts, "音频消融歌曲数"),
+    ):
+        _require(value > 0, f"配置 实验.{name} 必须大于 0")
     _require(0 <= inference.level_idx <= 6, "配置 推理.难度编号 必须在 0 到 6 之间")
     _require(inference.start_sec >= 0, "配置 推理.开始秒 不能小于 0")
 
@@ -300,6 +374,9 @@ def inference_checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | 
             "状态维度": config.model.state,
             "注意力头数": config.model.head,
             "层数": config.model.layer,
+            "音频适配器层数": config.model.audio_adapter_layers,
+            "音频适配器卷积核": config.model.audio_adapter_kernel,
+            "音频适配器丢弃率": config.model.audio_adapter_dropout,
             "最大词元数": config.model.max_tokens,
         },
     }
@@ -312,6 +389,7 @@ def checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | float]]:
         "难度编号": config.training.level_idx,
         "训练步进秒": config.window.train_stride_sec,
         "验证集比例": config.training.val_ratio,
+        "测试集比例": config.training.test_ratio,
         "随机种子": config.training.seed,
         "过拟合歌曲数": config.training.overfit_charts,
         "旋转增强数": config.training.rotations,
@@ -361,7 +439,11 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if unknown or missing:
         raise ValueError(f"配置分组错误: 缺少={sorted(missing)} 未知={sorted(unknown)}")
     loaded = {name: _load_section(raw, name) for name in SECTIONS}
-    config = AppConfig(*loaded.values())
+    config = AppConfig(**{
+        "paths": loaded["路径"], "mert": loaded["MERT"], "window": loaded["滑窗"],
+        "model": loaded["模型"], "training": loaded["训练"],
+        "experiment": loaded["实验"], "inference": loaded["推理"],
+    })
     _validate_config(config)
     return config
 

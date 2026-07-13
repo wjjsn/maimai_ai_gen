@@ -235,6 +235,19 @@ def _cache_is_current(out: Path, expected: dict) -> bool:
         return False
 
 
+def _cache_is_usable(out: Path, hidden_size: int) -> bool:
+    """旧签名不一致时仍复用可读的冻结特征，避免无意全量重提取。"""
+    try:
+        features = np.load(out, mmap_mode="r")
+        return features.ndim == 2 and features.shape[0] > 0 and features.shape[1] == hidden_size
+    except (OSError, ValueError):
+        return False
+
+
+def _cache_size(cache_dir: Path) -> int:
+    return sum(path.stat().st_size for path in cache_dir.iterdir() if path.is_file())
+
+
 def _write_cache(out: Path, features: np.ndarray, expected: dict) -> None:
     metadata_path = out.with_suffix(".json")
     temp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
@@ -251,29 +264,43 @@ def process_one(chart_dir: Path, rel_path: str, cache_dir: Path, device, process
     out = cache_dir / f"{cache_key(rel_path)}.npy"
     track = chart_dir / "track.mp3"
     expected = _expected(track, feature_signature(), processor.sampling_rate, model.config.hidden_size)
-    if _cache_is_current(out, expected):
+    if _cache_is_usable(out, model.config.hidden_size):
         return out, False
     features = extract_audio_features(track, device, processor, model)
     _write_cache(out, features, expected)
     return out, True
 
 
-def main(charts_dir=CONFIG.paths.charts_dir, cache_dir=CACHE_DIR):
+def main(
+    charts_dir=CONFIG.paths.charts_dir,
+    cache_dir=CACHE_DIR,
+    allowed_rel_paths: set[str] | None = None,
+):
     charts_dir, cache_dir = Path(charts_dir), Path(cache_dir)
     cache_dir.mkdir(exist_ok=True, parents=True)
     signature = feature_signature()
+    cache_size = _cache_size(cache_dir)
+    cache_limit = CONFIG.mert.cache_max_bytes
     pending = []
     for chart_dir, _dirs, files in charts_dir.walk():
         if "track.mp3" not in files or "maidata.txt" not in files:
             continue
         rel = str(chart_dir.relative_to(charts_dir))
+        if allowed_rel_paths is not None and rel not in allowed_rel_paths:
+            continue
         out = cache_dir / f"{cache_key(rel)}.npy"
         expected = _expected(chart_dir / "track.mp3", signature, 24000, CONFIG.model.state)
-        if not _cache_is_current(out, expected):
+        if not _cache_is_usable(out, CONFIG.model.state):
             pending.append((chart_dir, rel, out, expected))
     if not pending:
-        print("[mert-cache] 全部命中，无需加载 MERT 模型")
+        print("[mert-cache] 完成: 全部可复用，无需提取")
         return 0, 0
+    if cache_size >= cache_limit:
+        print(
+            f"[mert-cache] 缓存已达上限 {cache_limit / 1024 ** 3:.0f}G；"
+            f"跳过 {len(pending)} 首缺失特征"
+        )
+        return 0, len(pending)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     processor, model = load_mert(device)
@@ -284,28 +311,29 @@ def main(charts_dir=CONFIG.paths.charts_dir, cache_dir=CACHE_DIR):
     audio_seconds = 0.0
     gpu_seconds = 0.0
     write_seconds = 0.0
+    capacity_skipped = 0
+    capacity_reached = False
     started = time.perf_counter()
     workers = CONFIG.mert.audio_workers
-    print(f"[mert-cache] 重建 {len(pending)} 首，CPU workers={workers}，MERT batch<={CONFIG.mert.batch_size}")
-    tasks = iter(pending)
+    tasks = deque(pending)
     futures: dict[concurrent.futures.Future, tuple[Path, str, Path, dict]] = {}
     ready: deque[tuple[Path, str, Path, dict, np.ndarray]] = deque()
     # torchaudio 的解码和重采样在原生代码中执行；线程可与单卡推理并行，
     # 也不会因 train.py 的模块级入口被 spawn 子进程重复执行。
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor, tqdm(
-        total=len(pending), desc="[mert-cache] 重建", unit="首"
+        total=len(pending), desc="[mert-cache] 提取", unit="首"
     ) as progress:
         def submit_available() -> None:
             while len(futures) < workers * 2:
                 try:
-                    chart_dir, rel, out, expected = next(tasks)
-                except StopIteration:
+                    chart_dir, rel, out, expected = tasks.popleft()
+                except IndexError:
                     return
                 future = executor.submit(_load_prepared_audio, str(chart_dir / "track.mp3"), processor.sampling_rate)
                 futures[future] = (chart_dir, rel, out, expected)
 
         submit_available()
-        while futures or ready:
+        while (futures or ready) and not capacity_reached:
             if not ready:
                 done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
                 for future in done:
@@ -331,9 +359,20 @@ def main(charts_dir=CONFIG.paths.charts_dir, cache_dir=CACHE_DIR):
                     torch.cuda.synchronize()
                 gpu_seconds += time.perf_counter() - gpu_started
                 dtype = np.float16 if CONFIG.mert.cache_float16 else np.float32
+                features = features.astype(dtype, copy=False)
+                # npy 头和 JSON 元数据很小，预留 1 KiB 保证不会越过配置上限。
+                if cache_size + features.nbytes + 1024 > cache_limit:
+                    capacity_skipped += 1 + len(tasks) + len(futures) + len(ready)
+                    progress.update(capacity_skipped)
+                    tasks.clear()
+                    futures.clear()
+                    ready.clear()
+                    capacity_reached = True
+                    continue
                 write_started = time.perf_counter()
-                _write_cache(out, features.astype(dtype, copy=False), expected)
+                _write_cache(out, features, expected)
                 write_seconds += time.perf_counter() - write_started
+                cache_size += out.stat().st_size + out.with_suffix(".json").stat().st_size
                 count += 1
                 progress.update()
             except Exception as error:
@@ -343,7 +382,7 @@ def main(charts_dir=CONFIG.paths.charts_dir, cache_dir=CACHE_DIR):
 
     elapsed = time.perf_counter() - started
     print(
-        f"[mert-cache] 完成: {count} 首，跳过 {skipped} 首，用时 {elapsed:.1f}s；"
+        f"[mert-cache] 完成: {count} 首，错误跳过 {skipped} 首，容量跳过 {capacity_skipped} 首，用时 {elapsed:.1f}s；"
         f"CPU音频累计 {audio_seconds:.1f}s，GPU累计 {gpu_seconds:.1f}s，写入累计 {write_seconds:.1f}s"
     )
     return count, skipped
