@@ -2,6 +2,7 @@
 
 import subprocess
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -64,9 +65,18 @@ def _time_stretch(waveform: torch.Tensor, speed: float) -> torch.Tensor:
     return torch.istft(torchaudio.functional.phase_vocoder(spectrum, speed, phase), n_fft=n_fft, hop_length=hop_length, window=window, length=max(1, round(waveform.shape[-1] / speed)))
 
 
+def _pitch_shift(waveform: torch.Tensor, sample_rate: int, steps: float) -> torch.Tensor:
+    if abs(steps) < 1e-6:
+        return waveform
+    ratio = Fraction(2.0 ** (-steps / 12)).limit_denominator(1_000)
+    stretched = _time_stretch(waveform, float(ratio))
+    shifted = torchaudio.functional.resample(stretched, ratio.denominator, ratio.numerator)
+    return torch.nn.functional.pad(shifted[..., :waveform.shape[-1]], (0, max(0, waveform.shape[-1] - shifted.shape[-1])))
+
+
 def _augment_waveform(waveform: torch.Tensor, augmentation: AudioAugmentation, sample_rate: int) -> torch.Tensor:
     if augmentation.pitch_steps:
-        waveform = torchaudio.functional.pitch_shift(waveform, sample_rate, augmentation.pitch_steps, n_fft=512, hop_length=128)
+        waveform = _pitch_shift(waveform, sample_rate, augmentation.pitch_steps)
     waveform = _time_stretch(waveform, augmentation.speed)
     if augmentation.noise_std:
         waveform = waveform + torch.randn_like(waveform) * augmentation.noise_std
@@ -141,4 +151,7 @@ def _self_check() -> None:
     features = np.array([[0.0], [10.0]], dtype=np.float32)
     aligned = _interpolate_to_chart_axis(features, np.array([0.01, 0.03]), 2400, 24000)
     assert aligned.shape == (21, 1) and np.allclose(aligned[[0, 4, -1], 0], (0, 5, 10))
+    waveform = torch.randn(1, 2_400)
+    shifted = _pitch_shift(waveform, 24_000, -0.282670927)
+    assert shifted.shape == waveform.shape
     print("[audio-features] 自检通过")
