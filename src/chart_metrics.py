@@ -20,6 +20,7 @@ class SongMetrics:
     title: str
     level_query: float | None
     active_frames: int
+    note_intervals_sec: list[float]
     type_means: dict[str, float]
     type_medians: dict[str, float]
     note_counts: dict[str, int]
@@ -108,10 +109,12 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
     for kind, indices in start_counts.items():
         counts = Counter(indices)
         starts_by_type[kind] = list(counts.values())
+    note_times = sorted({frame.time_sec for frame in frames if frame.notes})
     return SongMetrics(
         title=title,
         level_query=level_query,
         active_frames=length,
+        note_intervals_sec=[right - left for left, right in zip(note_times, note_times[1:])],
         type_means={name: float(axis.mean()) for name, axis in axes.items()},
         type_medians={name: float(np.median(axis)) for name, axis in axes.items()},
         note_counts=note_counts,
@@ -138,6 +141,32 @@ def _print_difficulty_metrics(songs: list[SongMetrics]) -> None:
         for kind, label in (("tap", "Tap/Touch"), ("hold", "Hold/Touch Hold"), ("slide", "Slide"), ("total", "总音符")):
             counts = [song.note_counts[kind] for song in group]
             print(f"{label}: 平均={_format(mean(counts))} 中位数={_format(median(counts))}")
+        intervals = [value for song in group for value in song.note_intervals_sec]
+        if intervals:
+            print(f"相邻音符间隔(秒): 平均={_format(mean(intervals))} 中位数={_format(median(intervals))}")
+        else:
+            print("相邻音符间隔(秒): 无相邻音符")
+
+
+def format_level_summary(items: list[tuple[float | None, list[Frame]]]) -> list[str]:
+    """按浮点等级汇总生成谱面的音符数量和相邻音符间隔。"""
+    groups: dict[float | None, list[tuple[int, list[float]]]] = defaultdict(list)
+    for level_query, frames in items:
+        note_count = sum(len(frame.notes) for frame in frames)
+        times = sorted({frame.time_sec for frame in frames if frame.notes})
+        groups[level_query].append((note_count, [right - left for left, right in zip(times, times[1:])]))
+    lines = []
+    for difficulty, songs in sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or 0)):
+        label = "未知" if difficulty is None else f"{difficulty:g}"
+        counts = [count for count, _ in songs]
+        intervals = [interval for _, values in songs for interval in values]
+        lines.append(f"  浮点等级 {label}：这一组共有 {len(songs)} 首验证歌曲。")
+        lines.append(f"    生成音符数量：每首平均生成 {mean(counts):.1f} 个；中位数是 {median(counts):.1f} 个。")
+        if intervals:
+            lines.append(f"    相邻音符间隔：相邻两个有音符时间点平均相隔 {mean(intervals):.4f} 秒；中位数相隔 {median(intervals):.4f} 秒。同一时刻的多押不算间隔。")
+        else:
+            lines.append("    相邻音符间隔：没有两个不同时间点的音符，因此暂时无法计算间隔。")
+    return lines or ["  验证集中没有可用于生成统计的歌曲。"]
 
 
 def _histogram_median(histogram: Counter[int]) -> float:
@@ -237,6 +266,7 @@ def _self_check() -> None:
     assert metrics.slide_frames[1] == 140 and metrics.slide_frames[2] == 160
     assert metrics.note_counts == {"tap": 0, "hold": 1, "slide": 2, "total": 3}
     assert metrics.type_means["hold"] > 0 and metrics.type_medians["total"] >= 1
+    assert format_level_summary([(13.5, [Frame((Note(NoteType.TAP, TapType.LANE1),), 0.0), Frame((Note(NoteType.TAP, TapType.LANE2),), 0.5)])])[-1] == "    相邻音符间隔：相邻两个有音符时间点平均相隔 0.5000 秒；中位数相隔 0.5000 秒。同一时刻的多押不算间隔。"
     print("[chart-metrics] 自检通过")
 
 

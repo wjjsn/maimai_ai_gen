@@ -81,7 +81,7 @@ class TrainingConfig:
     generation_interval: int
     overfit_charts: int
     short_loss_weight: float
-    max_long_pos_weight: float
+    wrong_loss_weight: float
 
 
 @dataclass(frozen=True)
@@ -137,7 +137,7 @@ SECTIONS = {
         "提前停止耐心轮数": "early_stop_patience", "学习率退火周期": "lr_t_max",
         "随机种子": "seed", "整曲验证歌曲数": "val_gen_charts", "整曲验证间隔": "generation_interval",
         "过拟合歌曲数": "overfit_charts", "短音损失权重": "short_loss_weight",
-        "长音正样本权重上限": "max_long_pos_weight",
+        "预测错误损失权重": "wrong_loss_weight",
     }),
     "推理": (InferenceConfig, {
         "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
@@ -222,7 +222,7 @@ def _validate(config: AppConfig) -> None:
     _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
     _require(training.grad_clip > 0 and training.early_stop_patience > 0 and training.lr_t_max > 0, "训练控制参数无效")
     _require(training.val_gen_charts >= 0 and training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
-    _require(training.short_loss_weight > 0 and training.max_long_pos_weight >= 1, "损失权重无效")
+    _require(training.short_loss_weight > 0 and training.wrong_loss_weight >= 1, "损失权重无效")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
     _require(0 <= inference.long_threshold <= 1, "持续音阈值必须在 [0, 1] 内")
     _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")

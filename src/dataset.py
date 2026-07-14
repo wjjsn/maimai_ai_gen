@@ -18,6 +18,7 @@ from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK
 class SongEntry:
     chart_path: Path
     audio_path: Path
+    level_query: float | None
 
 
 def _target_scale() -> np.ndarray:
@@ -105,7 +106,7 @@ def discover_songs(charts_dir: Path, level_idx: int) -> tuple[list[SongEntry], l
             validate_chart_audio_alignment(chart, audio_duration_sec, level_idx)
             length = max(1, round(audio_duration_sec * CONFIG.audio.frames_per_sec) + 1)
             chart_to_targets(chart, length, level_idx)
-            entries.append(SongEntry(chart_path, audio_path))
+            entries.append(SongEntry(chart_path, audio_path, chart.all_levels[level_idx].level_query))
         except Exception as error:
             skipped.append(f"{relative}: {error}")
     return entries, skipped
