@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from statistics import mean, median
 
 import numpy as np
@@ -18,6 +19,7 @@ RATE = 200
 @dataclass
 class SongMetrics:
     title: str
+    level_idx: int
     level_query: float | None
     active_frames: int
     note_intervals_sec: list[float]
@@ -58,7 +60,7 @@ def _add_interval(axis: np.ndarray, start: int, end: int, first: int) -> None:
         axis[clipped_start - first:clipped_end - first] += 1
 
 
-def analyze_level(title: str, level_query: float | None, frames: list[Frame]) -> SongMetrics:
+def analyze_level(title: str, level_idx: int, level_query: float | None, frames: list[Frame]) -> SongMetrics:
     if not frames:
         raise ValueError("谱面没有音符")
     first = min(_index(frame.time_sec) for frame in frames)
@@ -112,6 +114,7 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
     note_times = sorted({frame.time_sec for frame in frames if frame.notes})
     return SongMetrics(
         title=title,
+        level_idx=level_idx,
         level_query=level_query,
         active_frames=length,
         note_intervals_sec=[right - left for left, right in zip(note_times, note_times[1:])],
@@ -130,22 +133,33 @@ def _format(value: float) -> str:
     return f"{value:.6f}"
 
 
-def _print_difficulty_metrics(songs: list[SongMetrics]) -> None:
-    groups: dict[float | None, list[SongMetrics]] = defaultdict(list)
-    for song in songs:
-        groups[song.level_query].append(song)
-    print("\n按浮点难度的单曲音符总出现次数统计")
-    for difficulty, group in sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or 0)):
-        label = "未知" if difficulty is None else f"{difficulty:g}"
-        print(f"\n浮点难度={label} 有效歌曲={len(group)}")
-        for kind, label in (("tap", "Tap/Touch"), ("hold", "Hold/Touch Hold"), ("slide", "Slide"), ("total", "总音符")):
+def _print_note_count_groups(title: str, groups: dict[object, list[SongMetrics]], labels: dict[object, str] | None = None) -> None:
+    print(f"\n{title}")
+    for key, group in sorted(groups.items(), key=lambda item: (item[0] is None, item[0])):
+        label = labels[key] if labels is not None else ("未知" if key is None else f"{key:g}")
+        print(f"\n难度={label} 有效歌曲={len(group)}")
+        for kind, note_label in (("tap", "Tap/Touch"), ("hold", "Hold/Touch Hold"), ("slide", "Slide"), ("total", "总音符")):
             counts = [song.note_counts[kind] for song in group]
-            print(f"{label}: 平均={_format(mean(counts))} 中位数={_format(median(counts))}")
+            print(f"{note_label}: 平均={_format(mean(counts))} 中位数={_format(median(counts))}")
         intervals = [value for song in group for value in song.note_intervals_sec]
         if intervals:
             print(f"相邻音符间隔(秒): 平均={_format(mean(intervals))} 中位数={_format(median(intervals))}")
         else:
             print("相邻音符间隔(秒): 无相邻音符")
+
+
+def _print_difficulty_metrics(all_level_songs: list[SongMetrics]) -> None:
+    groups: dict[float | None, list[SongMetrics]] = defaultdict(list)
+    for song in all_level_songs:
+        groups[song.level_query].append(song)
+    _print_note_count_groups("按浮点难度的单曲音符总出现次数统计", groups)
+
+    # maidata 的 lv_1..lv_6 对应 Easy、Basic、Advanced、Expert、Master、Re:Master。
+    names = {0: "未命名", 1: "Easy", 2: "Basic", 3: "Advanced", 4: "Expert", 5: "Master", 6: "Re:Master"}
+    level_groups: dict[int, list[SongMetrics]] = defaultdict(list)
+    for song in all_level_songs:
+        level_groups[song.level_idx].append(song)
+    _print_note_count_groups("按大难度的单曲音符总出现次数统计", level_groups, names)
 
 
 def format_level_summary(items: list[tuple[float | None, list[Frame]]]) -> list[str]:
@@ -205,20 +219,49 @@ def _print_new_start_metrics(songs: list[SongMetrics]) -> None:
             print(f"{label}: 时间点数=0")
 
 
+def _parse_one_level(text: str, level_idx: int):
+    """隔离解析一个难度，避免其他难度的坏谱面丢弃其有效统计。"""
+    filtered = re.sub(
+        rf"^&inote_(?!{level_idx}=)[0-6]=.*?(?=^&|\Z)",
+        "",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    return parse_maidata(filtered)
+
+
 def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.training.level_idx) -> None:
     songs: list[SongMetrics] = []
+    all_level_songs: list[SongMetrics] = []
     missing_level = parse_errors = 0
     for path in sorted(charts_dir.rglob("maidata.txt")):
         try:
-            chart = parse_maidata(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            chart = parse_maidata(text)
             level = chart.all_levels[level_idx]
             if level is None:
                 missing_level += 1
-                continue
-            songs.append(analyze_level(str(path.parent.relative_to(charts_dir)), level.level_query, level.frames))
+            else:
+                songs.append(analyze_level(str(path.parent.relative_to(charts_dir)), level_idx, level.level_query, level.frames))
+            for current_idx, current_level in enumerate(chart.all_levels):
+                if current_level is not None and current_level.frames:
+                    all_level_songs.append(analyze_level(
+                        str(path.parent.relative_to(charts_dir)), current_idx, current_level.level_query, current_level.frames
+                    ))
         except Exception as error:
             parse_errors += 1
             print(f"解析失败: {path.relative_to(charts_dir)}: {error}")
+            # 全曲解析失败时，仍尝试收集其他不受损坏区块影响的大难度谱面。
+            for current_idx in range(7):
+                try:
+                    isolated = _parse_one_level(text, current_idx)
+                    current_level = isolated.all_levels[current_idx]
+                    if current_level is not None and current_level.frames:
+                        all_level_songs.append(analyze_level(
+                            str(path.parent.relative_to(charts_dir)), current_idx, current_level.level_query, current_level.frames
+                        ))
+                except Exception:
+                    pass
 
     slide_songs = [song for song in songs if song.slide_frames]
     default_songs = [song for song in songs if song.default_wait_segments]
@@ -251,7 +294,7 @@ def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.t
             print(f"并发{count}={frames}帧 ({frames / active_slide_frames:.4%})")
     _print_new_start_metrics(songs)
     _print_global_active_metrics(songs)
-    _print_difficulty_metrics(songs)
+    _print_difficulty_metrics(all_level_songs)
 
 
 def _self_check() -> None:
@@ -261,7 +304,7 @@ def _self_check() -> None:
     custom = Note(NoteType.SLIDE, [SlideSegment(SlideShape.Line, TapType.LANE3, TapType.LANE4, 0.3, 0.5, False)])
     # 构造的长期音、默认等待和显式等待覆盖三种统计路径。
     frames = [Frame((Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.0)), slide, custom), 0.0)]
-    metrics = analyze_level("test", 13.5, frames)
+    metrics = analyze_level("test", 5, 13.5, frames)
     assert metrics.default_wait_segments == 1 and metrics.custom_wait_segments == 1
     assert metrics.slide_frames[1] == 140 and metrics.slide_frames[2] == 160
     assert metrics.note_counts == {"tap": 0, "hold": 1, "slide": 2, "total": 3}

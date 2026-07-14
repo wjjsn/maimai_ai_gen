@@ -9,12 +9,11 @@ import torch
 from audio_features import extract_audio_features
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
 from config import CONFIG, checkpoint_config
-from maidata_parser import generate_maidata
 from model import ChartCNN, ModelDimensions
-from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT
+from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT, chart_to_tracks, maidata_to_tracks, tracks_to_maidata
 
 
-MODEL_KIND = "log-mel-full-song-event-cnn-v4"
+MODEL_KIND = "log-mel-full-song-event-cnn-v5"
 
 
 def _scale() -> np.ndarray:
@@ -24,7 +23,7 @@ def _scale() -> np.ndarray:
 
 def load_model(path: str | Path, device: torch.device) -> tuple[ChartCNN, ModelDimensions]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("checkpoint_version") != 4 or checkpoint.get("model_kind") != MODEL_KIND:
+    if checkpoint.get("checkpoint_version") != 5 or checkpoint.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自旧架构，拒绝加载")
     if checkpoint.get("config") != checkpoint_config():
         raise ValueError("检查点的音频或模型配置与当前配置不一致")
@@ -77,7 +76,7 @@ def infer_features(model: ChartCNN, features: np.ndarray, device: torch.device):
 def frames_to_maidata(frames: list[Frame], level_idx: int, title: str = "generated") -> str:
     chart = Chart(title=title, artist="generated")
     chart.all_levels[level_idx] = Level(f"level_{level_idx + 1}", 0.0, frames)
-    return generate_maidata(chart)
+    return tracks_to_maidata(chart_to_tracks(chart, level_idx), level_idx, title)
 
 
 def save_inference_files(audio_path: Path, text: str, out_dir: Path) -> Path:
@@ -97,6 +96,9 @@ def _self_check() -> None:
     assert len(frames) == 1 and len(frames[0].notes) == 3
     assert frames[0].time_sec == 3 / CONFIG.audio.frames_per_sec
     assert stats == {"events": 3, "dropped": 0}
+    text = frames_to_maidata(frames, 5, "test")
+    restored = maidata_to_tracks(text, 5)
+    assert restored[3].tolist() == [2, 1, 20, 0]
     print("[infer] 自检通过")
 
 
