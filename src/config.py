@@ -1,6 +1,7 @@
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields
 import math
 from pathlib import Path
+from types import UnionType
 from typing import Any, get_args, get_origin, get_type_hints
 
 import yaml
@@ -13,42 +14,50 @@ CONFIG_PATH = ROOT_DIR / "config.yaml"
 @dataclass(frozen=True)
 class PathsConfig:
     charts_dir: Path
-    mert_cache_dir: Path
     checkpoint_dir: Path
+    train_output_dir: Path
+    overfit_output_dir: Path
+    inference_output_dir: Path
 
 
 @dataclass(frozen=True)
-class MertConfig:
-    model_dir: Path
-    chunk_sec: float
-    context_sec: float
-    cache_float16: bool
-    audio_workers: int
-    batch_size: int
-    cache_max_bytes: int
-    preflight_workers: int
-    validation_timeout_sec: float
+class AudioConfig:
+    sample_rate: int
+    hop_length: int
+    n_fft: int
+    win_length: int
+    n_mels: int
+    f_min: float
+    f_max: float
+
+    @property
+    def frames_per_sec(self) -> float:
+        return self.sample_rate / self.hop_length
 
 
 @dataclass(frozen=True)
-class WindowConfig:
-    mert_frames: int
-    prefix_start_sec: float
-    target_start_sec: float
-    target_end_sec: float
-    train_stride_sec: float
-    infer_stride_sec: float
+class AugmentationConfig:
+    pitch_probability: float
+    max_pitch_steps: float
+    speed_probability: float
+    min_speed: float
+    max_speed: float
+    shift_probability: float
+    max_shift_sec: float
+    frequency_mask_probability: float
+    max_frequency_mask_bins: int
+    eq_probability: float
+    max_eq_gain: float
+    noise_probability: float
+    max_noise_std: float
 
 
 @dataclass(frozen=True)
 class ModelConfig:
-    state: int
-    head: int
-    layer: int
-    audio_adapter_layers: int
-    audio_adapter_kernel: int
-    audio_adapter_dropout: float
-    max_tokens: int
+    hidden_dim: int
+    layers: int
+    kernel_size: int
+    dropout: float
 
 
 @dataclass(frozen=True)
@@ -60,136 +69,86 @@ class TrainingConfig:
     pin_memory: bool
     num_epochs: int
     learning_rate: float
+    min_learning_rate: float
     weight_decay: float
     val_ratio: float
     test_ratio: float
     grad_clip: float
     early_stop_patience: int
-    label_smoothing: float
-    eos_loss_weight: float
     lr_t_max: int
     seed: int
     val_gen_charts: int
-    val_oracle_windows: int
+    generation_interval: int
     overfit_charts: int
-    resume_path: Path | None
-    rotations: int
-    audio_augment_probability: float
-    feature_noise_std: float
-    max_time_mask_frames: int
-
-
-@dataclass(frozen=True)
-class ExperimentConfig:
-    enabled: bool
-    name: str
-    train_charts: int
-    val_charts: int
-    test_charts: int
-    max_updates: int
-    validate_every_updates: int
-    generation_val_charts: int
-    audio_ablation_charts: int
+    short_loss_weight: float
+    max_long_pos_weight: float
 
 
 @dataclass(frozen=True)
 class InferenceConfig:
+    audio_path: Path
     checkpoint: Path
     level_idx: int
-    start_sec: float
+    short_min_gap_frames: int
+    long_min_frames: int
+    long_threshold: float
+    min_duration_sec: float
+    max_duration_sec: float
 
 
 @dataclass(frozen=True)
 class AppConfig:
     paths: PathsConfig
-    mert: MertConfig
-    window: WindowConfig
+    audio: AudioConfig
+    augmentation: AugmentationConfig
     model: ModelConfig
     training: TrainingConfig
-    experiment: ExperimentConfig
     inference: InferenceConfig
 
 
 SECTIONS = {
     "路径": (PathsConfig, {
-        "谱面目录": "charts_dir",
-        "MERT缓存目录": "mert_cache_dir",
-        "检查点目录": "checkpoint_dir",
+        "谱面目录": "charts_dir", "检查点目录": "checkpoint_dir",
+        "训练输出目录": "train_output_dir", "过拟合输出目录": "overfit_output_dir",
+        "推理输出目录": "inference_output_dir",
     }),
-    "MERT": (MertConfig, {
-        "模型目录": "model_dir",
-        "分块秒数": "chunk_sec",
-        "上下文秒数": "context_sec",
-        "缓存半精度": "cache_float16",
-        "音频工作线程数": "audio_workers",
-        "最大批大小": "batch_size",
-        "允许最大的缓存大小": "cache_max_bytes",
-        "谱面预检进程数": "preflight_workers",
-        "严格规则校验超时秒": "validation_timeout_sec",
+    "音频": (AudioConfig, {
+        "采样率": "sample_rate", "跳步长度": "hop_length", "FFT长度": "n_fft",
+        "窗口长度": "win_length", "Mel频带数": "n_mels", "最低频率": "f_min",
+        "最高频率": "f_max",
     }),
-    "滑窗": (WindowConfig, {
-        "MERT帧数": "mert_frames",
-        "前缀开始秒": "prefix_start_sec",
-        "目标开始秒": "target_start_sec",
-        "目标结束秒": "target_end_sec",
-        "训练步进秒": "train_stride_sec",
-        "推理步进秒": "infer_stride_sec",
+    "数据增强": (AugmentationConfig, {
+        "变调概率": "pitch_probability", "最大变调半音": "max_pitch_steps",
+        "变速概率": "speed_probability", "最小变速倍率": "min_speed",
+        "最大变速倍率": "max_speed", "时间平移概率": "shift_probability",
+        "最大平移秒数": "max_shift_sec", "频率遮蔽概率": "frequency_mask_probability",
+        "最大遮蔽频带数": "max_frequency_mask_bins", "EQ概率": "eq_probability",
+        "最大EQ增益": "max_eq_gain", "噪声概率": "noise_probability",
+        "最大噪声标准差": "max_noise_std",
     }),
     "模型": (ModelConfig, {
-        "状态维度": "state",
-        "注意力头数": "head",
-        "层数": "layer",
-        "音频适配器层数": "audio_adapter_layers",
-        "音频适配器卷积核": "audio_adapter_kernel",
-        "音频适配器丢弃率": "audio_adapter_dropout",
-        "最大词元数": "max_tokens",
+        "隐藏维度": "hidden_dim", "层数": "layers", "卷积核": "kernel_size", "丢弃率": "dropout",
     }),
     "训练": (TrainingConfig, {
-        "难度编号": "level_idx",
-        "批大小": "batch_size",
-        "数据加载进程数": "num_workers",
-        "预取批数": "prefetch_factor",
-        "锁页内存": "pin_memory",
-        "训练轮数": "num_epochs",
-        "学习率": "learning_rate",
-        "权重衰减": "weight_decay",
-        "验证集比例": "val_ratio",
-        "测试集比例": "test_ratio",
-        "梯度裁剪": "grad_clip",
-        "提前停止耐心轮数": "early_stop_patience",
-        "标签平滑": "label_smoothing",
-        "结束词元损失权重": "eos_loss_weight",
-        "学习率退火周期": "lr_t_max",
-        "随机种子": "seed",
-        "整曲验证歌曲数": "val_gen_charts",
-        "真值前缀验证窗口数": "val_oracle_windows",
-        "过拟合歌曲数": "overfit_charts",
-        "恢复检查点": "resume_path",
-        "旋转增强数": "rotations",
-        "音频增强概率": "audio_augment_probability",
-        "特征噪声强度": "feature_noise_std",
-        "最大时间遮挡帧数": "max_time_mask_frames",
-    }),
-    "实验": (ExperimentConfig, {
-        "启用": "enabled",
-        "名称": "name",
-        "训练歌曲数": "train_charts",
-        "验证歌曲数": "val_charts",
-        "测试歌曲数": "test_charts",
-        "最大更新次数": "max_updates",
-        "验证间隔更新次数": "validate_every_updates",
-        "整曲验证歌曲数": "generation_val_charts",
-        "音频消融歌曲数": "audio_ablation_charts",
+        "难度编号": "level_idx", "批大小": "batch_size", "数据加载进程数": "num_workers",
+        "预取批数": "prefetch_factor", "锁页内存": "pin_memory", "训练轮数": "num_epochs",
+        "学习率": "learning_rate", "最低学习率": "min_learning_rate", "权重衰减": "weight_decay",
+        "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
+        "提前停止耐心轮数": "early_stop_patience", "学习率退火周期": "lr_t_max",
+        "随机种子": "seed", "整曲验证歌曲数": "val_gen_charts", "整曲验证间隔": "generation_interval",
+        "过拟合歌曲数": "overfit_charts", "短音损失权重": "short_loss_weight",
+        "长音正样本权重上限": "max_long_pos_weight",
     }),
     "推理": (InferenceConfig, {
-        "检查点": "checkpoint",
-        "难度编号": "level_idx",
-        "开始秒": "start_sec",
+        "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
+        "短音最小间隔帧": "short_min_gap_frames", "持续音最短帧数": "long_min_frames",
+        "持续音阈值": "long_threshold", "最短持续秒数": "min_duration_sec",
+        "最长持续秒数": "max_duration_sec",
     }),
 }
 
 
-def _is_type(value: Any, expected: Any) -> bool:
+def _matches(value: Any, expected: Any) -> bool:
     if expected is float:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
     if expected is int:
@@ -197,42 +156,29 @@ def _is_type(value: Any, expected: Any) -> bool:
     if expected is Path:
         return isinstance(value, str)
     origin = get_origin(expected)
-    if origin is not None and type(None) in get_args(expected):
-        return value is None or _is_type(value, next(t for t in get_args(expected) if t is not type(None)))
+    if origin in (UnionType,):
+        return any(_matches(value, item) for item in get_args(expected))
     return isinstance(value, expected)
 
 
-def _byte_size(value: Any) -> int:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        suffix = value[-1:].upper()
-        factors = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
-        if suffix in factors and value[:-1].isdigit():
-            return int(value[:-1]) * factors[suffix]
-    raise TypeError(f"缓存大小必须是正整数或 K/M/G 整数单位: {value!r}")
-
-
-def _load_section(raw: dict, section_name: str):
-    cls, key_map = SECTIONS[section_name]
-    section = raw.get(section_name)
+def _load_section(raw: dict, name: str):
+    cls, mapping = SECTIONS[name]
+    section = raw.get(name)
     if not isinstance(section, dict):
-        raise ValueError(f"配置缺少对象: {section_name}")
-    unknown = set(section) - set(key_map)
-    missing = set(key_map) - set(section)
+        raise ValueError(f"配置缺少对象: {name}")
+    unknown = set(section) - set(mapping)
+    missing = set(mapping) - set(section)
     if unknown or missing:
-        raise ValueError(f"配置 {section_name} 键错误: 缺少={sorted(missing)} 未知={sorted(unknown)}")
+        raise ValueError(f"配置 {name} 键错误: 缺少={sorted(missing)} 未知={sorted(unknown)}")
     hints = get_type_hints(cls)
     values = {}
-    for yaml_key, field_name in key_map.items():
-        value = section[yaml_key]
+    for yaml_name, field_name in mapping.items():
+        value = section[yaml_name]
         expected = hints[field_name]
-        if field_name == "cache_max_bytes":
-            value = _byte_size(value)
-        if not _is_type(value, expected):
-            raise TypeError(f"配置 {section_name}.{yaml_key} 类型错误: {value!r}")
-        if expected is Path or (get_origin(expected) is not None and Path in get_args(expected)):
-            value = None if value is None else (ROOT_DIR / value).resolve()
+        if not _matches(value, expected):
+            raise TypeError(f"配置 {name}.{yaml_name} 类型错误: {value!r}")
+        if expected is Path:
+            value = (ROOT_DIR / value).resolve()
         elif expected is float:
             value = float(value)
         values[field_name] = value
@@ -244,185 +190,42 @@ def _require(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def _validate_config(config: AppConfig) -> None:
-    mert = config.mert
-    window = config.window
-    model = config.model
-    training = config.training
-    inference = config.inference
-
-    for value, name in (
-        (window.prefix_start_sec, "滑窗.前缀开始秒"),
-        (window.target_start_sec, "滑窗.目标开始秒"),
-        (window.target_end_sec, "滑窗.目标结束秒"),
-        (window.train_stride_sec, "滑窗.训练步进秒"),
-        (window.infer_stride_sec, "滑窗.推理步进秒"),
-        (training.learning_rate, "训练.学习率"),
-        (training.weight_decay, "训练.权重衰减"),
-        (training.val_ratio, "训练.验证集比例"),
-        (training.test_ratio, "训练.测试集比例"),
-        (training.grad_clip, "训练.梯度裁剪"),
-        (training.label_smoothing, "训练.标签平滑"),
-        (training.eos_loss_weight, "训练.结束词元损失权重"),
-        (inference.start_sec, "推理.开始秒"),
-    ):
-        _require(math.isfinite(value), f"配置 {name} 必须是有限数字")
-
-    _require(mert.model_dir.is_dir(), f"配置 MERT.模型目录不存在或不是目录: {mert.model_dir}")
-    _require(math.isfinite(mert.chunk_sec) and mert.chunk_sec > 0, "配置 MERT.分块秒数 必须大于 0")
-    _require(math.isfinite(mert.context_sec) and mert.context_sec >= 0, "配置 MERT.上下文秒数 不能小于 0")
-    _require(mert.context_sec * 2 < mert.chunk_sec, "配置 MERT.上下文秒数的两倍必须小于分块秒数")
-    _require(mert.audio_workers > 0, "配置 MERT.音频工作线程数 必须大于 0")
-    _require(mert.batch_size > 0, "配置 MERT.最大批大小 必须大于 0")
-    _require(mert.cache_max_bytes > 0, "配置 MERT.允许最大的缓存大小 必须大于 0")
-    _require(mert.preflight_workers > 0, "配置 MERT.谱面预检进程数 必须大于 0")
-    _require(math.isfinite(mert.validation_timeout_sec) and mert.validation_timeout_sec > 0, "配置 MERT.严格规则校验超时秒 必须大于 0")
-
-    _require(window.mert_frames > 0, "配置 滑窗.MERT帧数 必须大于 0")
-    _require(window.prefix_start_sec >= 0, "配置 滑窗.前缀开始秒 不能小于 0")
-    _require(
-        window.prefix_start_sec < window.target_start_sec < window.target_end_sec,
-        "配置滑窗时间必须满足 前缀开始秒 < 目标开始秒 < 目标结束秒",
+def _validate(config: AppConfig) -> None:
+    audio, augmentation = config.audio, config.augmentation
+    model, training, inference = config.model, config.training, config.inference
+    for group in (audio, augmentation, model, training, inference):
+        for item in fields(group):
+            value = getattr(group, item.name)
+            if isinstance(value, float):
+                _require(math.isfinite(value), f"配置 {item.name} 必须是有限数字")
+    _require(audio.sample_rate > 0 and audio.hop_length > 0, "音频采样率和跳步长度必须大于 0")
+    _require(audio.n_fft >= audio.win_length > 0, "音频 FFT长度必须不小于窗口长度")
+    _require(audio.n_mels > 0 and 0 <= audio.f_min < audio.f_max <= audio.sample_rate / 2, "音频频率范围无效")
+    probabilities = (
+        augmentation.pitch_probability, augmentation.speed_probability,
+        augmentation.shift_probability, augmentation.frequency_mask_probability,
+        augmentation.eq_probability, augmentation.noise_probability,
     )
-    _require(window.target_end_sec <= 30.0, "配置 滑窗.目标结束秒 不能超过时间戳上限 30.0 秒")
-    window_duration = window.mert_frames / 75
-    _require(
-        window.target_end_sec <= window_duration,
-        f"配置 滑窗.目标结束秒 超出音频窗口；当前 MERT 帧数只能提供 {window_duration:.2f} 秒",
-    )
-    _require(window.train_stride_sec > 0, "配置 滑窗.训练步进秒 必须大于 0")
-    _require(window.infer_stride_sec > 0, "配置 滑窗.推理步进秒 必须大于 0")
-    target_duration = window.target_end_sec - window.target_start_sec
-    _require(
-        abs(window.infer_stride_sec - target_duration) <= 1e-6,
-        "配置 滑窗.推理步进秒 必须等于目标区时长",
-    )
-
-    for value, name in (
-        (model.state, "状态维度"),
-        (model.head, "注意力头数"),
-        (model.layer, "层数"),
-        (model.audio_adapter_kernel, "音频适配器卷积核"),
-        (model.max_tokens, "最大词元数"),
-    ):
-        _require(value > 0, f"配置 模型.{name} 必须大于 0")
-    _require(model.state >= 4, "配置 模型.状态维度 至少为 4")
-    _require(
-        model.state % model.head == 0,
-        "配置 模型.状态维度 必须能被 注意力头数 整除",
-    )
-    _require(model.max_tokens >= 2, "配置 模型.最大词元数 至少为 2，才能容纳开始和结束词元")
-    _require(model.audio_adapter_layers >= 0, "配置 模型.音频适配器层数 不能小于 0")
-    _require(model.audio_adapter_kernel % 2 == 1, "配置 模型.音频适配器卷积核 必须是奇数")
-    _require(0 <= model.audio_adapter_dropout < 1, "配置 模型.音频适配器丢弃率 必须大于等于 0 且小于 1")
-
-    _require(0 <= training.level_idx <= 6, "配置 训练.难度编号 必须在 0 到 6 之间")
-    _require(training.batch_size > 0, "配置 训练.批大小 必须大于 0")
-    _require(training.num_workers >= 0, "配置 训练.数据加载进程数 不能小于 0")
-    _require(training.prefetch_factor > 0, "配置 训练.预取批数 必须大于 0")
-    _require(training.num_epochs > 0, "配置 训练.训练轮数 必须大于 0")
-    _require(training.learning_rate > 0, "配置 训练.学习率 必须大于 0")
-    _require(training.weight_decay >= 0, "配置 训练.权重衰减 不能小于 0")
-    _require(0 < training.val_ratio < 1, "配置 训练.验证集比例 必须大于 0 且小于 1")
-    _require(0 < training.test_ratio < 1, "配置 训练.测试集比例 必须大于 0 且小于 1")
-    _require(training.val_ratio + training.test_ratio < 1, "配置 训练.验证集比例与测试集比例之和必须小于 1")
-    _require(training.grad_clip > 0, "配置 训练.梯度裁剪 必须大于 0")
-    _require(training.early_stop_patience > 0, "配置 训练.提前停止耐心轮数 必须大于 0")
-    _require(0 <= training.label_smoothing < 1, "配置 训练.标签平滑 必须大于等于 0 且小于 1")
-    _require(training.eos_loss_weight > 0, "配置 训练.结束词元损失权重 必须大于 0")
-    _require(training.lr_t_max > 0, "配置 训练.学习率退火周期 必须大于 0")
-    _require(training.val_gen_charts >= 0, "配置 训练.整曲验证歌曲数 不能小于 0")
-    _require(training.val_oracle_windows >= 0, "配置 训练.真值前缀验证窗口数 不能小于 0")
-    _require(training.overfit_charts >= 0, "配置 训练.过拟合歌曲数 不能小于 0")
-    _require(training.rotations in range(1, 9), "配置 训练.旋转增强数 必须在 1 到 8 之间")
-    _require(0 <= training.audio_augment_probability <= 1, "配置 训练.音频增强概率 必须在 0 到 1 之间")
-    _require(training.feature_noise_std >= 0, "配置 训练.特征噪声强度 不能小于 0")
-    _require(training.max_time_mask_frames >= 0, "配置 训练.最大时间遮挡帧数 不能小于 0")
-    experiment = config.experiment
-    _require(experiment.name and all(c.isalnum() or c in "_-" for c in experiment.name), "配置 实验.名称 只能包含字母、数字、下划线和连字符")
-    for value, name in (
-        (experiment.train_charts, "训练歌曲数"),
-        (experiment.val_charts, "验证歌曲数"),
-        (experiment.test_charts, "测试歌曲数"),
-        (experiment.max_updates, "最大更新次数"),
-        (experiment.validate_every_updates, "验证间隔更新次数"),
-        (experiment.generation_val_charts, "整曲验证歌曲数"),
-        (experiment.audio_ablation_charts, "音频消融歌曲数"),
-    ):
-        _require(value > 0, f"配置 实验.{name} 必须大于 0")
-    _require(0 <= inference.level_idx <= 6, "配置 推理.难度编号 必须在 0 到 6 之间")
-    _require(inference.start_sec >= 0, "配置 推理.开始秒 不能小于 0")
-
-
-def inference_checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | float]]:
-    """保存会改变模型结构、输入特征或正式推理语义的配置。"""
-    return {
-        "MERT": {
-            "模型目录": str(config.mert.model_dir),
-            "分块秒数": config.mert.chunk_sec,
-            "上下文秒数": config.mert.context_sec,
-            "缓存半精度": config.mert.cache_float16,
-        },
-        "滑窗": {
-            "MERT帧数": config.window.mert_frames,
-            "前缀开始秒": config.window.prefix_start_sec,
-            "目标开始秒": config.window.target_start_sec,
-            "目标结束秒": config.window.target_end_sec,
-            "推理步进秒": config.window.infer_stride_sec,
-        },
-        "模型": {
-            "状态维度": config.model.state,
-            "注意力头数": config.model.head,
-            "层数": config.model.layer,
-            "音频适配器层数": config.model.audio_adapter_layers,
-            "音频适配器卷积核": config.model.audio_adapter_kernel,
-            "音频适配器丢弃率": config.model.audio_adapter_dropout,
-            "最大词元数": config.model.max_tokens,
-        },
-    }
-
-
-def checkpoint_config(config: AppConfig) -> dict[str, dict[str, int | float]]:
-    """保存严格续训需要保持一致的模型、任务和优化器配置。"""
-    saved = inference_checkpoint_config(config)
-    saved["训练任务"] = {
-        "难度编号": config.training.level_idx,
-        "训练步进秒": config.window.train_stride_sec,
-        "验证集比例": config.training.val_ratio,
-        "测试集比例": config.training.test_ratio,
-        "随机种子": config.training.seed,
-        "过拟合歌曲数": config.training.overfit_charts,
-        "旋转增强数": config.training.rotations,
-    }
-    saved["优化器"] = {
-        "学习率": config.training.learning_rate,
-        "权重衰减": config.training.weight_decay,
-        "学习率退火周期": config.training.lr_t_max,
-    }
-    return saved
-
-
-def validate_checkpoint_config(
-    saved: dict | None,
-    current: AppConfig,
-    *,
-    for_training: bool,
-) -> None:
-    expected = checkpoint_config(current) if for_training else inference_checkpoint_config(current)
-    complete = saved is not None and all(
-        section in saved and all(key in saved[section] for key in values)
-        for section, values in expected.items()
-    )
-    if not complete:
-        raise ValueError("检查点配置不完整或来自旧架构，拒绝加载")
-    for section, values in expected.items():
-        saved_section = saved.get(section, {})
-        for key, value in values.items():
-            if saved_section.get(key) != value:
-                raise ValueError(
-                    f"检查点与当前配置不兼容: {section}.{key}="
-                    f"{saved_section.get(key)!r}，当前为 {value!r}"
-                )
+    _require(all(0 <= value <= 1 for value in probabilities), "数据增强概率必须在 [0, 1] 内")
+    _require(augmentation.max_pitch_steps >= 0, "最大变调半音不能为负")
+    _require(0 < augmentation.min_speed <= augmentation.max_speed, "变速倍率范围无效")
+    _require(augmentation.max_shift_sec >= 0, "最大平移秒数不能为负")
+    _require(0 <= augmentation.max_frequency_mask_bins <= audio.n_mels, "频率遮蔽范围无效")
+    _require(augmentation.max_eq_gain >= 0 and augmentation.max_noise_std >= 0, "EQ 或噪声强度不能为负")
+    _require(model.hidden_dim > 0 and model.layers > 0, "模型维度和层数必须大于 0")
+    _require(model.kernel_size > 0 and model.kernel_size % 2 == 1, "模型卷积核必须是正奇数")
+    _require(0 <= model.dropout < 1, "模型丢弃率必须在 [0, 1) 内")
+    _require(0 <= training.level_idx <= 6 and 0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
+    _require(training.batch_size > 0 and training.num_workers >= 0 and training.prefetch_factor > 0, "DataLoader 配置无效")
+    _require(training.num_epochs > 0 and training.learning_rate > 0 and training.min_learning_rate >= 0, "学习率或训练轮数无效")
+    _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
+    _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
+    _require(training.grad_clip > 0 and training.early_stop_patience > 0 and training.lr_t_max > 0, "训练控制参数无效")
+    _require(training.val_gen_charts >= 0 and training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
+    _require(training.short_loss_weight > 0 and training.max_long_pos_weight >= 1, "损失权重无效")
+    _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
+    _require(0 <= inference.long_threshold <= 1, "持续音阈值必须在 [0, 1] 内")
+    _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -439,135 +242,29 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if unknown or missing:
         raise ValueError(f"配置分组错误: 缺少={sorted(missing)} 未知={sorted(unknown)}")
     loaded = {name: _load_section(raw, name) for name in SECTIONS}
-    config = AppConfig(**{
-        "paths": loaded["路径"], "mert": loaded["MERT"], "window": loaded["滑窗"],
-        "model": loaded["模型"], "training": loaded["训练"],
-        "experiment": loaded["实验"], "inference": loaded["推理"],
-    })
-    _validate_config(config)
+    config = AppConfig(
+        loaded["路径"], loaded["音频"], loaded["数据增强"],
+        loaded["模型"], loaded["训练"], loaded["推理"],
+    )
+    _validate(config)
     return config
 
 
 CONFIG = load_config()
 
 
-def _expect_error(message: str, action) -> None:
-    try:
-        action()
-    except Exception as error:
-        assert message in str(error), error
-    else:
-        raise AssertionError(f"预期异常: {message}")
+def checkpoint_config(config: AppConfig = CONFIG) -> dict:
+    return {
+        "audio": vars(config.audio),
+        "model": vars(config.model),
+    }
 
 
 def _self_check() -> None:
-    from infer import _level_arg, _nonnegative_float_arg, _prefix_relative_cs, frames_to_prefix_tokens
-    from maidata_parser import Frame, Note, NoteType, TapType
-    from tokenizer import TS_BASE
-
+    assert CONFIG.audio.frames_per_sec == 200
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
-    assert CONFIG.mert.model_dir == ROOT_DIR / "MERT-v1-95M"
-    assert CONFIG.model.state == 768
-    assert CONFIG.window.mert_frames == 2612
-    assert CONFIG.window.target_end_sec - CONFIG.window.target_start_sec == 10.0
-    assert CONFIG.model.max_tokens == 2048
-    assert CONFIG.training.level_idx == 5
     assert load_config() == CONFIG
-
-    window_start = 10.0
-    just_below_prefix = Frame((Note(NoteType.TAP, TapType.LANE1),), 15.9949)
-    rounded_to_prefix = Frame((Note(NoteType.TAP, TapType.LANE2),), 15.999999999999998)
-    just_below_target = Frame((Note(NoteType.TAP, TapType.LANE3),), 21.9949)
-    rounded_to_target = Frame((Note(NoteType.TAP, TapType.LANE4),), 21.999999999999998)
-    assert _prefix_relative_cs(just_below_prefix, window_start) is None
-    assert _prefix_relative_cs(rounded_to_prefix, window_start) == 600
-    assert _prefix_relative_cs(just_below_target, window_start) == 1199
-    assert _prefix_relative_cs(rounded_to_target, window_start) is None
-    prefix_tokens = frames_to_prefix_tokens(
-        [just_below_prefix, rounded_to_prefix, just_below_target, rounded_to_target],
-        window_start,
-    )
-    assert prefix_tokens.count(TS_BASE + 600) == 1
-    assert prefix_tokens.count(TS_BASE + 1199) == 1
-
-    _expect_error(
-        "目标结束秒 超出音频窗口",
-        lambda: _validate_config(replace(CONFIG, window=replace(CONFIG.window, mert_frames=1000))),
-    )
-    _expect_error(
-        "状态维度 必须能被",
-        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, head=5))),
-    )
-    _expect_error(
-        "状态维度 至少为 4",
-        lambda: _validate_config(replace(CONFIG, model=replace(CONFIG.model, state=2, head=1))),
-    )
-    _expect_error(
-        "音频增强概率",
-        lambda: _validate_config(replace(
-            CONFIG,
-            training=replace(CONFIG.training, audio_augment_probability=1.1),
-        )),
-    )
-    _expect_error(
-        "最大时间遮挡帧数",
-        lambda: _validate_config(replace(
-            CONFIG,
-            training=replace(CONFIG.training, max_time_mask_frames=-1),
-        )),
-    )
-    _expect_error(
-        "时间戳上限",
-        lambda: _validate_config(replace(
-            CONFIG,
-            window=replace(CONFIG.window, target_end_sec=30.01, infer_stride_sec=18.01),
-        )),
-    )
-
-    saved = checkpoint_config(CONFIG)
-    _expect_error(
-        "滑窗.MERT帧数",
-        lambda: validate_checkpoint_config(
-            saved, replace(CONFIG, window=replace(CONFIG.window, mert_frames=2000)),
-            for_training=False,
-        ),
-    )
-    validate_checkpoint_config(
-        saved, replace(CONFIG, window=replace(CONFIG.window, train_stride_sec=2.0)),
-        for_training=False,
-    )
-    _expect_error(
-        "优化器.学习率",
-        lambda: validate_checkpoint_config(
-            saved, replace(CONFIG, training=replace(CONFIG.training, learning_rate=0.001)),
-            for_training=True,
-        ),
-    )
-    _expect_error(
-        "训练任务.难度编号",
-        lambda: validate_checkpoint_config(
-            saved, replace(CONFIG, training=replace(CONFIG.training, level_idx=4)),
-            for_training=True,
-        ),
-    )
-    _expect_error(
-        "旧架构",
-        lambda: validate_checkpoint_config(None, CONFIG, for_training=False),
-    )
-    partial = checkpoint_config(CONFIG)
-    del partial["优化器"]
-    _expect_error(
-        "旧架构",
-        lambda: validate_checkpoint_config(partial, CONFIG, for_training=True),
-    )
-
-    for action in (
-        lambda: _level_arg("-1"),
-        lambda: _level_arg("7"),
-        lambda: _nonnegative_float_arg("nan"),
-        lambda: _nonnegative_float_arg("-1"),
-    ):
-        _expect_error("", action)
+    assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "kernel_size", "dropout"}
     print("[config] 自检通过")
 
 

@@ -1,221 +1,8 @@
-import json
+import math
 import re
-import hashlib
-from dataclasses import dataclass, field
-from enum import Enum, auto
-from pathlib import Path
-from urllib.request import urlopen
+from chart import Chart, Frame, HoldData, Level, Note, NoteType, SlideSegment, SlideShape, TapType, TouchData, TouchType
 
-import torch
-
-from tokenizer import (
-    EOS, FRAME_END, FRAME_START, IS_BREAK, IS_CCW, IS_CW, IS_EX, IS_FAKE_ROTATE,
-    IS_FIREWORK, IS_FORCE_STAR, IS_SLIDE_BREAK, IS_SLIDE_NO_HEAD, LANE_BASE,
-    NOTE_HOLD, NOTE_SLIDE, NOTE_TAP, NOTE_TOUCH, PAD, SEGMENT_END, SEGMENT_START,
-    SLIDE_SHAPE_BASE, SOS, TOUCH_BASE, TS_BASE, VOCAB_SIZE,
-)
-
-
-# ── Note ──────────────────────────────────────────────────────────────────
-
-
-class NoteType(Enum):
-    TAP = auto()
-    HOLD = auto()
-    SLIDE = auto()
-    TOUCH = auto()
-    TOUCH_HOLD = auto()
-
-
-class TouchType(Enum):
-    A1 = auto()
-    A2 = auto()
-    A3 = auto()
-    A4 = auto()
-    A5 = auto()
-    A6 = auto()
-    A7 = auto()
-    A8 = auto()
-    B1 = auto()
-    B2 = auto()
-    B3 = auto()
-    B4 = auto()
-    B5 = auto()
-    B6 = auto()
-    B7 = auto()
-    B8 = auto()
-    C = auto()
-    D1 = auto()
-    D2 = auto()
-    D3 = auto()
-    D4 = auto()
-    D5 = auto()
-    D6 = auto()
-    D7 = auto()
-    D8 = auto()
-    E1 = auto()
-    E2 = auto()
-    E3 = auto()
-    E4 = auto()
-    E5 = auto()
-    E6 = auto()
-    E7 = auto()
-    E8 = auto()
-
-
-class TapType(Enum):
-    LANE1 = auto()
-    LANE2 = auto()
-    LANE3 = auto()
-    LANE4 = auto()
-    LANE5 = auto()
-    LANE6 = auto()
-    LANE7 = auto()
-    LANE8 = auto()
-
-
-class SlideShape(Enum):
-    Line = auto()  # -
-    Circle = auto()  # > < ^
-    V = auto()  # v
-    GrandV = auto()  # V (L型折线)
-    P = auto()  # p (单弯)
-    Q = auto()  # q (单弯镜像)
-    PP = auto()  # pp (大弯)
-    QQ = auto()  # qq (大弯镜像)
-    S = auto()  # s (闪电)
-    Z = auto()  # z (闪电镜像)
-    Wifi = auto()  # w (扇形/WiFi)
-
-    def __eq__(self, other):
-        return self is other
-
-    def __hash__(self):
-        return id(self)
-
-
-@dataclass
-class SlideSegment:
-    shape: SlideShape
-    start_lane: TapType
-    end_lane: TapType
-    wait_duration: float = 0.0  # 等待时间（秒），默认一拍
-    trace_duration: float = 0.0  # 持续时间（秒）
-
-    isClockwise: bool | None = None  # > 顺时针 / < 逆时针 / ^ 自动判断选最短，不需要这个字段
-    middle_lane: TapType | None = None  # GrandV的拐点。1V35  →  起点=1, 拐点=3, 终点=5
-
-    isForceStar: bool = False  # 强制星星头
-    isFakeRotate: bool = False  # 假旋转 ($$)
-    isSlideBreak: bool = False  # Slide 本体 Break。b 在 ] 后 = 整条 Slide 变 Break
-    isSlideNoHead: bool = False  # Slide 无头 (! 或 ? 或 *)
-
-
-@dataclass
-class Touch_data:
-    Touch_area: TouchType
-    isFirework: bool = False  # 烟花
-    holdTime: float = 0.0  # 持续时间（秒），TouchHold 才有
-
-
-@dataclass
-class Hold_data:
-    lane: TapType
-    holdTime: float = 0.0  # 持续时间（秒）
-
-
-@dataclass
-class Note:
-    """一个音符。"""
-    type: NoteType
-    data: TapType | Hold_data | Touch_data | list[SlideSegment]
-    isBreak: bool = False
-    isEx: bool = False
-
-
-@dataclass
-class Frame:
-    """一个时间帧，包含该时间点的所有音符。"""
-    notes: tuple[Note, ...] = ()
-    time_sec: float = 0.0  # 精确时间（秒）
-
-
-@dataclass
-class Level:
-    """一个难度等级，包含该难度的所有时间帧。"""
-    level_name: str
-    level_query: float | None
-    frames: list[Frame] = field(default_factory=list)
-
-
-@dataclass
-class Chart:
-    """一首歌的+不同难度（0.0~15.0）谱面。"""
-    all_levels: list[Level | None] = field(default_factory=list)
-    title: str = "default"
-    artist: str = "default"
-    designer: str = "default"
-
-    # EASY/BASIC/ADVANCED/EXPERT/MASTER/Re:MASTER/ORIGINAL
-    # lv_1/lv_2 /lv_3   /lv_4/  lv_5/     lv_6/  lv_7
-
-
-# ── helpers ────────────────────────────────────────────────────────────────
-
-_MUSIC_DATA_URL = "https://www.diving-fish.com/api/maimaidxprober/music_data"
-
-
-def _music_data_path() -> Path:
-    return Path(__file__).resolve().parent.parent / ".cache" / "music_data.json"
-
-
-def load_music_data() -> list[dict]:
-    """只读取已下载的本地歌曲表；解析谱面绝不访问网络。"""
-    try:
-        data = json.loads(_music_data_path().read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError):
-        return []
-
-
-def update_music_data() -> None:
-    """显式下载歌曲表，供索引筛选等离线流程使用。"""
-    with urlopen(_MUSIC_DATA_URL, timeout=30) as response:
-        data = json.load(response)
-    if not isinstance(data, list):
-        raise ValueError("歌曲表格式错误")
-    path = _music_data_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    temp.replace(path)
-
-
-def music_data_version() -> str:
-    """本地歌曲表内容摘要；更新歌曲表才会改变训练索引。"""
-    data = json.dumps(load_music_data(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(data.encode()).hexdigest()
-
-
-def _local_level_names(text: str) -> dict[int, str]:
-    return {
-        int(match.group(1)): match.group(2).strip()
-        for match in re.finditer(r"^&lv_(\d)=([^\n]*)$", text, re.MULTILINE)
-    }
-
-
-def _fallback_level_name(level: str) -> str:
-    try:
-        value = float(level)
-    except ValueError:
-        return level
-    if value == 13.0:
-        return "13"
-    if value == 13.5:
-        return "13+"
-    return level
-
-
+__all__ = ["parse_maidata", "generate_maidata"]
 def _level_to_float(level: str) -> float | None:
     try:
         return float(level)
@@ -227,35 +14,6 @@ def _level_to_float(level: str) -> float | None:
                 pass
     return None
 
-
-def _levels_match(song: dict, local_levels: dict[int, str], *, fallback: bool) -> bool:
-    compared = False
-    for level_idx, local_level in local_levels.items():
-        ds_index = level_idx - 2
-        levels = song.get("level", [])
-        if not 0 <= ds_index < len(levels):
-            continue
-        compared = True
-        expected = _fallback_level_name(local_level) if fallback else local_level
-        if expected != levels[ds_index]:
-            return False
-    return compared
-
-
-def _match_music(text: str, title: str, songs: list[dict]) -> dict | None:
-    shortid_match = re.search(r"^&shortid=(\d+)\s*$", text, re.MULTILINE)
-    if shortid_match:
-        shortid = shortid_match.group(1)
-        song = next((song for song in songs if str(song.get("id")) == shortid), None)
-        if song is not None:
-            return song
-    matches = [song for song in songs if song.get("title") == title]
-    local_levels = _local_level_names(text)
-    for fallback in (False, True):
-        matched = [song for song in matches if _levels_match(song, local_levels, fallback=fallback)]
-        if len(matched) == 1:
-            return matched[0]
-    return None
 
 _LANE_MAP = {
     "1": TapType.LANE1, "2": TapType.LANE2, "3": TapType.LANE3, "4": TapType.LANE4,
@@ -355,8 +113,8 @@ def _touch_hold_length(token: str, bpm: float) -> float | None:
 
 # ── compiler ──────────────────────────────────────────────────────────────
 
-class compiler:
-    def __init__(self, hop_length=512, sample_rate=44100):
+class _Parser:
+    def __init__(self):
         self.chart = Chart(all_levels=[None] * 7)
         self.current_time = 0.0  # seconds
         self._warned: set[str] = set()
@@ -443,7 +201,7 @@ class compiler:
             hold_sec = _length_to_seconds(m.group(1), bpm)
             return Note(
                 type=NoteType.HOLD,
-                data=Hold_data(lane=lane, holdTime=hold_sec),
+                data=HoldData(lane=lane, holdTime=hold_sec),
                 isBreak=is_break,
                 isEx=is_ex,
             )
@@ -476,18 +234,18 @@ class compiler:
                 hold_sec = _length_to_seconds(m.group(1), bpm)
                 return Note(
                     type=NoteType.TOUCH_HOLD,
-                    data=Touch_data(Touch_area=area, isFirework=has_f, holdTime=hold_sec),
+                    data=TouchData(Touch_area=area, isFirework=has_f, holdTime=hold_sec),
                 )
             else:
                 # 无时长的伪 TOUCH HOLD 按 TOUCH 归一化。
                 return Note(
                     type=NoteType.TOUCH,
-                    data=Touch_data(Touch_area=area, isFirework=has_f),
+                    data=TouchData(Touch_area=area, isFirework=has_f),
                 )
         else:
             return Note(
                 type=NoteType.TOUCH,
-                data=Touch_data(Touch_area=area, isFirework=has_f),
+                data=TouchData(Touch_area=area, isFirework=has_f),
             )
 
     # ── slide parsing ─────────────────────────────────────────────────────
@@ -689,10 +447,13 @@ class compiler:
             # optional [wait##trace] for this segment
             wait_sec = 240.0 / bpm if bpm > 0 else 0.0
             trace_sec = 0.0
+            is_default_wait = True
             if i < n and t[i] == "[":
                 j = t.index("]", i)
                 bracket_content = t[i + 1 : j]
                 wait_sec, trace_sec = self._parse_slide_bracket(bracket_content, bpm)
+                # 默认等待是当前 BPM 的一拍；指定其他 BPM 也会改变等待时长。
+                is_default_wait = abs(wait_sec - 240.0 / bpm) < 1e-6 if bpm > 0 else wait_sec == 0.0
                 i = j + 1
 
             while i < n and t[i] in ("b", "x"):
@@ -706,6 +467,7 @@ class compiler:
                 end_lane=end_lane,
                 wait_duration=wait_sec,
                 trace_duration=trace_sec,
+                is_default_wait=is_default_wait,
                 isClockwise=is_cw,
                 middle_lane=middle_lane,
                 isForceStar=is_force_star,
@@ -829,7 +591,7 @@ class compiler:
 
     # ── main parse ────────────────────────────────────────────────────────
 
-    def parse(self, text: str, music_data: list[dict] | None = None):
+    def parse(self, text: str) -> Chart:
         self.chart = Chart(all_levels=[None] * 7)
         self._warned.clear()
 
@@ -841,8 +603,14 @@ class compiler:
         if artist_match:
             self.chart.artist = artist_match.group(1).strip()
 
-        # 调用方显式传入本地歌曲表时才使用云端元数据；解析本身不读文件或联网。
-        song = _match_music(text, self.chart.title, music_data) if music_data is not None else None
+        first_match = re.search(r"(?m)^&first=([^\r\n]+)", text)
+        if first_match:
+            try:
+                self.chart.first_sec = float(first_match.group(1).strip())
+            except ValueError as error:
+                raise ValueError(f"谱面 &first 无效: {first_match.group(1)!r}") from error
+            if not math.isfinite(self.chart.first_sec):
+                raise ValueError("谱面 &first 必须是有限数字")
 
         for level in range(0, 7):
             level_match = re.search(
@@ -926,18 +694,13 @@ class compiler:
             level_name = f"level_{level + 1}"
             level_query_match = re.search(rf"&lv_{level}=([^\n]+)", text)
             level_query = _level_to_float(level_query_match.group(1).strip()) if level_query_match else None
-            ds_index = level - 2  # maidata lv_2..lv_6 对应 API Basic..Re:Master。
-            if song is not None and 0 <= ds_index < len(song.get("ds", [])):
-                try:
-                    level_query = float(song["ds"][ds_index])
-                except (TypeError, ValueError):
-                    pass
             self.chart.all_levels[level] = Level(
                 level_name=level_name, level_query=level_query, frames=frames
             )
 
         return self.chart
 
+    '''旧 token、tensor 和训练辅助逻辑已移除。
     # ── eval ──────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -1344,6 +1107,7 @@ class compiler:
         print(f"[parse_from_tensor] level {level_idx}: {len(all_frames)} frames decoded")
         return self
 
+    '''
     # ── note-to-text reconstruction ───────────────────────────────────────
 
     # TapType value -> lane number string
@@ -1388,10 +1152,16 @@ class compiler:
         if seconds <= 0:
             return "1:1"
         beats = seconds * bpm / 240.0
-        for x in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1280]:
+        dividers = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1280]
+        for x in dividers:
             y = beats * x
             yi = int(round(y))
-            if yi > 0 and abs(y - yi) / max(yi, 1) < 0.02:
+            if yi > 0 and abs(y - yi) < 1e-6:
+                return f"{x}:{yi}"
+        for x in dividers:
+            y = beats * x
+            yi = int(round(y))
+            if yi > 0 and abs(y - yi) / yi < 0.02:
                 return f"{x}:{yi}"
         # fallback: compute a BPM where this duration = 1 beat, find clean D:M
         implied_bpm = 240.0 / seconds
@@ -1502,7 +1272,10 @@ class compiler:
                 trace_sec = seg.trace_duration
                 wait_sec = seg.wait_duration
                 default_wait = 240.0 / bpm  # 1 beat at generation BPM
-                if abs(wait_sec - default_wait) < 0.005:
+                if wait_sec <= 0:
+                    ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
+                    parts.append(f"[0###{ts}]")
+                elif abs(wait_sec - default_wait) < 0.005:
                     # wait = 1 beat at gen BPM, use simple [D:M] notation
                     trace_str = self._duration_to_notation(trace_sec, bpm)
                     parts.append(f"[{trace_str}]")
@@ -1537,11 +1310,11 @@ class compiler:
         lines: list[str] = []
         lines.append(f"&title={self.chart.title}")
         lines.append(f"&artist={self.chart.artist}")
-        lines.append("&first=0")
+        lines.append(f"&first={self.chart.first_sec:g}")
 
         gen_bpm = 12000.0
-        gen_divider = 1.0
-        per_comma_time = 240.0 / gen_bpm / gen_divider  # 0.02 seconds
+        gen_divider = 4.0
+        per_comma_time = 240.0 / gen_bpm / gen_divider  # 0.005 seconds
 
         for level_idx, level in enumerate(self.chart.all_levels):
             if level is None:
@@ -1570,7 +1343,7 @@ class compiler:
                 gap_commas = max(0, target_commas - commas_emitted)
 
                 if first_note:
-                    prefix = "(12000){1}" + "," * gap_commas
+                    prefix = "(12000){4}" + "," * gap_commas
                     output_lines.append(f"{prefix}{combined},")
                     first_note = False
                 else:
@@ -1586,6 +1359,32 @@ class compiler:
         return "\n".join(lines)
 
 
+def parse_maidata(text: str) -> Chart:
+    return _Parser().parse(text)
+
+
+def generate_maidata(chart: Chart) -> str:
+    parser = _Parser()
+    parser.chart = chart
+    return parser.generate()
+
+
+def _self_check() -> None:
+    text = "&title=test\n&artist=tester\n&first=0.125\n&lv_5=14\n&inote_5=(12000){4},1,2h[4:1],E"
+    chart = parse_maidata(text)
+    assert chart.title == "test" and chart.first_sec == 0.125
+    assert chart.all_levels[5] is not None
+    generated = generate_maidata(chart)
+    restored = parse_maidata(generated)
+    assert restored.first_sec == 0.125 and len(restored.all_levels[5].frames) == 2
+    print("[maidata-parser] 自检通过")
+
+
+if __name__ == "__main__":
+    _self_check()
+
+
+'''旧批处理和兼容性自检已移除。
 # ── batch tool ────────────────────────────────────────────────────────────
 
 def batch_main():
@@ -1731,7 +1530,4 @@ def _self_check() -> None:
     print("[maidata-parser] 自检通过")
 
 
-if __name__ == "__main__":
-    import sys
-
-    batch_main() if "--batch" in sys.argv else _self_check()
+'''

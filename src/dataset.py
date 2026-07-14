@@ -1,494 +1,163 @@
-"""读取冻结 MERT 特征和持久化滑窗谱面索引。"""
+"""训练时现场读取音频，并生成四头事件监督张量。"""
 
-from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-import random
-from typing import NamedTuple
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from chart_cache import require_chart_cache
+
+from audio_features import AudioAugmentation, extract_audio_features, load_audio, sample_augmentation
+from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
 from config import CONFIG
-from maidata_parser import compiler
-from tokenizer import EOS, FRAME_END, FRAME_START, SOS, encode_frame, rotate_token_id, rotate_tokens
+from maidata_parser import parse_maidata
+from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT, _slide_branches
 
 
-# ── Step 2: Validate dataset ─────────────────────────────────────────────
+@dataclass(frozen=True)
+class SongEntry:
+    chart_path: Path
+    audio_path: Path
 
-def validate_dataset(
-    charts_dir: str | Path,
-    cache_dir: str | Path | None = None,
-) -> tuple[list[tuple[Path, Path]], list[tuple[Path, str]]]:
-    """Check audio↔chart pairing and parse correctness."""
-    import hashlib
 
-    charts_dir = Path(charts_dir)
-    cache_dir = Path(cache_dir) if cache_dir else charts_dir.parent / ".cache" / "charts"
+def _target_scale() -> np.ndarray:
+    return np.array((8, 2, round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec), round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)), dtype=np.float32)
 
-    def cache_key(rel_path: str) -> str:
-        return hashlib.md5(rel_path.encode()).hexdigest()
 
-    valid: list[tuple[Path, Path]] = []
-    invalid: list[tuple[Path, str]] = []
-    c = compiler()
+def _note_end_sec(frame: Frame, note: Note) -> float:
+    if note.type in (NoteType.HOLD, NoteType.TOUCH_HOLD):
+        return frame.time_sec + note.data.holdTime
+    if note.type is NoteType.SLIDE:
+        return frame.time_sec + max((sum(
+            segment.wait_duration + segment.trace_duration for segment in branch
+        ) for branch in _slide_branches(note)), default=0.0)
+    return frame.time_sec
 
+
+def validate_chart_audio_alignment(chart: Chart, audio_duration_sec: float, level_idx: int) -> None:
+    level = chart.all_levels[level_idx]
+    if level is None:
+        raise ValueError("缺少目标难度")
+    tolerance = 1 / CONFIG.audio.frames_per_sec
+    for frame in level.frames:
+        start = frame.time_sec + chart.first_sec
+        if start < 0:
+            raise ValueError(f"{start:.3f}s 音符早于音频开头，跳过整首歌")
+        if start >= audio_duration_sec:
+            raise ValueError(f"{start:.3f}s 音符晚于音频结尾 {audio_duration_sec:.3f}s，跳过整首歌")
+        for note in frame.notes:
+            end = _note_end_sec(frame, note) + chart.first_sec
+            if end > audio_duration_sec + tolerance:
+                raise ValueError(f"{end:.3f}s 持续音晚于音频结尾 {audio_duration_sec:.3f}s，跳过整首歌")
+
+
+def chart_to_targets(chart: Chart, length: int, level_idx: int, augmentation: AudioAugmentation | None = None) -> np.ndarray:
+    level = chart.all_levels[level_idx]
+    if level is None:
+        raise ValueError("缺少目标难度")
+    rate = CONFIG.audio.frames_per_sec
+    speed = augmentation.speed if augmentation is not None else 1.0
+    shift = augmentation.shift_sec if augmentation is not None else 0.0
+    targets = np.zeros((length, TRACK_COUNT), dtype=np.float32)
+    for frame in level.frames:
+        start = round(((frame.time_sec + chart.first_sec) / speed + shift) * rate)
+        if not 0 <= start < length:
+            continue
+        for note in frame.notes:
+            if note.type in (NoteType.TAP, NoteType.TOUCH):
+                targets[start, TAP_COUNT] += 1
+            elif note.type in (NoteType.HOLD, NoteType.TOUCH_HOLD):
+                duration = max(1, round(note.data.holdTime / speed * rate))
+                slot = int(targets[start, HOLD_START_COUNT])
+                if slot == 2:
+                    raise ValueError(f"{start / rate:.3f}s 同时开始两个以上长按，跳过整首歌")
+                targets[start, HOLD_START_COUNT] += 1
+                targets[start, HOLD_DURATION_1 + slot] = duration
+            elif note.type is NoteType.SLIDE:
+                for branch in _slide_branches(note):
+                    if not all(segment.is_default_wait for segment in branch):
+                        raise ValueError(f"{start / rate:.3f}s SLIDE 使用非默认等待，跳过整首歌")
+                    duration = max(1, round(sum(
+                        segment.wait_duration + segment.trace_duration for segment in branch
+                    ) / speed * rate))
+                    slot = int(targets[start, HOLD_START_COUNT])
+                    if slot == 2:
+                        raise ValueError(f"{start / rate:.3f}s 同时开始两个以上长按，跳过整首歌")
+                    targets[start, HOLD_START_COUNT] += 1
+                    targets[start, HOLD_DURATION_1 + slot] = duration
+    scale = _target_scale()
+    if (targets > scale).any():
+        raise ValueError("事件数量或长按时长超出归一化范围，跳过整首歌")
+    return targets / scale
+
+
+def discover_songs(charts_dir: Path, level_idx: int) -> tuple[list[SongEntry], list[str]]:
+    entries, skipped = [], []
     for chart_path in sorted(charts_dir.rglob("maidata.txt")):
-        chart_dir = chart_path.parent
-        track_path = chart_dir / "track.mp3"
-
-        if not track_path.exists():
-            invalid.append((chart_path, "missing track.mp3"))
+        audio_path = chart_path.parent / "track.mp3"
+        if not audio_path.is_file():
             continue
-
-        rel = str(chart_dir.relative_to(charts_dir))
-        mel_path = cache_dir / f"{cache_key(rel)}.npy"
-        if not mel_path.exists():
-            invalid.append((chart_path, "missing mel cache"))
-            continue
-
+        relative = str(chart_path.parent.relative_to(charts_dir))
         try:
-            text = chart_path.read_text(encoding="utf-8")
-            c.parse(text)
-        except Exception as e:
-            invalid.append((chart_path, f"parse error: {e}"))
-            continue
-
-        valid.append((chart_path, mel_path))
-
-    return valid, invalid
-
-
-# ── Step 3: Compile charts & build index ──────────────────────────────────
-
-PREFIX_START_SEC = CONFIG.window.prefix_start_sec
-TARGET_START_SEC = CONFIG.window.target_start_sec
-TARGET_END_SEC = CONFIG.window.target_end_sec
+            chart = parse_maidata(chart_path.read_text(encoding="utf-8"))
+            waveform, sample_rate = load_audio(audio_path)
+            audio_duration_sec = waveform.shape[-1] / sample_rate
+            validate_chart_audio_alignment(chart, audio_duration_sec, level_idx)
+            length = max(1, round(audio_duration_sec * CONFIG.audio.frames_per_sec) + 1)
+            chart_to_targets(chart, length, level_idx)
+            entries.append(SongEntry(chart_path, audio_path))
+        except Exception as error:
+            skipped.append(f"{relative}: {error}")
+    return entries, skipped
 
 
-class _IndexEntry(NamedTuple):
-    mel_path: Path
-    source_start_frame: int
-    source_end_frame: int
-    left_pad_frames: int
-    window_start_sec: float
-    target_start_sec: float
-    tokens: list[int]
-    loss_mask: list[bool]
-
-
-@dataclass
-class _CachedIndexEntry:
-    mel_path: Path
-    source_start_frame: int
-    source_end_frame: int
-    left_pad_frames: int
-    window_start_sec: float
-    target_start_sec: float
-    tokens: np.ndarray
-    loss_start: int
-
-    @property
-    def loss_mask(self) -> np.ndarray:
-        mask = np.zeros(len(self.tokens), dtype=bool)
-        mask[self.loss_start:] = True
-        return mask
-
-
-class _CachedIndex:
-    """只保留窗口行号，具体 token 与元数据按需从 mmap 读取。"""
-
-    def __init__(self, cache_path: Path, charts_dir: Path, cache_dir: Path, selected_charts: set[Path] | None = None):
-        import json
-
-        manifest = json.loads((cache_path / "manifest.json").read_text(encoding="utf-8"))
-        self.rows = np.load(cache_path / "entries.npy", mmap_mode="r")
-        self.tokens = np.load(cache_path / "tokens.npy", mmap_mode="r")
-        self.mel_paths = [cache_dir.parent / chart["mel"] for chart in manifest["charts"]]
-        self.chart_paths = [charts_dir / chart["chart"] for chart in manifest["charts"]]
-        if selected_charts is None:
-            self.indices = np.arange(len(self.rows), dtype=np.int64)
-        else:
-            selected_ids = {i for i, path in enumerate(self.chart_paths) if path in selected_charts}
-            self.indices = np.flatnonzero(np.isin(self.rows["chart_id"], list(selected_ids)))
+class SongDataset(Dataset):
+    def __init__(self, entries: list[SongEntry], level_idx: int, augment: bool = False):
+        self.entries, self.level_idx, self.augment = entries, level_idx, augment
 
     def __len__(self) -> int:
-        return len(self.indices)
+        return len(self.entries)
 
-    def __getitem__(self, index: int) -> _CachedIndexEntry:
-        row = self.rows[self.indices[index]]
-        token_start = int(row["token_start"])
-        token_end = token_start + int(row["token_length"])
-        return _CachedIndexEntry(
-            mel_path=self.mel_paths[int(row["chart_id"])],
-            source_start_frame=int(row["source_start_frame"]),
-            source_end_frame=int(row["source_end_frame"]),
-            left_pad_frames=int(row["left_pad_frames"]),
-            window_start_sec=float(row["window_start_sec"]),
-            target_start_sec=float(row["target_start_sec"]),
-            tokens=self.tokens[token_start:token_end],
-            loss_start=int(row["loss_start"]),
-        )
+    def __getitem__(self, index: int) -> dict:
+        entry = self.entries[index]
+        augmentation = sample_augmentation() if self.augment else None
+        features = extract_audio_features(entry.audio_path, augmentation=augmentation)
+        chart = parse_maidata(entry.chart_path.read_text(encoding="utf-8"))
+        return {"features": torch.from_numpy(features), "events": torch.from_numpy(chart_to_targets(chart, len(features), self.level_idx, augmentation)), "entry": entry}
 
 
-def rotate_token_list(tokens: list[int], steps: int) -> list[int]:
-    return rotate_tokens(tokens, steps)
+def collate_songs(items: list[dict]) -> dict:
+    max_length = max(item["features"].shape[0] for item in items)
+    batch, feature_dim = len(items), items[0]["features"].shape[1]
+    features = torch.zeros(batch, max_length, feature_dim)
+    events = torch.zeros(batch, max_length, TRACK_COUNT)
+    mask = torch.zeros(batch, max_length, dtype=torch.bool)
+    for i, item in enumerate(items):
+        length = item["features"].shape[0]
+        features[i, :length], events[i, :length], mask[i, :length] = item["features"], item["events"], True
+    return {"features": features, "events": events, "mask": mask, "entries": [item["entry"] for item in items]}
 
 
-class RotatedDataset(Dataset):
-    """把基础数据集扩成 8 个方向；只旋转 token，不改音频。"""
+def _self_check() -> None:
+    chart = Chart(first_sec=0.2)
+    chart.all_levels[5] = Level("master", 14, [Frame((Note(NoteType.TAP, TapType.LANE1),), 0.1)])
+    targets = chart_to_targets(chart, 100, 5)
+    assert targets[60, TAP_COUNT] == 1 / _target_scale()[TAP_COUNT]
 
-    def __init__(self, base: Dataset, rotations: int = 8):
-        self.base = base
-        self.rotations = rotations
+    augmented = chart_to_targets(chart, 100, 5, AudioAugmentation(speed=2.0, shift_sec=0.1))
+    assert augmented[50, TAP_COUNT] == 1 / _target_scale()[TAP_COUNT]
 
-    def __len__(self) -> int:
-        return len(self.base) * self.rotations
-
-    def __getitem__(self, idx: int) -> dict:
-        item = self.base[idx // self.rotations]
-        steps = idx % self.rotations
-        if steps == 0:
-            return item
-        rotated = dict(item)
-        rotated["tokens"] = torch.tensor(
-            rotate_token_list(item["tokens"].tolist(), steps),
-            dtype=item["tokens"].dtype,
-        )
-        return rotated
-
-
-class AudioAugmentedDataset(Dataset):
-    """仅在训练时在线增强缓存的 MERT 特征，不改变时间或谱面标签。"""
-
-    def __init__(
-        self,
-        base: Dataset,
-        probability: float,
-        noise_std: float,
-        max_time_mask_frames: int,
-    ):
-        self.base = base
-        self.probability = probability
-        self.noise_std = noise_std
-        self.max_time_mask_frames = max_time_mask_frames
-
-    def __len__(self) -> int:
-        return len(self.base)
-
-    def __getitem__(self, idx: int) -> dict:
-        item = self.base[idx]
-        if self.probability == 0 or torch.rand(()) >= self.probability:
-            return item
-
-        augmented = dict(item)
-        mel = item["mel"].clone()
-        valid_frames = item["audio_mask"].nonzero(as_tuple=True)[0]
-        if self.noise_std > 0:
-            valid = mel[valid_frames]
-            mel[valid_frames] = (
-                valid
-                + torch.randn_like(valid) * valid.std(unbiased=False) * self.noise_std
-            )
-        if self.max_time_mask_frames > 0 and valid_frames.numel() > 1:
-            length = min(self.max_time_mask_frames, valid_frames.numel() - 1)
-            length = torch.randint(1, length + 1, ()).item()
-            start = torch.randint(0, valid_frames.numel() - length + 1, ()).item()
-            mel[valid_frames[start:start + length]] = 0
-        augmented["mel"] = mel
-        return augmented
-
-
-def compile_index(
-    valid_pairs: list[tuple[Path, Path]],
-    level_idx: int,
-    stride_sec: float = CONFIG.window.train_stride_sec,
-    mert_frames: int = CONFIG.window.mert_frames,
-) -> tuple[list[_IndexEntry], int, dict[str, int]]:
-    """构建平移窗口：6..12 秒谱面前缀，12..22 秒训练目标。"""
-    index: list[_IndexEntry] = []
-    max_tokens = 0
-    total_windows = 0
-    total_frames = 0
-    parse_errors = 0
-    c = compiler()
-    frames_per_sec = 75
-    window_sec = mert_frames / frames_per_sec
-
-    for maidata_path, mel_path in valid_pairs:
-        try:
-            text = maidata_path.read_text(encoding="utf-8")
-            c.parse(text)
-        except Exception:
-            parse_errors += 1
-            continue
-
-        level = c.chart.all_levels[level_idx]
-        if level is None:
-            continue
-
-        total_frames += len(level.frames)
-
-        # 只读 shape；实际 mel 数据仍在 __getitem__ 里按需 mmap。
-        mel_arr = np.load(str(mel_path))
-        mel_total_frames = mel_arr.shape[0]
-        del mel_arr
-        song_end_sec = mel_total_frames / frames_per_sec
-
-        target_start = 0.0
-        while target_start < song_end_sec:
-            window_start = target_start - TARGET_START_SEC
-            logical_start_frame = round(window_start * frames_per_sec)
-            source_start = max(0, logical_start_frame)
-            source_end = min(mel_total_frames, logical_start_frame + mert_frames)
-            left_pad = source_start - logical_start_frame
-
-            tl = [SOS]
-            loss_mask = [False]
-            for frame in level.frames:
-                if not frame.notes:
-                    continue
-                rel_cs = round((frame.time_sec - window_start) * 100)
-                is_prefix = round(PREFIX_START_SEC * 100) <= rel_cs < round(TARGET_START_SEC * 100)
-                is_target = round(TARGET_START_SEC * 100) <= rel_cs < round(TARGET_END_SEC * 100)
-                if not (is_prefix or is_target):
-                    continue
-
-                frame_tokens = encode_frame(frame, rel_cs / 100.0)
-                tl.extend(frame_tokens)
-                loss_mask.extend([is_target] * len(frame_tokens))
-            tl.append(EOS)
-            loss_mask.append(True)
-
-            if len(tl) > max_tokens:
-                max_tokens = len(tl)
-
-            index.append(_IndexEntry(
-                mel_path=mel_path,
-                source_start_frame=source_start,
-                source_end_frame=max(source_start, source_end),
-                left_pad_frames=left_pad,
-                window_start_sec=window_start,
-                target_start_sec=target_start,
-                tokens=tl,
-                loss_mask=loss_mask,
-            ))
-            total_windows += 1
-            target_start += stride_sec
-
-    stats = {
-        "charts": len(valid_pairs),
-        "windows": total_windows,
-        "frames": total_frames,
-        "max_tokens": max_tokens,
-        "parse_errors": parse_errors,
-        "window_sec": window_sec,
-        "stride_sec": stride_sec,
-        "prefix_start_sec": PREFIX_START_SEC,
-        "target_start_sec": TARGET_START_SEC,
-        "target_end_sec": TARGET_END_SEC,
-    }
-    return index, max_tokens, stats
-
-
-# ── Step 4: Dataset — iter read, slice on the fly ─────────────────────────
-
-class ChartDataset(Dataset):
-    """Lazy-loading dataset. Slices mel at iteration time.
-
-    Constructor builds index (coords + tokens only).
-    __getitem__ loads mel from disk and slices on the fly.
-    """
-
-    def __init__(
-        self,
-        charts_dir: str | Path,
-        cache_dir: str | Path | None = None,
-        level_idx: int = CONFIG.training.level_idx,
-        max_tokens: int = 0,
-        stride_sec: float = CONFIG.window.train_stride_sec,
-        mert_frames: int = CONFIG.window.mert_frames,
-        valid_pairs: list[tuple[Path, Path]] | None = None,
-        chart_limit: int = 0,
-        seed: int = CONFIG.training.seed,
-    ):
-        self.charts_dir = Path(charts_dir)
-        self.cache_dir = Path(cache_dir) if cache_dir else CONFIG.paths.mert_cache_dir
-        self.level_idx = level_idx
-        self.feature_size = CONFIG.model.state
-        self.stride_sec = stride_sec
-        self.mert_frames = mert_frames
-        self._mert_cache: OrderedDict[Path, np.ndarray] = OrderedDict()
-
-        if not self.charts_dir.is_dir():
-            raise ValueError(f"谱面目录不存在或不是目录: {self.charts_dir}")
-        if self.cache_dir.exists() and not self.cache_dir.is_dir():
-            raise ValueError(f"梅尔缓存路径不是目录: {self.cache_dir}")
-
-        cache_path = require_chart_cache(
-            self.charts_dir,
-            self.cache_dir,
-            level_idx=level_idx,
-            stride_sec=stride_sec,
-            mert_frames=mert_frames,
-        )
-        all_index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir)
-        all_valid = list(zip(all_index.chart_paths, all_index.mel_paths))
-        valid = list(valid_pairs) if valid_pairs is not None else all_valid
-        if chart_limit > 0 and len(valid) > chart_limit:
-            rng = random.Random(seed)
-            valid = rng.sample(valid, chart_limit)
-            valid.sort()
-        self.valid_pairs = valid
-        self._index = _CachedIndex(cache_path, self.charts_dir, self.cache_dir, {path for path, _ in valid})
-        computed_max = max((len(entry.tokens) for entry in self._index), default=0)
-        if max_tokens > 0 and computed_max > max_tokens:
-            raise ValueError(
-                f"配置的最大词元数 {max_tokens} 装不下数据；当前窗口最大需要 {computed_max} 个词元"
-            )
-        self.max_tokens = max_tokens if max_tokens > 0 else computed_max
-        print(f"[dataset] 缓存索引: {len(valid)} 首歌，{len(self._index)} 个窗口，max_tokens={self.max_tokens}")
-
-    def __len__(self) -> int:
-        return len(self._index)
-
-    def __getitem__(self, idx: int) -> dict:
-        entry = self._index[idx]
-
-        # 每个 DataLoader worker 复用 mmap，避免同一首歌的分段反复从磁盘读整文件。
-        mert_full = self._mert_cache.get(entry.mel_path)
-        if mert_full is None:
-            mert_full = np.load(str(entry.mel_path), mmap_mode="r")
-            if mert_full.ndim != 2 or mert_full.shape[1] != self.feature_size:
-                raise ValueError(
-                    f"MERT 缓存形状错误: {entry.mel_path} 为 {mert_full.shape}，"
-                    f"当前配置需要 (时间帧数, {self.feature_size})"
-                )
-            self._mert_cache[entry.mel_path] = mert_full
-            # ponytail: 每个 worker 最多保持 8 个 mmap；需要更多时再按命中率调大。
-            if len(self._mert_cache) > 8:
-                self._mert_cache.popitem(last=False)
-        else:
-            self._mert_cache.move_to_end(entry.mel_path)
-        source = torch.from_numpy(
-            mert_full[entry.source_start_frame:entry.source_end_frame].copy()
-        ).float()
-        mel_slice = torch.zeros(self.mert_frames, self.feature_size)
-        audio_mask = torch.zeros(self.mert_frames, dtype=torch.bool)
-        copy_len = min(source.shape[0], self.mert_frames - entry.left_pad_frames)
-        if copy_len > 0:
-            mel_slice[entry.left_pad_frames:entry.left_pad_frames + copy_len] = source[:copy_len]
-            audio_mask[entry.left_pad_frames:entry.left_pad_frames + copy_len] = True
-
-        # ── pad tokens ──
-        tl = entry.tokens
-        if len(tl) > self.max_tokens:
-            raise ValueError(f"窗口 token 数 {len(tl)} 超过 max_tokens={self.max_tokens}，拒绝截断合法序列")
-        length = len(tl)
-        if length >= self.max_tokens:
-            tokens = torch.from_numpy(np.asarray(tl[:self.max_tokens], dtype=np.int64))
-            mask = torch.ones(self.max_tokens, dtype=torch.bool)
-        else:
-            tokens = torch.zeros(self.max_tokens, dtype=torch.int64)
-            tokens[:length] = torch.from_numpy(np.asarray(tl, dtype=np.int64))
-            mask = torch.cat([
-                torch.ones(length, dtype=torch.bool),
-                torch.zeros(self.max_tokens - length, dtype=torch.bool),
-            ])
-
-        loss_mask = torch.zeros(self.max_tokens, dtype=torch.bool)
-        loss_mask[entry.loss_start:length] = True
-        return {
-            "mel": mel_slice,
-            "audio_mask": audio_mask,
-            "tokens": tokens,
-            "mask": mask,
-            "loss_mask": loss_mask,
-            "window_start_sec": entry.window_start_sec,
-            "target_start_sec": entry.target_start_sec,
-        }
-
-
-# ── collate ───────────────────────────────────────────────────────────────
-
-def collate_segments(batch: list[dict], mert_frames: int = 0) -> dict:
-    """把固定长度 MERT 窗口组成 batch。"""
-    feature_size = batch[0]["mel"].shape[1]
-
-    if mert_frames <= 0:
-        mert_frames = max(item["mel"].shape[0] for item in batch)
-
-    mels = torch.zeros(len(batch), mert_frames, feature_size)
-    audio_masks = torch.zeros(len(batch), mert_frames, dtype=torch.bool)
-    for i, item in enumerate(batch):
-        mel = item["mel"]
-        T = mel.shape[0]
-        mels[i, :min(T, mert_frames)] = mel[:mert_frames]
-        audio_masks[i, :min(T, mert_frames)] = item["audio_mask"][:mert_frames]
-
-    return {
-        "mel": mels,
-        "audio_mask": audio_masks,
-        "tokens": torch.stack([item["tokens"] for item in batch]),
-        "mask": torch.stack([item["mask"] for item in batch]),
-        "loss_mask": torch.stack([item["loss_mask"] for item in batch]),
-        "window_start_sec": torch.tensor([item["window_start_sec"] for item in batch]),
-        "target_start_sec": torch.tensor([item["target_start_sec"] for item in batch]),
-    }
-
-
-# ── self-check ────────────────────────────────────────────────────────────
-
-def _self_check():
-    base_item = {
-        "mel": torch.tensor([[0.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [0.0, 0.0]]),
-        "audio_mask": torch.tensor([False, True, True, True, False]),
-        "tokens": torch.tensor([SOS, EOS]),
-        "mask": torch.tensor([True, True]),
-        "loss_mask": torch.tensor([False, True]),
-        "window_start_sec": 0.0,
-        "target_start_sec": 12.0,
-    }
-    torch.manual_seed(0)
-    augmented = AudioAugmentedDataset([base_item], 1.0, 0.1, 2)[0]
-    torch.manual_seed(0)
-    repeated = AudioAugmentedDataset([base_item], 1.0, 0.1, 2)[0]
-    assert torch.equal(augmented["mel"], repeated["mel"])
-    assert torch.equal(
-        base_item["mel"],
-        torch.tensor([[0.0, 0.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0], [0.0, 0.0]]),
-    )
-    assert torch.equal(augmented["audio_mask"], base_item["audio_mask"])
-    assert torch.equal(augmented["tokens"], base_item["tokens"])
-    assert not augmented["mel"][~base_item["audio_mask"]].any()
-
-    charts_dir = CONFIG.paths.charts_dir
-    if not charts_dir.exists():
-        print("[dataset] charts/ not found, skipping self-check")
-        return
-
-    ds = ChartDataset(charts_dir, max_tokens=CONFIG.model.max_tokens, level_idx=CONFIG.training.level_idx)
-    print(f"[dataset] total: {len(ds)} segments")
-
-    if len(ds) > 0:
-        item = ds[0]
-        t = item["tokens"]
-        assert t[0] == SOS, f"Expected SOS, got {t[0]}"
-        non_pad = t[t != 0]
-        assert non_pad[-1].item() == EOS, f"Expected EOS, got {non_pad[-1].item()}"
-        assert item["audio_mask"].dtype == torch.bool
-        assert item["audio_mask"].shape == (ds.mert_frames,)
-        assert item["audio_mask"].any()
-        print(f"  mel={item['mel'].shape} tokens={item['tokens'].shape} "
-              f"mask_true={item['mask'].sum().item()}")
-        print(f"  SOS={t[0].item()} EOS={non_pad[-1].item()} ✓")
-
-    batch = [ds[i] for i in range(min(4, len(ds)))]
-    c = collate_segments(batch)
-    assert torch.equal(c["audio_mask"], torch.stack([item["audio_mask"] for item in batch]))
-    print(f"  batch: mel={c['mel'].shape} tokens={c['tokens'].shape}")
-    print("[dataset] ✓ self-check passed")
+    long_chart = Chart(first_sec=0.2)
+    long_chart.all_levels[5] = Level("master", 14, [Frame((
+        Note(NoteType.HOLD, HoldData(TapType.LANE1, 0.2)),
+    ), 0.7)])
+    try:
+        validate_chart_audio_alignment(long_chart, 1.0, 5)
+    except ValueError as error:
+        assert "持续音晚于音频结尾" in str(error)
+    else:
+        raise AssertionError("超出音频的持续音必须被拒绝")
+    print("[dataset] 自检通过")
 
 
 if __name__ == "__main__":

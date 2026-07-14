@@ -1,373 +1,114 @@
-"""Sliding-window inference for maimai chart generation.
+"""四头事件 CNN 正式推理入口。"""
 
-Usage:
-    uv run src/infer.py <audio_file> [--checkpoint ckpts/best.pt] [--level 5] [--out output.txt]
-"""
-
-import argparse
-import math
 import shutil
 from pathlib import Path
 
 import numpy as np
 import torch
-from config import CONFIG, validate_checkpoint_config
-from model import Whisper, ModelDimensions
-from constrained_decode import allowed_tokens
-from maidata_parser import (
-    compiler, Chart, Level, Frame, Note, NoteType, TapType,
-)
-from tokenizer import PAD, SOS, EOS, VOCAB_SIZE, FRAME_END, decode_frames, encode_frame
-from mert_cache import extract_audio_features, feature_signature
 
-# ──────────────────── defaults ────────────────────
-
-SAMPLE_RATE = 75
-HOP_LENGTH = 1
-N_MELS = CONFIG.model.state
-MAX_TOKENS = CONFIG.model.max_tokens
-WINDOW_FRAMES = CONFIG.window.mert_frames
-DEFAULT_LEVEL = CONFIG.inference.level_idx
-PREFIX_START_SEC = CONFIG.window.prefix_start_sec
-TARGET_START_SEC = CONFIG.window.target_start_sec
-TARGET_END_SEC = CONFIG.window.target_end_sec
-DEFAULT_COMMIT_SEC = CONFIG.window.infer_stride_sec
+from audio_features import extract_audio_features
+from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
+from config import CONFIG, checkpoint_config
+from maidata_parser import generate_maidata
+from model import ChartCNN, ModelDimensions
+from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT
 
 
-def _level_arg(value: str) -> int:
-    level = int(value)
-    if not 0 <= level <= 6:
-        raise argparse.ArgumentTypeError("难度编号必须在 0 到 6 之间")
-    return level
+MODEL_KIND = "log-mel-full-song-event-cnn-v4"
 
 
-def _nonnegative_float_arg(value: str) -> float:
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
-        raise argparse.ArgumentTypeError("必须是大于等于 0 的有限数字")
-    return number
+def _scale() -> np.ndarray:
+    duration = round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)
+    return np.array((8, 2, duration, duration), dtype=np.float32)
 
 
-def load_model(ckpt_path: str | Path, device: torch.device) -> tuple[Whisper, ModelDimensions]:
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    if ckpt.get("checkpoint_version") != 4 or ckpt.get("model_kind") != "mert-window-decoder-v3":
+def load_model(path: str | Path, device: torch.device) -> tuple[ChartCNN, ModelDimensions]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if checkpoint.get("checkpoint_version") != 4 or checkpoint.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自旧架构，拒绝加载")
-    if ckpt.get("feature_signature") != feature_signature():
-        raise ValueError("检查点使用的 MERT 特征实现与当前环境不一致")
-    dims: ModelDimensions = ckpt["dims"]
-    validate_checkpoint_config(
-        ckpt.get("config"),
-        CONFIG,
-        for_training=False,
-    )
-    if dims.n_state != N_MELS:
-        raise ValueError(f"检查点状态维度与 MERT 输出不兼容: {dims.n_state}")
-    if dims.n_audio_ctx != WINDOW_FRAMES:
-        raise ValueError(f"检查点特征帧数为 {dims.n_audio_ctx}，当前配置为 {WINDOW_FRAMES}")
-    if dims.n_text_ctx != MAX_TOKENS:
-        raise ValueError(f"检查点最大词元数为 {dims.n_text_ctx}，当前配置为 {MAX_TOKENS}")
-    model = Whisper(dims).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
+    if checkpoint.get("config") != checkpoint_config():
+        raise ValueError("检查点的音频或模型配置与当前配置不一致")
+    model = ChartCNN(checkpoint["dims"]).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    expected = {
-        "mert_frames": WINDOW_FRAMES,
-        "prefix_start_sec": PREFIX_START_SEC,
-        "target_start_sec": TARGET_START_SEC,
-        "target_end_sec": TARGET_END_SEC,
-        "infer_stride_sec": DEFAULT_COMMIT_SEC,
-    }
-    config = ckpt.get("window_config")
-    if config is not None:
-        for key, value in expected.items():
-            if config.get(key) != value:
-                raise ValueError(f"checkpoint 窗口配置不兼容: {key}={config.get(key)!r}, 当前需要 {value!r}")
-    print(f"[infer] loaded checkpoint epoch={ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', '?')}")
-    return model, dims
-
-
-def audio_to_mel(path: str | Path, device: torch.device) -> np.ndarray:
-    """提取整曲冻结 MERT 特征，返回 (T, 768)。"""
-    features = extract_audio_features(path, device)
-    print(f"[infer] MERT特征形状: {features.shape}")
-    return features
+    print(f"[infer] 加载 checkpoint epoch={checkpoint.get('epoch', '?')}")
+    return model, checkpoint["dims"]
 
 
 @torch.no_grad()
-def decode_segment(
-    model: Whisper,
-    mel_slice: torch.Tensor,   # (T, 768)
-    device: torch.device,
-    max_tokens: int = MAX_TOKENS,
-    constrained: bool = True,
-    prefix_tokens: list[int] | None = None,
-    audio_mask: torch.Tensor | None = None,
-    return_stats: bool = False,
-    verbose: bool = True,
-) -> list[int] | tuple[list[int], dict[str, int | bool]]:
-    """Autoregressive greedy decode one mel segment. Returns full token list incl. SOS/EOS."""
-    mel = mel_slice.unsqueeze(0).to(device)
-    if audio_mask is None:
-        audio_mask = torch.ones(mel_slice.shape[0], dtype=torch.bool)
-    audio_mask = audio_mask.unsqueeze(0).to(device)
+def predict_events(model: ChartCNN, features: np.ndarray, device: torch.device) -> np.ndarray:
+    tensor = torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(device)
+    mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        audio_features = model.embed_audio(mel, audio_mask)
-
-    tokens = list(prefix_tokens or [SOS])
-    prefix_len = len(tokens)
-    if len(tokens) >= max_tokens:
-        raise ValueError(f"decoder 前缀长度 {len(tokens)} 已达到 max_tokens={max_tokens}")
-
-    kv_cache = model.new_kv_cache(audio_features)
-    dec_input = torch.tensor([tokens], dtype=torch.long, device=device)
-    with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        logits = model.logits(dec_input, audio_features, audio_mask, kv_cache=kv_cache)
-    next_logits = logits[0, -1, :]
-
-    stop_reason = "token_budget"
-    while len(tokens) < max_tokens - 1:
-        if constrained:
-            allowed = allowed_tokens(
-                tokens,
-                min_frame_time=round(TARGET_START_SEC * 100),
-                max_frame_time=round(TARGET_END_SEC * 100) - 1,
-            )
-            if not allowed:
-                stop_reason = "grammar_dead_end"
-                break
-            masked = torch.full_like(next_logits, float("-inf"))
-            masked[list(allowed)] = next_logits[list(allowed)]
-            next_logits = masked
-        next_token = next_logits.argmax().item()
-
-        if next_token == EOS:
-            tokens.append(next_token)
-            stop_reason = "eos"
-            break
-        if next_token == PAD:
-            tokens.append(EOS)
-            stop_reason = "pad"
-            break
-        tokens.append(next_token)
-        dec_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-            logits = model.logits(dec_input, audio_features, audio_mask, kv_cache=kv_cache)
-        next_logits = logits[0, 0, :]
-
-    raw_new_tokens = len(tokens) - prefix_len
-    dropped_tokens = 0
-    if stop_reason in ("token_budget", "grammar_dead_end") and tokens[-1] != EOS:
-        # 异常终止时可能停在 TAP/Slide/frame 中间；只保留完整帧。
-        try:
-            last_frame_end = len(tokens) - 1 - tokens[::-1].index(FRAME_END)
-        except ValueError:
-            last_frame_end = len(prefix_tokens or [SOS]) - 1
-        dropped_tokens = len(tokens) - last_frame_end - 1
-        tokens = tokens[:last_frame_end + 1]
-        tokens.append(EOS)
-        if dropped_tokens and verbose:
-            print(f"[infer] {stop_reason}，丢弃尾部 {dropped_tokens} 个未闭合 token")
-    stats = {
-        "stop_reason": stop_reason,
-        "hit_limit": stop_reason == "token_budget",
-        "grammar_dead_end": stop_reason == "grammar_dead_end",
-        "raw_new_tokens": raw_new_tokens,
-        "new_tokens": len(tokens) - prefix_len,
-        "dropped_tokens": dropped_tokens,
-    }
-    return (tokens, stats) if return_stats else tokens
+        events = model(tensor, mask)[0]
+    return (events.float().cpu().numpy() * _scale()).round().astype(np.int32)
 
 
-def fit_logical_window(
-    mel: np.ndarray,
-    logical_start_frame: int,
-    window: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    source_start = max(0, logical_start_frame)
-    source_end = min(mel.shape[0], logical_start_frame + window)
-    left_pad = source_start - logical_start_frame
-    out = np.zeros((window, N_MELS), dtype=mel.dtype)
-    audio_mask = torch.zeros(window, dtype=torch.bool)
-    if source_end > source_start:
-        source = mel[source_start:source_end]
-        out[left_pad:left_pad + source.shape[0]] = source
-        audio_mask[left_pad:left_pad + source.shape[0]] = True
-    return torch.from_numpy(out.copy()).float(), audio_mask
-
-
-def _prefix_relative_cs(frame: Frame, window_start_sec: float) -> int | None:
-    """与训练缓存一致：先量化到厘秒，再判断前缀区间。"""
-    rel_cs = round((frame.time_sec - window_start_sec) * 100)
-    return rel_cs if round(PREFIX_START_SEC * 100) <= rel_cs < round(TARGET_START_SEC * 100) else None
-
-
-def frames_to_prefix_tokens(frames: list[Frame], window_start_sec: float) -> list[int]:
-    tokens = [SOS]
-    for frame in frames:
-        rel_cs = _prefix_relative_cs(frame, window_start_sec)
-        if rel_cs is None:
-            continue
-        tokens.extend(encode_frame(frame, rel_cs / 100.0))
-    return tokens
-
-
-def overlap_infer(
-    model: Whisper,
-    mel: np.ndarray,
-    device: torch.device,
-    window: int = WINDOW_FRAMES,
-    commit_sec: float = DEFAULT_COMMIT_SEC,
-    start_sec: float = 0.0,
-    max_tokens: int = MAX_TOKENS,
-    verbose: bool = True,
-    return_stats: bool = False,
-) -> list[Frame] | tuple[list[Frame], dict[str, int]]:
-    """使用上一窗口最后 6 秒 token 作为前缀，生成中间 10 秒。"""
-    frames_per_sec = SAMPLE_RATE / HOP_LENGTH
-    total_sec = mel.shape[0] / frames_per_sec
-    window_sec = window / frames_per_sec
-    if abs(commit_sec - DEFAULT_COMMIT_SEC) > 1e-6:
-        raise ValueError(f"当前模型窗口固定提交 {DEFAULT_COMMIT_SEC:.0f}s，不支持 commit_sec={commit_sec}")
-    committed: list[Frame] = []
-    limit_windows = 0
-    dead_end_windows = 0
-    eos_windows = 0
-    total_new_tokens = 0
-    total_raw_new_tokens = 0
-    total_dropped_tokens = 0
-
-    commit_start = max(0.0, start_sec)
-    window_i = 0
-    while commit_start < total_sec:
-        window_start = commit_start - TARGET_START_SEC
-        logical_start_frame = round(window_start * frames_per_sec)
-        window_end_sec = window_start + window_sec
-        commit_end = min(commit_start + commit_sec, total_sec)
-
-        prefix_frames = [f for f in committed if _prefix_relative_cs(f, window_start) is not None]
-        prefix_tokens = frames_to_prefix_tokens(prefix_frames, window_start)
-        mel_tensor, audio_mask = fit_logical_window(mel, logical_start_frame, window)
-        tokens, decode_stats = decode_segment(
-            model,
-            mel_tensor,
-            device,
-            max_tokens=max_tokens,
-            prefix_tokens=prefix_tokens,
-            audio_mask=audio_mask,
-            return_stats=True,
-            verbose=verbose,
-        )
-        limit_windows += int(decode_stats["hit_limit"])
-        dead_end_windows += int(decode_stats["grammar_dead_end"])
-        eos_windows += int(decode_stats["stop_reason"] in ("eos", "pad"))
-        total_new_tokens += int(decode_stats["new_tokens"])
-        total_raw_new_tokens += int(decode_stats["raw_new_tokens"])
-        total_dropped_tokens += int(decode_stats["dropped_tokens"])
-        generated_body = [t for t in tokens[len(prefix_tokens):] if t not in (SOS, EOS, PAD)]
-        rel_frames = decode_frames(generated_body)
-
-        accepted = 0
-        for frame in rel_frames:
-            if not (TARGET_START_SEC <= frame.time_sec < TARGET_END_SEC):
+def events_to_frames(events: np.ndarray) -> tuple[list[Frame], dict[str, int]]:
+    if events.ndim != 2 or events.shape[1] != TRACK_COUNT:
+        raise ValueError(f"事件张量形状必须为 (T, {TRACK_COUNT})")
+    grouped: dict[int, list[Note]] = {}
+    dropped = 0
+    last_tap = -CONFIG.inference.short_min_gap_frames
+    for frame, values in enumerate(events):
+        tap_count = max(0, int(values[TAP_COUNT]))
+        if tap_count and frame - last_tap >= CONFIG.inference.short_min_gap_frames:
+            for index in range(tap_count):
+                grouped.setdefault(frame, []).append(Note(NoteType.TAP, (TapType.LANE1, TapType.LANE8)[index % 2]))
+            last_tap = frame
+        else:
+            dropped += tap_count
+        for slot in range(min(2, max(0, int(values[HOLD_START_COUNT])))):
+            duration_frames = int(values[HOLD_DURATION_1 + slot])
+            if duration_frames <= 0:
                 continue
-            abs_time = window_start + frame.time_sec
-            if not (commit_start <= abs_time < commit_end):
-                continue
-            f = Frame(notes=frame.notes, time_sec=abs_time)
-            committed.append(f)
-            accepted += 1
-
-        if verbose:
-            print(
-                f"[infer]   overlap window {window_i} {window_start:.1f}..{window_end_sec:.1f}s "
-                f"prefix={len(prefix_frames)} commit {commit_start:.1f}..{commit_end:.1f}s "
-                f"frames={len(rel_frames)} kept={accepted}"
-            )
-
-        commit_start += commit_sec
-        window_i += 1
-
-    frames = sorted(committed, key=lambda f: f.time_sec)
-    stats = {
-        "windows": window_i,
-        "limit_windows": limit_windows,
-        "dead_end_windows": dead_end_windows,
-        "eos_windows": eos_windows,
-        "new_tokens": total_new_tokens,
-        "raw_new_tokens": total_raw_new_tokens,
-        "dropped_tokens": total_dropped_tokens,
-    }
-    return (frames, stats) if return_stats else frames
+            duration = min(CONFIG.inference.max_duration_sec, max(CONFIG.inference.min_duration_sec, duration_frames / CONFIG.audio.frames_per_sec))
+            grouped.setdefault(frame, []).append(Note(NoteType.HOLD, HoldData((TapType.LANE2, TapType.LANE3)[slot], duration)))
+    frames = [Frame(tuple(notes), frame / CONFIG.audio.frames_per_sec) for frame, notes in sorted(grouped.items())]
+    return frames, {"events": sum(len(notes) for notes in grouped.values()), "dropped": dropped}
 
 
-def frames_to_maidata(frames: list[Frame], level_idx: int) -> str:
-    c = compiler()
-    c.chart = Chart(all_levels=[None] * 7, title="generated", artist="default")
-    c.chart.all_levels[level_idx] = Level(
-        level_name=f"level_{level_idx + 1}",
-        level_query=0.0,
-        frames=sorted(frames, key=lambda f: f.time_sec),
-    )
-    return c.generate()
+def infer_features(model: ChartCNN, features: np.ndarray, device: torch.device):
+    events = predict_events(model, features, device)
+    frames, stats = events_to_frames(events)
+    return frames, {**stats, "tap_events": int(events[:, TAP_COUNT].sum()), "hold_events": int(events[:, HOLD_START_COUNT].sum())}
 
 
-def save_inference_files(audio_path: Path, maidata_text: str, out_path: Path | None) -> Path:
-    infer_dir = Path(__file__).resolve().parent.parent / "tmp" / "infer"
-    infer_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(audio_path, infer_dir / audio_path.name)
-    generated_path = infer_dir / "maidata.txt"
-    generated_path.write_text(maidata_text, encoding="utf-8")
-    if out_path is not None and out_path.resolve() != generated_path.resolve():
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(maidata_text, encoding="utf-8")
-    return generated_path
+def frames_to_maidata(frames: list[Frame], level_idx: int, title: str = "generated") -> str:
+    chart = Chart(title=title, artist="generated")
+    chart.all_levels[level_idx] = Level(f"level_{level_idx + 1}", 0.0, frames)
+    return generate_maidata(chart)
+
+
+def save_inference_files(audio_path: Path, text: str, out_dir: Path) -> Path:
+    if out_dir.exists() and any(out_dir.iterdir()):
+        raise ValueError(f"推理输出目录必须为空: {out_dir}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(audio_path, out_dir / "track.mp3")
+    generated = out_dir / "maidata.txt"
+    generated.write_text(text, encoding="utf-8")
+    return generated
 
 
 def _self_check() -> None:
-    mel = np.arange(5 * N_MELS, dtype=np.float32).reshape(5, N_MELS)
-    window, mask = fit_logical_window(mel, -2, 8)
-    assert window.shape == (8, N_MELS)
-    assert mask.tolist() == [False, False, True, True, True, True, True, False]
-    assert torch.equal(window[2:7], torch.from_numpy(mel))
-    assert not window[~mask].any()
-
-    window, mask = fit_logical_window(mel, 2, 5)
-    assert mask.tolist() == [True, True, True, False, False]
-    assert torch.equal(window[:3], torch.from_numpy(mel[2:]))
+    events = np.zeros((20, TRACK_COUNT), dtype=np.int32)
+    events[3] = (2, 1, 20, 0)
+    frames, stats = events_to_frames(events)
+    assert len(frames) == 1 and len(frames[0].notes) == 3
+    assert frames[0].time_sec == 3 / CONFIG.audio.frames_per_sec
+    assert stats == {"events": 3, "dropped": 0}
+    print("[infer] 自检通过")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="maimai chart inference")
-    parser.add_argument("audio", type=str, help="Path to audio file")
-    parser.add_argument("--checkpoint", type=Path, default=CONFIG.inference.checkpoint)
-    parser.add_argument("--level", type=_level_arg, default=DEFAULT_LEVEL)
-    parser.add_argument("--out", type=str, default=None, help="Output text file path")
-    parser.add_argument("--start-sec", type=_nonnegative_float_arg, default=CONFIG.inference.start_sec)
-    args = parser.parse_args()
-
-    device = torch.device(
-        "cuda" if torch.cuda.is_available()
-        else "mps" if torch.backends.mps.is_available()
-        else "cpu"
-    )
-    print(f"[infer] device: {device}")
-
-    model, dims = load_model(args.checkpoint, device)
-
-    audio_path = Path(args.audio)
-    if not audio_path.exists():
-        print(f"[infer] ERROR: {audio_path} not found")
-        return
-
-    mel = audio_to_mel(audio_path, device)
-    frames = overlap_infer(model, mel, device, start_sec=args.start_sec)
-    print(f"[infer] total frames: {len(frames)}")
-    maidata_text = frames_to_maidata(frames, level_idx=args.level)
-
-    out_path = Path(args.out) if args.out else None
-    generated_path = save_inference_files(audio_path, maidata_text, out_path)
-    if out_path is not None:
-        print(f"[infer] saved to '{out_path}'")
-    print(f"[infer] inference files saved to '{generated_path.parent}'")
+def main() -> None:
+    audio_path = CONFIG.inference.audio_path
+    output_dir = CONFIG.paths.inference_output_dir / audio_path.stem
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = load_model(CONFIG.inference.checkpoint, device)
+    frames, stats = infer_features(model, extract_audio_features(audio_path, device), device)
+    path = save_inference_files(audio_path, frames_to_maidata(frames, CONFIG.inference.level_idx, audio_path.stem), output_dir)
+    print(f"[infer] 生成 {len(frames)} 帧，丢弃 {stats['dropped']}/{stats['events']} 个事件")
+    print(f"[infer] 输出: {path}")
 
 
 if __name__ == "__main__":
