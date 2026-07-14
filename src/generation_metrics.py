@@ -33,6 +33,19 @@ def _f1(predicted: int, target: int, matched: int) -> tuple[float, float, float]
     return precision, recall, 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
 
+def generation_score(items: list[tuple[str, np.ndarray, np.ndarray, int]]) -> float:
+    """以 Tap 与持续音起点的微平均 F1 均值作为正式选模指标。"""
+    if not items:
+        return 0.0
+    scores = []
+    for channel in (TAP_COUNT, HOLD_START_COUNT):
+        predicted = sum(int(value[:, channel].sum()) for _, _, value, _ in items)
+        target = sum(int(value[:, channel].sum()) for _, value, _, _ in items)
+        matched = sum(int(np.minimum(value[:, channel], prediction[:, channel]).sum()) for _, value, prediction, _ in items)
+        scores.append(_f1(predicted, target, matched)[2])
+    return mean(scores)
+
+
 def _match_lines(predicted: np.ndarray, target: np.ndarray) -> list[str]:
     tap_pred, tap_target = int(predicted[:, 0].sum()), int(target[:, 0].sum())
     long_pred, long_target = int(predicted[:, 1].sum()), int(target[:, 1].sum())
@@ -81,6 +94,7 @@ def _self_check() -> None:
     predicted = np.array(((1, 1, 10, 0), (1, 0, 0, 0), (0, 0, 0, 0)), dtype=np.int32)
     text = "\n".join(format_generation_comparison([("test", target, predicted, 2)]))
     assert "Tap=2/2 (100.0%)" in text and "F1=50.0%" in text and "过滤 Tap=2" in text
+    assert generation_score([("test", target, predicted, 2)]) == 0.75
     print("[generation-metrics] 自检通过")
 
 

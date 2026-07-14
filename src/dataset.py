@@ -6,8 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torchcodec.decoders import AudioDecoder
+from tqdm import tqdm
 
-from audio_features import AudioAugmentation, extract_audio_features, load_audio, sample_augmentation
+from audio_features import AudioAugmentation, extract_audio_features, sample_augmentation
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
 from config import CONFIG
 from maidata_parser import parse_maidata
@@ -94,15 +96,17 @@ def chart_to_targets(chart: Chart, length: int, level_idx: int, augmentation: Au
 
 def discover_songs(charts_dir: Path, level_idx: int) -> tuple[list[SongEntry], list[str]]:
     entries, skipped = [], []
-    for chart_path in sorted(charts_dir.rglob("maidata.txt")):
+    chart_paths = sorted(charts_dir.rglob("maidata.txt"))
+    for chart_path in tqdm(chart_paths, desc="扫描训练歌曲", unit="首"):
         audio_path = chart_path.parent / "track.mp3"
         if not audio_path.is_file():
             continue
         relative = str(chart_path.parent.relative_to(charts_dir))
         try:
             chart = parse_maidata(chart_path.read_text(encoding="utf-8"))
-            waveform, sample_rate = load_audio(audio_path)
-            audio_duration_sec = waveform.shape[-1] / sample_rate
+            audio_duration_sec = AudioDecoder(audio_path).metadata.duration_seconds
+            if audio_duration_sec is None or audio_duration_sec <= 0:
+                raise ValueError("无法读取有效音频时长")
             validate_chart_audio_alignment(chart, audio_duration_sec, level_idx)
             length = max(1, round(audio_duration_sec * CONFIG.audio.frames_per_sec) + 1)
             chart_to_targets(chart, length, level_idx)

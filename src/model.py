@@ -31,7 +31,7 @@ class ResidualConvBlock(nn.Module):
 
 
 class ChartCNN(nn.Module):
-    """整曲 CNN：预测 Tap 数量、长按起始数量及两个长按时长。"""
+    """整曲 CNN：分类预测事件数量，回归预测两个持续音时长。"""
     def __init__(self, dims: ModelDimensions):
         super().__init__()
         self.dims = dims
@@ -39,9 +39,11 @@ class ChartCNN(nn.Module):
         self.input_projection = nn.Conv1d(dims.input_dim, dims.hidden_dim, 1)
         self.blocks = nn.ModuleList([ResidualConvBlock(dims.hidden_dim, dims.kernel_size, 2 ** (i % 5), dims.dropout) for i in range(dims.layers)])
         self.output_norm = nn.LayerNorm(dims.hidden_dim)
-        self.event_head = nn.Conv1d(dims.hidden_dim, 4, 1)
+        self.tap_head = nn.Conv1d(dims.hidden_dim, 9, 1)
+        self.hold_head = nn.Conv1d(dims.hidden_dim, 3, 1)
+        self.duration_head = nn.Conv1d(dims.hidden_dim, 2, 1)
 
-    def forward(self, features: Tensor, mask: Tensor | None = None) -> Tensor:
+    def forward(self, features: Tensor, mask: Tensor | None = None) -> tuple[Tensor, Tensor, Tensor]:
         if features.ndim != 3 or features.shape[-1] != self.dims.input_dim:
             raise ValueError(f"MERT 特征形状错误: {tuple(features.shape)}")
         if mask is not None:
@@ -56,18 +58,24 @@ class ChartCNN(nn.Module):
             if mask is not None:
                 x = x.masked_fill(~mask.unsqueeze(1), 0)
         x = self.output_norm(x.transpose(1, 2)).transpose(1, 2)
-        return torch.sigmoid(self.event_head(F.gelu(x)).transpose(1, 2))
+        x = F.gelu(x)
+        return (
+            self.tap_head(x).transpose(1, 2),
+            self.hold_head(x).transpose(1, 2),
+            torch.sigmoid(self.duration_head(x).transpose(1, 2)),
+        )
 
 
 def _self_check() -> None:
     model = ChartCNN(ModelDimensions(8, 16, 3, 5, 0.0))
     output = model(torch.randn(2, 37, 8), torch.ones(2, 37, dtype=torch.bool))
-    assert output.shape == (2, 37, 4) and (0 <= output).all() and (output <= 1).all()
-    output.mean().backward()
+    assert tuple(value.shape for value in output) == ((2, 37, 9), (2, 37, 3), (2, 37, 2))
+    assert (0 <= output[2]).all() and (output[2] <= 1).all()
+    sum(value.mean() for value in output).backward()
     assert all(parameter.grad is not None for parameter in model.parameters())
     model.eval()
     features = torch.randn(1, 17, 8)
     alone = model(features)
     padded = model(torch.cat((features, torch.zeros(1, 9, 8)), dim=1), torch.tensor([[True] * 17 + [False] * 9]))
-    assert torch.allclose(alone, padded[:, :17])
+    assert all(torch.allclose(left, right[:, :17]) for left, right in zip(alone, padded))
     print("[model] 自检通过")

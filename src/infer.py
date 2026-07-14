@@ -13,7 +13,7 @@ from model import ChartCNN, ModelDimensions
 from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT, chart_to_tracks, maidata_to_tracks, tracks_to_maidata
 
 
-MODEL_KIND = "log-mel-full-song-event-cnn-v5"
+MODEL_KIND = "log-mel-full-song-event-cnn-v6"
 
 
 def _scale() -> np.ndarray:
@@ -23,7 +23,7 @@ def _scale() -> np.ndarray:
 
 def load_model(path: str | Path, device: torch.device) -> tuple[ChartCNN, ModelDimensions]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("checkpoint_version") != 5 or checkpoint.get("model_kind") != MODEL_KIND:
+    if checkpoint.get("checkpoint_version") != 6 or checkpoint.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自旧架构，拒绝加载")
     if checkpoint.get("config") != checkpoint_config():
         raise ValueError("检查点的音频或模型配置与当前配置不一致")
@@ -39,8 +39,10 @@ def predict_events(model: ChartCNN, features: np.ndarray, device: torch.device) 
     tensor = torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(device)
     mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        events = model(tensor, mask)[0]
-    return (events.float().cpu().numpy() * _scale()).round().astype(np.int32)
+        tap_logits, hold_logits, durations = model(tensor, mask)
+    maximum = _scale()[2]
+    duration_frames = torch.expm1(durations[0].float() * np.log1p(maximum)).round().to(torch.int32)
+    return torch.cat((tap_logits[0].argmax(dim=-1, keepdim=True), hold_logits[0].argmax(dim=-1, keepdim=True), duration_frames), dim=-1).cpu().numpy()
 
 
 def events_to_frames(events: np.ndarray) -> tuple[list[Frame], dict[str, int]]:
