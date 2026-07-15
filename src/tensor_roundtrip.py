@@ -83,7 +83,7 @@ def maidata_to_tracks(text: str, level_idx: int = 5, length: int | None = None) 
     return chart_to_tracks(parse_maidata(text), level_idx, length)
 
 
-def tracks_to_chart(tracks: np.ndarray, level_idx: int = 5, title: str = "tensor-roundtrip") -> Chart:
+def tracks_to_chart(tracks: np.ndarray, level_idx: int = 5, title: str = "tensor-roundtrip", level_query: float = 0.0) -> Chart:
     tracks = np.asarray(tracks)
     if tracks.ndim != 2 or tracks.shape[1] != TRACK_COUNT:
         raise ValueError(f"张量形状必须为 (T, {TRACK_COUNT})")
@@ -108,14 +108,14 @@ def tracks_to_chart(tracks: np.ndarray, level_idx: int = 5, title: str = "tensor
                 ))
 
     chart = Chart(title=title, artist="generated")
-    chart.all_levels[level_idx] = Level("master", 0.0, [
+    chart.all_levels[level_idx] = Level("master", level_query, [
         Frame(tuple(notes), frame / rate) for frame, notes in sorted(grouped.items())
     ])
     return chart
 
 
-def tracks_to_maidata(tracks: np.ndarray, level_idx: int = 5, title: str = "tensor-roundtrip") -> str:
-    return generate_maidata(tracks_to_chart(tracks, level_idx, title))
+def tracks_to_maidata(tracks: np.ndarray, level_idx: int = 5, title: str = "tensor-roundtrip", level_query: float = 0.0) -> str:
+    return generate_maidata(tracks_to_chart(tracks, level_idx, title, level_query))
 
 
 def txt2tensor2txt(text: str, level_idx: int = 5) -> tuple[np.ndarray, str]:
@@ -125,7 +125,7 @@ def txt2tensor2txt(text: str, level_idx: int = 5) -> tuple[np.ndarray, str]:
 
 def validate_all_songs() -> None:
     charts_dir = CONFIG.paths.charts_dir
-    level_idx = CONFIG.training.level_idx
+    level_idx = CONFIG.inference.level_idx
     output_dir = ROOT_DIR / "tmp" / "txt2tensor2txt"
     if output_dir.exists():
         shutil.rmtree(output_dir)

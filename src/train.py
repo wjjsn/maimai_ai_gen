@@ -1,6 +1,7 @@
 """四头事件 CNN 训练入口；过拟合模式只改变歌曲集合。"""
 
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
@@ -11,10 +12,9 @@ from tqdm import tqdm
 from audio_features import MERT_HIDDEN_DIM, extract_audio_features
 from chart import Chart, Level
 from config import CONFIG, checkpoint_config
-from dataset import SongDataset, _target_scale, chart_to_targets, collate_songs, discover_songs
+from dataset import SongDataset, SongEntry, _target_scale, chart_to_targets, collate_songs, discover_songs, parse_level
 from generation_metrics import format_generation_comparison, generation_score
 from infer import MODEL_KIND, events_to_frames, frames_to_maidata, predict_events, save_inference_files
-from maidata_parser import parse_maidata
 from model import ChartCNN, ModelDimensions
 from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, chart_to_tracks
 
@@ -27,13 +27,29 @@ if DEVICE.type == "cuda":
 
 
 def split_entries(entries, seed: int, overfit_charts: int):
-    order = torch.randperm(len(entries), generator=torch.Generator().manual_seed(seed)).tolist()
-    shuffled = [entries[i] for i in order]
+    songs = {}
+    for entry in entries:
+        songs.setdefault(entry.song_key, []).append(entry)
+    keys = list(songs)
+    order = torch.randperm(len(keys), generator=torch.Generator().manual_seed(seed)).tolist()
+    shuffled = [keys[i] for i in order]
     if overfit_charts:
-        selected = shuffled[:overfit_charts]
+        selected = [entry for path in shuffled[:overfit_charts] for entry in songs[path]]
         return selected, selected, []
-    val_count, test_count = max(1, round(len(entries) * CONFIG.training.val_ratio)), max(1, round(len(entries) * CONFIG.training.test_ratio))
-    return shuffled[val_count + test_count:], shuffled[:val_count], shuffled[val_count:val_count + test_count]
+    val_count, test_count = max(1, round(len(keys) * CONFIG.training.val_ratio)), max(1, round(len(keys) * CONFIG.training.test_ratio))
+    groups = shuffled[val_count + test_count:], shuffled[:val_count], shuffled[val_count:val_count + test_count]
+    return tuple([entry for path in group for entry in songs[path]] for group in groups)
+
+
+def first_songs(entries, count: int):
+    selected, keys = [], set()
+    for entry in entries:
+        if entry.song_key not in keys:
+            if len(keys) == count:
+                break
+            keys.add(entry.song_key)
+        selected.append(entry)
+    return selected
 
 
 def _duration_target(events: torch.Tensor) -> torch.Tensor:
@@ -72,10 +88,10 @@ def run_epoch(model, loader, optimizer, scaler):
     totals = np.zeros(3)
     correct = frames = 0
     for batch in tqdm(loader, desc="训练" if training else "验证", leave=False):
-        for key in ("features", "events", "mask"):
+        for key in ("features", "events", "mask", "level_queries", "level_indices"):
             batch[key] = batch[key].to(DEVICE, non_blocking=True)
         with torch.set_grad_enabled(training), torch.autocast(device_type=DEVICE.type, dtype=torch.float16, enabled=DEVICE.type == "cuda"):
-            output = model(batch["features"], batch["mask"])
+            output = model(batch["features"], batch["level_queries"], batch["level_indices"], batch["mask"])
             loss, count_loss, duration_loss = compute_loss(output, batch)
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -95,30 +111,63 @@ def run_epoch(model, loader, optimizer, scaler):
 
 @torch.no_grad()
 def generation_eval(model, entries, output_dir: Path | None = None):
-    stats = {"songs": 0, "events": 0, "dropped": 0, "comparison": []}
-    for entry in tqdm(entries, desc="正式整曲推理", leave=False):
-        events = predict_events(model, extract_audio_features(entry.audio_path, DEVICE), DEVICE)
-        frames, song_stats = events_to_frames(events)
-        generated = Chart(all_levels=[None] * 7)
-        generated.all_levels[CONFIG.training.level_idx] = Level("generated", entry.level_query, frames)
-        # 正式解码允许末尾持续音超过音频；比较时间轴只覆盖当前音频。
-        predicted = chart_to_tracks(generated, CONFIG.training.level_idx)
-        predicted = np.pad(predicted, ((0, max(0, len(events) - len(predicted))), (0, 0)))[:len(events)]
-        source = parse_maidata(entry.chart_path.read_text(encoding="utf-8"))
-        target = (chart_to_targets(source, len(events), CONFIG.training.level_idx) * _target_scale()).round().astype(np.int32)
+    stats = {"songs": 0, "charts": 0, "events": 0, "dropped": 0, "comparison": []}
+    groups = {}
+    for entry in entries:
+        groups.setdefault(entry.chart_path, []).append(entry)
+    for group in tqdm(groups.values(), desc="正式整曲推理", leave=False):
+        features = extract_audio_features(group[0].audio_path, DEVICE)
+        text = group[0].chart_path.read_text(encoding="utf-8")
         stats["songs"] += 1
-        stats["events"] += song_stats["events"]
-        stats["dropped"] += song_stats["dropped"]
-        stats["comparison"].append((str(entry.chart_path.parent.relative_to(CONFIG.paths.charts_dir)), target, predicted, song_stats["dropped"]))
-        if output_dir is not None:
+        for entry in group:
+            events = predict_events(model, features, entry.level_query, entry.level_idx, DEVICE)
+            frames, song_stats = events_to_frames(events)
+            generated = Chart(all_levels=[None] * 7)
+            generated.all_levels[entry.level_idx] = Level("generated", entry.level_query, frames)
+            # 正式解码允许末尾持续音超过音频；比较时间轴只覆盖当前音频。
+            predicted = chart_to_tracks(generated, entry.level_idx)
+            predicted = np.pad(predicted, ((0, max(0, len(events) - len(predicted))), (0, 0)))[:len(events)]
+            source = parse_level(text, entry.level_idx)
+            target = (chart_to_targets(source, len(events), entry.level_idx) * _target_scale()).round().astype(np.int32)
+            stats["charts"] += 1
+            stats["events"] += song_stats["events"]
+            stats["dropped"] += song_stats["dropped"]
             relative = entry.chart_path.parent.relative_to(CONFIG.paths.charts_dir)
-            save_inference_files(entry.audio_path, frames_to_maidata(frames, CONFIG.training.level_idx, relative.name), output_dir / relative)
+            label = f"{relative} level={entry.level_idx} ds={entry.level_query:g}"
+            stats["comparison"].append((label, target, predicted, song_stats["dropped"]))
+            if output_dir is not None:
+                difficulty_dir = output_dir / relative / f"level_{entry.level_idx}_{entry.level_query:g}"
+                save_inference_files(entry.audio_path, frames_to_maidata(frames, entry.level_idx, entry.level_query, relative.name), difficulty_dir)
     stats["score"] = generation_score(stats["comparison"])
     return stats
 
 
-def checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics):
-    return {"checkpoint_version": 6, "model_kind": MODEL_KIND, "epoch": epoch, "model_state_dict": model.state_dict(), "optimizer_state_dict": optimizer.state_dict(), "scheduler_state_dict": scheduler.state_dict(), "scaler_state_dict": scaler.state_dict(), "dims": dims, "config": checkpoint_config(), "metrics": metrics}
+def checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics, training_state, data_info):
+    return {
+        "checkpoint_version": 7,
+        "model_kind": MODEL_KIND,
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "dims": dims,
+        "config": checkpoint_config(),
+        "data_info": data_info,
+        "training_state": training_state,
+        "metrics": metrics,
+    }
+
+
+def validate_checkpoint(state, dims, data_info) -> None:
+    if (
+        state.get("checkpoint_version") != 7
+        or state.get("model_kind") != MODEL_KIND
+        or state.get("config") != checkpoint_config()
+        or state.get("dims") != dims
+        or state.get("data_info") != data_info
+    ):
+        raise ValueError("检查点的架构、配置或难度数据快照与当前训练不一致")
 
 
 def format_epoch_log(epoch: int, train_metrics, val_metrics, learning_rate: float, saved_best: bool, bad_epochs: int) -> str:
@@ -145,6 +194,7 @@ def format_generation_log(label: str, stats: dict[str, int]) -> str:
         "",
         f"---------- {label} ----------",
         f"参与整曲推理的歌曲数：{stats['songs']} 首。",
+        f"参与整曲推理的谱面数：{stats['charts']} 张。",
         f"成功写入生成谱面的音符事件总数：{stats['events']} 个。这个数字只表示模型生成量，不代表与原谱面的匹配程度。",
         f"因为短音之间少于最小间隔而被丢弃的 Tap/Touch 数量：{stats['dropped']} 个。该数值很高通常表示模型把短音生成得过密。",
         f"正式生成选模 F1：{stats['score'] * 100:.2f}%。这是 Tap 与持续音起点微平均 F1 的均值，越高越好。",
@@ -154,12 +204,14 @@ def format_generation_log(label: str, stats: dict[str, int]) -> str:
 
 
 def _self_check() -> None:
+    from unittest.mock import patch
+
     batch = {
         "events": torch.zeros(1, 2, 4, device=DEVICE),
         "mask": torch.ones(1, 2, dtype=torch.bool, device=DEVICE),
     }
     model = ChartCNN(ModelDimensions(4, 8, 1, 3, 0)).to(DEVICE)
-    output = model(torch.zeros(1, 2, 4, device=DEVICE), batch["mask"])
+    output = model(torch.zeros(1, 2, 4, device=DEVICE), torch.tensor([13.7], device=DEVICE), torch.tensor([5], device=DEVICE), batch["mask"])
     loss, count_loss, duration_loss = compute_loss(output, batch)
     assert loss.isfinite() and count_loss.isfinite() and duration_loss.isfinite()
     batch["events"][0, 0] = torch.tensor((0, 0.5, 0.1, 0))
@@ -167,6 +219,43 @@ def _self_check() -> None:
     short = np.zeros((1, 4), dtype=np.int32)
     aligned = np.pad(short, ((0, 2), (0, 0)))[:3]
     assert aligned.shape == (3, 4) and not aligned.any()
+    entries = [
+        SongEntry(Path("a/maidata.txt"), Path("a/track.mp3"), "same", "1", 2, 4.0),
+        SongEntry(Path("a/maidata.txt"), Path("a/track.mp3"), "same", "1", 5, 13.0),
+        SongEntry(Path("b/maidata.txt"), Path("b/track.mp3"), "same", "10001", 5, 14.0),
+        SongEntry(Path("c/maidata.txt"), Path("c/track.mp3"), "other", "2", 5, 14.5),
+        SongEntry(Path("d/maidata.txt"), Path("d/track.mp3"), "third", "3", 5, 14.7),
+    ]
+    train, val, test = split_entries(entries, 42, 0)
+    assert not ({entry.song_key for entry in train} & {entry.song_key for entry in val + test})
+    assert len(first_songs(entries, 1)) == 3
+    source = Chart(all_levels=[None] * 7)
+    source.all_levels[2] = Level("basic", 4.0, [])
+    source.all_levels[5] = Level("master", 13.0, [])
+    eval_path = CONFIG.paths.charts_dir / "self-check" / "maidata.txt"
+    eval_audio = eval_path.parent / "track.mp3"
+    eval_entries = [
+        SongEntry(eval_path, eval_audio, "same", "1", 2, 4.0),
+        SongEntry(eval_path, eval_audio, "same", "1", 5, 13.0),
+    ]
+    with (
+        patch("train.extract_audio_features", return_value=np.zeros((3, 4), dtype=np.float32)) as extract,
+        patch("train.predict_events", return_value=np.zeros((3, 4), dtype=np.int32)),
+        patch("train.parse_level", side_effect=lambda _text, level_idx: source),
+        patch.object(Path, "read_text", return_value=""),
+    ):
+        stats = generation_eval(model, eval_entries)
+    assert extract.call_count == 1 and stats["songs"] == 1 and stats["charts"] == 2
+
+    dims = ModelDimensions(4, 8, 1, 3, 0)
+    state = {"checkpoint_version": 7, "model_kind": MODEL_KIND, "config": checkpoint_config(), "dims": dims, "data_info": {"schema_version": 1, "digest": "test"}}
+    validate_checkpoint(state, dims, state["data_info"])
+    try:
+        validate_checkpoint(state, dims, {"schema_version": 1, "digest": "changed"})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("难度数据快照变化时必须拒绝检查点")
     assert "完整时间帧命中率" in format_epoch_log(1, (0.1, 0.1, 0.0, 0.0), (0.1, 0.1, 0.0, 0.0), 0.001, True, 0)
     print("[train] 自检通过")
 
@@ -175,19 +264,21 @@ def main() -> None:
     torch.manual_seed(CONFIG.training.seed)
     np.random.seed(CONFIG.training.seed)
     print(f"开始扫描训练歌曲：{CONFIG.paths.charts_dir}", flush=True)
-    entries, skipped = discover_songs(CONFIG.paths.charts_dir, CONFIG.training.level_idx)
+    entries, skipped, data_info = discover_songs(CONFIG.paths.charts_dir)
     if skipped:
-        print(f"跳过 {len(skipped)} 首含非默认等待 Slide、长按溢出或无效数据的歌曲", flush=True)
+        print(f"忽略 {len(skipped)} 个无法匹配或无效的歌曲/难度项", flush=True)
     minimum = CONFIG.training.overfit_charts or 3
-    if len(entries) < minimum:
-        raise ValueError(f"有效歌曲只有 {len(entries)} 首，需要至少 {minimum} 首")
+    songs = {entry.song_key for entry in entries}
+    if len(songs) < minimum:
+        raise ValueError(f"有效歌曲只有 {len(songs)} 首，需要至少 {minimum} 首")
     train_entries, val_entries, test_entries = split_entries(entries, CONFIG.training.seed, CONFIG.training.overfit_charts)
-    print(f"设备={DEVICE}，训练/验证/测试={len(train_entries)}/{len(val_entries)}/{len(test_entries)} 首", flush=True)
+    song_count = lambda group: len({entry.song_key for entry in group})
+    print(f"设备={DEVICE}，训练/验证/测试歌曲={song_count(train_entries)}/{song_count(val_entries)}/{song_count(test_entries)} 首，谱面={len(train_entries)}/{len(val_entries)}/{len(test_entries)} 张", flush=True)
     options = {"num_workers": CONFIG.training.num_workers, "pin_memory": CONFIG.training.pin_memory, "collate_fn": collate_songs}
     if CONFIG.training.num_workers:
         options["prefetch_factor"] = CONFIG.training.prefetch_factor
-    train_loader = DataLoader(SongDataset(train_entries, CONFIG.training.level_idx, augment=True), batch_size=CONFIG.training.batch_size, shuffle=True, **options)
-    val_loader = DataLoader(SongDataset(val_entries, CONFIG.training.level_idx), batch_size=CONFIG.training.batch_size, shuffle=False, **options)
+    train_loader = DataLoader(SongDataset(train_entries, augment=True), batch_size=CONFIG.training.batch_size, shuffle=True, **options)
+    val_loader = DataLoader(SongDataset(val_entries), batch_size=CONFIG.training.batch_size, shuffle=False, **options)
     dims = ModelDimensions(MERT_HIDDEN_DIM, CONFIG.model.hidden_dim, CONFIG.model.layers, CONFIG.model.kernel_size, CONFIG.model.dropout)
     model = ChartCNN(dims).to(DEVICE)
     print(f"模型参数量={sum(parameter.numel() for parameter in model.parameters()):,}", flush=True)
@@ -196,32 +287,71 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
     CONFIG.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_loss, best_gen_score, bad_epochs = float("inf"), -1.0, 0
-    for epoch in range(1, CONFIG.training.num_epochs + 1):
+    start_epoch = 1
+    best_gen_path = CONFIG.paths.checkpoint_dir / "best_gen.pt"
+    if CONFIG.training.resume_checkpoint is not None:
+        print(f"从检查点恢复训练：{CONFIG.training.resume_checkpoint}", flush=True)
+        state = torch.load(CONFIG.training.resume_checkpoint, map_location=DEVICE, weights_only=False)
+        validate_checkpoint(state, dims, data_info)
+        model.load_state_dict(state["model_state_dict"])
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        scheduler.load_state_dict(state["scheduler_state_dict"])
+        scaler.load_state_dict(state["scaler_state_dict"])
+        start_epoch = state["epoch"] + 1
+        training_state = state.get("training_state")
+        if not isinstance(training_state, dict):
+            raise ValueError("恢复检查点缺少训练状态")
+        best_loss = training_state["best_loss"]
+        best_gen_score = training_state["best_gen_score"]
+        bad_epochs = training_state["bad_epochs"]
+        source_best_gen = CONFIG.training.resume_checkpoint.parent / "best_gen.pt"
+        if not source_best_gen.is_file():
+            raise ValueError(f"恢复训练缺少配套最佳生成检查点：{source_best_gen}")
+        best_gen = torch.load(source_best_gen, map_location="cpu", weights_only=False)
+        validate_checkpoint(best_gen, dims, data_info)
+        best_gen_state = best_gen.get("training_state")
+        if not isinstance(best_gen_state, dict) or best_gen_state.get("best_gen_score") != best_gen_score:
+            raise ValueError("配套最佳生成检查点与恢复检查点的最佳分数不一致")
+        if source_best_gen.resolve() != best_gen_path.resolve():
+            shutil.copy2(source_best_gen, best_gen_path)
+        print(f"已恢复到第 {state['epoch']} 轮，从第 {start_epoch} 轮继续训练", flush=True)
+    for epoch in range(start_epoch, CONFIG.training.num_epochs + 1):
         if epoch == 1:
             print("开始现场解码音频并提取首批 MERT 特征", flush=True)
         train_metrics, val_metrics = run_epoch(model, train_loader, optimizer, scaler), run_epoch(model, val_loader, None, scaler)
         scheduler.step()
         metrics = {"train_loss": train_metrics[0], "val_loss": val_metrics[0], "count_loss": val_metrics[1], "duration_loss": val_metrics[2], "exact_frame_accuracy": val_metrics[3] * 100}
-        state = checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics)
-        torch.save(state, CONFIG.paths.checkpoint_dir / "newest.pt")
         if val_metrics[0] < best_loss:
             best_loss, bad_epochs = val_metrics[0], 0
-            torch.save(state, CONFIG.paths.checkpoint_dir / "best.pt")
             saved_best = True
         else:
             bad_epochs += 1
             saved_best = False
         print(format_epoch_log(epoch, train_metrics, val_metrics, scheduler.get_last_lr()[0], saved_best, bad_epochs))
         if epoch == 1 or epoch % CONFIG.training.generation_interval == 0:
-            generated = generation_eval(model, val_entries[:CONFIG.training.val_gen_charts])
+            generated = generation_eval(model, first_songs(val_entries, CONFIG.training.val_gen_charts))
             if generated["score"] > best_gen_score:
                 best_gen_score = generated["score"]
-                torch.save(state, CONFIG.paths.checkpoint_dir / "best_gen.pt")
+                saved_best_gen = True
+            else:
+                saved_best_gen = False
             print(format_generation_log("定期整曲推理检查", generated))
+        else:
+            saved_best_gen = False
+        training_state = {"best_loss": best_loss, "best_gen_score": best_gen_score, "bad_epochs": bad_epochs}
+        state = checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics, training_state, data_info)
+        torch.save(state, CONFIG.paths.checkpoint_dir / "newest.pt")
+        if saved_best:
+            torch.save(state, CONFIG.paths.checkpoint_dir / "best.pt")
+        if saved_best_gen:
+            torch.save(state, best_gen_path)
         if bad_epochs >= CONFIG.training.early_stop_patience:
             print("验证损失长期没有改善，提前停止")
             break
-    best = torch.load(CONFIG.paths.checkpoint_dir / "best_gen.pt", map_location=DEVICE, weights_only=False)
+    if not best_gen_path.is_file():
+        raise ValueError(f"没有可用的最佳生成检查点：{best_gen_path}")
+    best = torch.load(best_gen_path, map_location=DEVICE, weights_only=False)
+    validate_checkpoint(best, dims, data_info)
     model.load_state_dict(best["model_state_dict"])
     output_entries = train_entries if CONFIG.training.overfit_charts else test_entries
     output_dir = CONFIG.paths.overfit_output_dir if CONFIG.training.overfit_charts else CONFIG.paths.train_output_dir

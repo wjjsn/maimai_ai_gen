@@ -230,7 +230,7 @@ def _parse_one_level(text: str, level_idx: int):
     return parse_maidata(filtered)
 
 
-def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.training.level_idx) -> None:
+def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.inference.level_idx) -> None:
     songs: list[SongMetrics] = []
     all_level_songs: list[SongMetrics] = []
     missing_level = parse_errors = 0

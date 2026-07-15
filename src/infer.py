@@ -6,14 +6,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from audio_features import extract_audio_features
+from audio_features import MERT_HIDDEN_DIM, extract_audio_features
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
 from config import CONFIG, checkpoint_config
 from model import ChartCNN, ModelDimensions
 from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT, chart_to_tracks, maidata_to_tracks, tracks_to_maidata
 
 
-MODEL_KIND = "log-mel-full-song-event-cnn-v6"
+MODEL_KIND = "mert-full-song-conditioned-event-cnn-v7"
 
 
 def _scale() -> np.ndarray:
@@ -23,23 +23,28 @@ def _scale() -> np.ndarray:
 
 def load_model(path: str | Path, device: torch.device) -> tuple[ChartCNN, ModelDimensions]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
-    if checkpoint.get("checkpoint_version") != 6 or checkpoint.get("model_kind") != MODEL_KIND:
+    if checkpoint.get("checkpoint_version") != 7 or checkpoint.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自旧架构，拒绝加载")
     if checkpoint.get("config") != checkpoint_config():
         raise ValueError("检查点的音频或模型配置与当前配置不一致")
-    model = ChartCNN(checkpoint["dims"]).to(device)
+    expected_dims = ModelDimensions(MERT_HIDDEN_DIM, CONFIG.model.hidden_dim, CONFIG.model.layers, CONFIG.model.kernel_size, CONFIG.model.dropout)
+    if checkpoint.get("dims") != expected_dims:
+        raise ValueError("检查点的模型维度与当前配置不一致")
+    model = ChartCNN(expected_dims).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     print(f"[infer] 加载 checkpoint epoch={checkpoint.get('epoch', '?')}")
-    return model, checkpoint["dims"]
+    return model, expected_dims
 
 
 @torch.no_grad()
-def predict_events(model: ChartCNN, features: np.ndarray, device: torch.device) -> np.ndarray:
+def predict_events(model: ChartCNN, features: np.ndarray, level_query: float, level_idx: int, device: torch.device) -> np.ndarray:
     tensor = torch.from_numpy(np.asarray(features, dtype=np.float32)).unsqueeze(0).to(device)
     mask = torch.ones(1, tensor.shape[1], dtype=torch.bool, device=device)
+    level_queries = torch.tensor([level_query], dtype=torch.float32, device=device)
+    level_indices = torch.tensor([level_idx], dtype=torch.long, device=device)
     with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
-        tap_logits, hold_logits, durations = model(tensor, mask)
+        tap_logits, hold_logits, durations = model(tensor, level_queries, level_indices, mask)
     maximum = _scale()[2]
     duration_frames = torch.expm1(durations[0].float() * np.log1p(maximum)).round().to(torch.int32)
     return torch.cat((tap_logits[0].argmax(dim=-1, keepdim=True), hold_logits[0].argmax(dim=-1, keepdim=True), duration_frames), dim=-1).cpu().numpy()
@@ -69,16 +74,16 @@ def events_to_frames(events: np.ndarray) -> tuple[list[Frame], dict[str, int]]:
     return frames, {"events": sum(len(notes) for notes in grouped.values()), "dropped": dropped}
 
 
-def infer_features(model: ChartCNN, features: np.ndarray, device: torch.device):
-    events = predict_events(model, features, device)
+def infer_features(model: ChartCNN, features: np.ndarray, level_query: float, level_idx: int, device: torch.device):
+    events = predict_events(model, features, level_query, level_idx, device)
     frames, stats = events_to_frames(events)
     return frames, {**stats, "tap_events": int(events[:, TAP_COUNT].sum()), "hold_events": int(events[:, HOLD_START_COUNT].sum())}
 
 
-def frames_to_maidata(frames: list[Frame], level_idx: int, title: str = "generated") -> str:
+def frames_to_maidata(frames: list[Frame], level_idx: int, level_query: float, title: str = "generated") -> str:
     chart = Chart(title=title, artist="generated")
-    chart.all_levels[level_idx] = Level(f"level_{level_idx + 1}", 0.0, frames)
-    return tracks_to_maidata(chart_to_tracks(chart, level_idx), level_idx, title)
+    chart.all_levels[level_idx] = Level(f"level_{level_idx + 1}", level_query, frames)
+    return tracks_to_maidata(chart_to_tracks(chart, level_idx), level_idx, title, level_query)
 
 
 def save_inference_files(audio_path: Path, text: str, out_dir: Path) -> Path:
@@ -98,9 +103,10 @@ def _self_check() -> None:
     assert len(frames) == 1 and len(frames[0].notes) == 3
     assert frames[0].time_sec == 3 / CONFIG.audio.frames_per_sec
     assert stats == {"events": 3, "dropped": 0}
-    text = frames_to_maidata(frames, 5, "test")
+    text = frames_to_maidata(frames, 5, 13.7, "test")
     restored = maidata_to_tracks(text, 5)
     assert restored[3].tolist() == [2, 1, 20, 0]
+    assert "&lv_5=13.7" in text
     print("[infer] 自检通过")
 
 
@@ -109,8 +115,8 @@ def main() -> None:
     output_dir = CONFIG.paths.inference_output_dir / audio_path.stem
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load_model(CONFIG.inference.checkpoint, device)
-    frames, stats = infer_features(model, extract_audio_features(audio_path, device), device)
-    path = save_inference_files(audio_path, frames_to_maidata(frames, CONFIG.inference.level_idx, audio_path.stem), output_dir)
+    frames, stats = infer_features(model, extract_audio_features(audio_path, device), CONFIG.inference.level_query, CONFIG.inference.level_idx, device)
+    path = save_inference_files(audio_path, frames_to_maidata(frames, CONFIG.inference.level_idx, CONFIG.inference.level_query, audio_path.stem), output_dir)
     print(f"[infer] 生成 {len(frames)} 帧，丢弃 {stats['dropped']}/{stats['events']} 个事件")
     print(f"[infer] 输出: {path}")
 

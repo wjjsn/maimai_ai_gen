@@ -62,7 +62,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    level_idx: int
+    resume_checkpoint: Path | None
     batch_size: int
     num_workers: int
     prefetch_factor: int
@@ -89,6 +89,7 @@ class InferenceConfig:
     audio_path: Path
     checkpoint: Path
     level_idx: int
+    level_query: float
     short_min_gap_frames: int
     long_min_frames: int
     long_threshold: float
@@ -130,7 +131,7 @@ SECTIONS = {
         "隐藏维度": "hidden_dim", "层数": "layers", "卷积核": "kernel_size", "丢弃率": "dropout",
     }),
     "训练": (TrainingConfig, {
-        "难度编号": "level_idx", "批大小": "batch_size", "数据加载进程数": "num_workers",
+        "恢复检查点": "resume_checkpoint", "批大小": "batch_size", "数据加载进程数": "num_workers",
         "预取批数": "prefetch_factor", "锁页内存": "pin_memory", "训练轮数": "num_epochs",
         "学习率": "learning_rate", "最低学习率": "min_learning_rate", "权重衰减": "weight_decay",
         "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
@@ -141,6 +142,7 @@ SECTIONS = {
     }),
     "推理": (InferenceConfig, {
         "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
+        "浮点难度": "level_query",
         "短音最小间隔帧": "short_min_gap_frames", "持续音最短帧数": "long_min_frames",
         "持续音阈值": "long_threshold", "最短持续秒数": "min_duration_sec",
         "最长持续秒数": "max_duration_sec",
@@ -155,6 +157,8 @@ def _matches(value: Any, expected: Any) -> bool:
         return isinstance(value, int) and not isinstance(value, bool)
     if expected is Path:
         return isinstance(value, str)
+    if expected is type(None):
+        return value is None
     origin = get_origin(expected)
     if origin in (UnionType,):
         return any(_matches(value, item) for item in get_args(expected))
@@ -177,7 +181,11 @@ def _load_section(raw: dict, name: str):
         expected = hints[field_name]
         if not _matches(value, expected):
             raise TypeError(f"配置 {name}.{yaml_name} 类型错误: {value!r}")
-        if expected is Path:
+        # 处理 Path | None 类型
+        origin = get_origin(expected)
+        if origin is UnionType and Path in get_args(expected) and type(None) in get_args(expected):
+            value = (ROOT_DIR / value).resolve() if value else None
+        elif expected is Path:
             value = (ROOT_DIR / value).resolve()
         elif expected is float:
             value = float(value)
@@ -193,6 +201,8 @@ def _require(condition: bool, message: str) -> None:
 def _validate(config: AppConfig) -> None:
     audio, augmentation = config.audio, config.augmentation
     model, training, inference = config.model, config.training, config.inference
+    if training.resume_checkpoint is not None:
+        _require(training.resume_checkpoint.exists(), f"恢复检查点文件不存在: {training.resume_checkpoint}")
     for group in (audio, augmentation, model, training, inference):
         for item in fields(group):
             value = getattr(group, item.name)
@@ -215,7 +225,8 @@ def _validate(config: AppConfig) -> None:
     _require(model.hidden_dim > 0 and model.layers > 0, "模型维度和层数必须大于 0")
     _require(model.kernel_size > 0 and model.kernel_size % 2 == 1, "模型卷积核必须是正奇数")
     _require(0 <= model.dropout < 1, "模型丢弃率必须在 [0, 1) 内")
-    _require(0 <= training.level_idx <= 6 and 0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
+    _require(2 <= inference.level_idx <= 6, "推理难度编号必须在 2 到 6 之间")
+    _require(0 < inference.level_query <= 15, "推理浮点难度必须在 (0, 15] 内")
     _require(training.batch_size > 0 and training.num_workers >= 0 and training.prefetch_factor > 0, "DataLoader 配置无效")
     _require(training.num_epochs > 0 and training.learning_rate > 0 and training.min_learning_rate >= 0, "学习率或训练轮数无效")
     _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
@@ -257,6 +268,7 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
     return {
         "audio": vars(config.audio),
         "model": vars(config.model),
+        "max_duration_sec": config.inference.max_duration_sec,
     }
 
 
@@ -265,6 +277,7 @@ def _self_check() -> None:
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert load_config() == CONFIG
     assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "kernel_size", "dropout"}
+    assert CONFIG.inference.level_query == 13.0
     print("[config] 自检通过")
 
 

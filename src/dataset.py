@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from audio_features import AudioAugmentation, extract_audio_features, sample_aug
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, TapType
 from config import CONFIG
 from maidata_parser import parse_maidata
+from music_data import DATA_SCHEMA_VERSION, load_music_data, match_music, normalize_title
 from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK_COUNT, _slide_branches
 
 
@@ -20,7 +22,10 @@ from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, TRACK
 class SongEntry:
     chart_path: Path
     audio_path: Path
-    level_query: float | None
+    song_key: str
+    music_id: str
+    level_idx: int
+    level_query: float
 
 
 def _target_scale() -> np.ndarray:
@@ -94,8 +99,19 @@ def chart_to_targets(chart: Chart, length: int, level_idx: int, augmentation: Au
     return targets / scale
 
 
-def discover_songs(charts_dir: Path, level_idx: int) -> tuple[list[SongEntry], list[str]]:
+def parse_level(text: str, level_idx: int) -> Chart:
+    filtered = re.sub(
+        rf"^&inote_(?!{level_idx}=)[0-6]=.*?(?=^&|\Z)",
+        "",
+        text,
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    return parse_maidata(filtered)
+
+
+def discover_songs(charts_dir: Path) -> tuple[list[SongEntry], list[str], dict]:
     entries, skipped = [], []
+    music_data, digest = load_music_data()
     chart_paths = sorted(charts_dir.rglob("maidata.txt"))
     for chart_path in tqdm(chart_paths, desc="扫描训练歌曲", unit="首"):
         audio_path = chart_path.parent / "track.mp3"
@@ -103,35 +119,74 @@ def discover_songs(charts_dir: Path, level_idx: int) -> tuple[list[SongEntry], l
             continue
         relative = str(chart_path.parent.relative_to(charts_dir))
         try:
-            chart = parse_maidata(chart_path.read_text(encoding="utf-8"))
+            text = chart_path.read_text(encoding="utf-8")
+            song = match_music(text, chart_path, music_data)
+            if song is None:
+                raise ValueError("无法匹配 Diving-Fish 歌曲数据")
             audio_duration_sec = AudioDecoder(audio_path).metadata.duration_seconds
             if audio_duration_sec is None or audio_duration_sec <= 0:
                 raise ValueError("无法读取有效音频时长")
-            validate_chart_audio_alignment(chart, audio_duration_sec, level_idx)
             length = max(1, round(audio_duration_sec * CONFIG.audio.frames_per_sec) + 1)
-            chart_to_targets(chart, length, level_idx)
-            entries.append(SongEntry(chart_path, audio_path, chart.all_levels[level_idx].level_query))
+            valid = 0
+            for ds_idx, level_query in enumerate(song["ds"]):
+                level_idx = ds_idx + 2
+                chart = parse_level(text, level_idx)
+                level = chart.all_levels[level_idx]
+                if level is None or not level.frames:
+                    continue
+                try:
+                    level_query = float(level_query)
+                    if not np.isfinite(level_query) or level_query <= 0:
+                        raise ValueError("精确浮点难度无效")
+                    validate_chart_audio_alignment(chart, audio_duration_sec, level_idx)
+                    chart_to_targets(chart, length, level_idx)
+                    entries.append(SongEntry(
+                        chart_path,
+                        audio_path,
+                        normalize_title(song["title"]),
+                        str(song["id"]),
+                        level_idx,
+                        level_query,
+                    ))
+                    valid += 1
+                except Exception as error:
+                    skipped.append(f"{relative} 难度={level_idx}: {error}")
+            if not valid:
+                raise ValueError("没有可用的 Basic 至 Re:Master 谱面")
         except Exception as error:
             skipped.append(f"{relative}: {error}")
-    return entries, skipped
+    return entries, skipped, {"schema_version": DATA_SCHEMA_VERSION, "digest": digest}
 
 
 class SongDataset(Dataset):
-    def __init__(self, entries: list[SongEntry], level_idx: int, augment: bool = False):
-        self.entries, self.level_idx, self.augment = entries, level_idx, augment
+    def __init__(self, entries: list[SongEntry], augment: bool = False):
+        songs = {}
+        for entry in entries:
+            songs.setdefault(entry.chart_path, []).append(entry)
+        self.songs, self.augment = list(songs.values()), augment
 
     def __len__(self) -> int:
-        return len(self.entries)
+        return len(self.songs)
 
     def __getitem__(self, index: int) -> dict:
-        entry = self.entries[index]
+        entries = self.songs[index]
+        entry = entries[0]
         augmentation = sample_augmentation() if self.augment else None
         features = extract_audio_features(entry.audio_path, augmentation=augmentation)
-        chart = parse_maidata(entry.chart_path.read_text(encoding="utf-8"))
-        return {"features": torch.from_numpy(features), "events": torch.from_numpy(chart_to_targets(chart, len(features), self.level_idx, augmentation)), "entry": entry}
+        text = entry.chart_path.read_text(encoding="utf-8")
+        return {
+            "features": torch.from_numpy(features),
+            "events": [torch.from_numpy(chart_to_targets(parse_level(text, current.level_idx), len(features), current.level_idx, augmentation)) for current in entries],
+            "entries": entries,
+        }
 
 
 def collate_songs(items: list[dict]) -> dict:
+    items = [
+        {"features": item["features"], "events": events, "entry": entry}
+        for item in items
+        for events, entry in zip(item["events"], item["entries"])
+    ]
     max_length = max(item["features"].shape[0] for item in items)
     batch, feature_dim = len(items), items[0]["features"].shape[1]
     features = torch.zeros(batch, max_length, feature_dim)
@@ -140,7 +195,15 @@ def collate_songs(items: list[dict]) -> dict:
     for i, item in enumerate(items):
         length = item["features"].shape[0]
         features[i, :length], events[i, :length], mask[i, :length] = item["features"], item["events"], True
-    return {"features": features, "events": events, "mask": mask, "entries": [item["entry"] for item in items]}
+    entries = [item["entry"] for item in items]
+    return {
+        "features": features,
+        "events": events,
+        "mask": mask,
+        "level_queries": torch.tensor([entry.level_query for entry in entries], dtype=torch.float32),
+        "level_indices": torch.tensor([entry.level_idx for entry in entries], dtype=torch.long),
+        "entries": entries,
+    }
 
 
 def _self_check() -> None:
@@ -151,6 +214,11 @@ def _self_check() -> None:
 
     augmented = chart_to_targets(chart, 100, 5, AudioAugmentation(speed=2.0, shift_sec=0.1))
     assert augmented[50, TAP_COUNT] == 1 / _target_scale()[TAP_COUNT]
+
+    entry = SongEntry(Path("maidata.txt"), Path("track.mp3"), "test", "1", 5, 13.7)
+    batch = collate_songs([{"features": torch.zeros(2, 3), "events": [torch.zeros(2, TRACK_COUNT)], "entries": [entry]}])
+    assert np.allclose(batch["level_queries"].numpy(), [13.7])
+    assert batch["level_indices"].tolist() == [5]
 
     long_chart = Chart(first_sec=0.2)
     long_chart.all_levels[5] = Level("master", 14, [Frame((
