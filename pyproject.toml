@@ -12,4 +12,5 @@ dependencies = [
     "tqdm>=4.68.4",
     "pyyaml>=6.0.3",
     "transformers>=5.13.1",
+    "rich>=15.0.0",
 ]

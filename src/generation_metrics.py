@@ -1,19 +1,93 @@
-"""比较正式生成事件、原谱事件和 Master 总体统计。"""
+"""评估正式后处理后的简化事件时间轴。"""
 
+from dataclasses import dataclass
 from statistics import mean, median
 
 import numpy as np
 
 from config import CONFIG
-from tensor_roundtrip import HOLD_START_COUNT, TAP_COUNT
+from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT
 
 
-MASTER_MEAN = {"tap": 497.522670, "long": 138.738035, "total": 636.260705, "interval": 0.251188}
-MASTER_MEDIAN = {"tap": 485.0, "long": 133.0, "total": 631.5, "interval": 0.188679}
+MATCH_TOLERANCE_FRAMES = round(0.01 * CONFIG.audio.frames_per_sec)
+DURATION_TOLERANCE_FRAMES = round(0.05 * CONFIG.audio.frames_per_sec)
 
 
-def _ratio(value: float, reference: float) -> str:
-    return f"{value / reference * 100:.1f}%" if reference else "无基准"
+@dataclass(frozen=True)
+class EvaluationItem:
+    label: str
+    level_query: float
+    target: np.ndarray
+    predicted: np.ndarray
+    dropped: int
+
+
+def _events(tracks: np.ndarray, channel: int) -> list[int]:
+    return [frame for frame, count in enumerate(tracks[:, channel]) for _ in range(int(count))]
+
+
+def _long_events(tracks: np.ndarray) -> list[tuple[int, int]]:
+    return [
+        (frame, int(values[HOLD_DURATION_1 + slot]))
+        for frame, values in enumerate(tracks)
+        for slot in range(min(2, int(values[HOLD_START_COUNT])))
+    ]
+
+
+def _match(left: list[int], right: list[int], tolerance: int) -> list[tuple[int, int]]:
+    """按时间顺序做最大数量的一对一容差匹配。"""
+    pairs = []
+    i = j = 0
+    while i < len(left) and j < len(right):
+        if left[i] < right[j] - tolerance:
+            i += 1
+        elif right[j] < left[i] - tolerance:
+            j += 1
+        else:
+            pairs.append((i, j))
+            i += 1
+            j += 1
+    return pairs
+
+
+def _prf(predicted: int, target: int, matched: int) -> dict[str, float]:
+    precision = matched / predicted if predicted else float(target == 0)
+    recall = matched / target if target else float(predicted == 0)
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def _channel_metrics(items: list[EvaluationItem], channel: int, tolerance: int) -> dict[str, float]:
+    predicted = target = matched = 0
+    for item in items:
+        prediction_events = _events(item.predicted, channel)
+        target_events = _events(item.target, channel)
+        predicted += len(prediction_events)
+        target += len(target_events)
+        matched += len(_match(prediction_events, target_events, tolerance))
+    return _prf(predicted, target, matched)
+
+
+def _long_accuracy(items: list[EvaluationItem]) -> tuple[float | None, float | None, list[int]]:
+    """统计预测为持续的类型准确率，以及匹配持续音中的时长准确率。"""
+    predicted_count = matched_count = duration_correct = 0
+    duration_errors = []
+    for item in items:
+        predicted = _long_events(item.predicted)
+        target = _long_events(item.target)
+        predicted_count += len(predicted)
+        for predicted_index, target_index in _match(
+            [frame for frame, _ in predicted], [frame for frame, _ in target], MATCH_TOLERANCE_FRAMES
+        ):
+            error = abs(predicted[predicted_index][1] - target[target_index][1])
+            matched_count += 1
+            duration_errors.append(error)
+            duration_correct += error <= DURATION_TOLERANCE_FRAMES
+    return (
+        matched_count / predicted_count if predicted_count else None,
+        duration_correct / matched_count if matched_count else None,
+        duration_errors,
+    )
 
 
 def _counts(tracks: np.ndarray) -> dict[str, int]:
@@ -27,74 +101,124 @@ def _intervals(tracks: np.ndarray) -> list[float]:
     return np.diff(times).tolist()
 
 
-def _f1(predicted: int, target: int, matched: int) -> tuple[float, float, float]:
-    precision = matched / predicted if predicted else float(target == 0)
-    recall = matched / target if target else float(predicted == 0)
-    return precision, recall, 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+def _average_middle(values: list[float]) -> tuple[float, float]:
+    return (float(mean(values)), float(median(values))) if values else (0.0, 0.0)
 
 
-def generation_score(items: list[tuple[str, np.ndarray, np.ndarray, int]]) -> float:
-    """以 Tap 与持续音起点的微平均 F1 均值作为正式选模指标。"""
-    if not items:
-        return 0.0
-    scores = []
-    for channel in (TAP_COUNT, HOLD_START_COUNT):
-        predicted = sum(int(value[:, channel].sum()) for _, _, value, _ in items)
-        target = sum(int(value[:, channel].sum()) for _, value, _, _ in items)
-        matched = sum(int(np.minimum(value[:, channel], prediction[:, channel]).sum()) for _, value, prediction, _ in items)
-        scores.append(_f1(predicted, target, matched)[2])
-    return mean(scores)
-
-
-def _match_lines(predicted: np.ndarray, target: np.ndarray) -> list[str]:
-    tap_pred, tap_target = int(predicted[:, 0].sum()), int(target[:, 0].sum())
-    long_pred, long_target = int(predicted[:, 1].sum()), int(target[:, 1].sum())
-    tap = _f1(tap_pred, tap_target, int(np.minimum(predicted[:, 0], target[:, 0]).sum()))
-    long = _f1(long_pred, long_target, int(np.minimum(predicted[:, 1], target[:, 1]).sum()))
-    duration_mask = np.stack((target[:, HOLD_START_COUNT] >= 1, target[:, HOLD_START_COUNT] >= 2), axis=1)
-    duration_error = np.abs(predicted[:, 2:] - target[:, 2:])[duration_mask]
-    duration = float(duration_error.mean()) if duration_error.size else 0.0
-    return [
-        f"    Tap 时间点匹配：精确率={tap[0] * 100:.1f}% 召回率={tap[1] * 100:.1f}% F1={tap[2] * 100:.1f}%。",
-        f"    持续音起点匹配：精确率={long[0] * 100:.1f}% 召回率={long[1] * 100:.1f}% F1={long[2] * 100:.1f}%。",
-        f"    真实持续音时长 MAE：{duration:.1f} 帧（{duration / CONFIG.audio.frames_per_sec:.4f} 秒）。",
-    ]
-
-
-def format_generation_comparison(items: list[tuple[str, np.ndarray, np.ndarray, int]]) -> list[str]:
-    """输出正式后处理结果相对原谱及 Master 总体的可读比较。"""
-    if not items:
-        return ["  没有可比较的整曲生成结果。"]
-    lines = ["正式整曲生成与原谱对比（持续音合并 Hold/Touch Hold/Slide）："]
-    generated_counts, all_intervals = [], []
-    for title, target, predicted, dropped in items:
-        expected, actual = _counts(target), _counts(predicted)
-        intervals = _intervals(predicted)
-        generated_counts.append(actual)
-        all_intervals.extend(intervals)
-        lines.extend([
-            f"  {title}：Tap={actual['tap']}/{expected['tap']} ({_ratio(actual['tap'], expected['tap'])})，持续音={actual['long']}/{expected['long']} ({_ratio(actual['long'], expected['long'])})，总音符={actual['total']}/{expected['total']} ({_ratio(actual['total'], expected['total'])})，过滤 Tap={dropped}。",
-            *_match_lines(predicted, target),
+def build_level_reference(items: list[tuple[float, np.ndarray]]) -> dict[float, dict]:
+    """按 Diving-Fish 精确定数汇总完整数据集基准。"""
+    groups: dict[float, list[np.ndarray]] = {}
+    for level_query, tracks in items:
+        groups.setdefault(level_query, []).append(tracks)
+    reference = {}
+    for level_query, tracks_group in groups.items():
+        counts = [_counts(tracks) for tracks in tracks_group]
+        values = {"charts": len(tracks_group)}
+        for key in ("tap", "long", "total"):
+            values[key] = _average_middle([value[key] for value in counts])
+        values["interval"] = _average_middle([
+            value for tracks in tracks_group for value in _intervals(tracks)
         ])
-    lines.append(f"Master 总体基准比较（{len(items)} 首生成谱的每首平均；基准为 1588 首 Master）：")
-    for key, label in (("tap", "Tap/Touch"), ("long", "持续音"), ("total", "总音符")):
-        values = [counts[key] for counts in generated_counts]
-        average, middle = mean(values), median(values)
-        lines.append(f"  {label}：平均={average:.1f}，为 Master 平均 {MASTER_MEAN[key]:.1f} 的 {_ratio(average, MASTER_MEAN[key])}；中位数={middle:.1f}，为 Master 参考中位数 {MASTER_MEDIAN[key]:.1f} 的 {_ratio(middle, MASTER_MEDIAN[key])}。")
-    if all_intervals:
-        average, middle = mean(all_intervals), median(all_intervals)
-        lines.append(f"  相邻音符间隔：平均={average:.4f} 秒，为 Master 平均 {MASTER_MEAN['interval']:.4f} 秒的 {_ratio(average, MASTER_MEAN['interval'])}；中位数={middle:.4f} 秒，为 Master 中位数 {MASTER_MEDIAN['interval']:.4f} 秒的 {_ratio(middle, MASTER_MEDIAN['interval'])}。")
-    else:
-        lines.append("  相邻音符间隔：生成谱没有足够的不同时间点，无法比较。")
-    return lines
+        reference[level_query] = values
+    return reference
+
+
+def _level_metrics(items: list[EvaluationItem], reference: dict[float, dict] | None) -> list[dict]:
+    groups: dict[float, list[EvaluationItem]] = {}
+    for item in items:
+        groups.setdefault(item.level_query, []).append(item)
+    rows = []
+    for level_query, group in sorted(groups.items()):
+        generated = [_counts(item.predicted) for item in group]
+        targets = [_counts(item.target) for item in group]
+        baseline = reference.get(level_query) if reference is not None else None
+        row = {
+            "level_query": level_query,
+            "charts": len(group),
+            "reference_charts": baseline["charts"] if baseline is not None else len(group),
+        }
+        for key in ("tap", "long", "total"):
+            row[f"generated_{key}"] = _average_middle([value[key] for value in generated])
+            row[f"target_{key}"] = baseline[key] if baseline is not None else _average_middle([value[key] for value in targets])
+        row["generated_interval"] = _average_middle([
+            value for item in group for value in _intervals(item.predicted)
+        ])
+        row["target_interval"] = baseline["interval"] if baseline is not None else _average_middle([
+            value for item in group for value in _intervals(item.target)
+        ])
+        tap = _channel_metrics(group, TAP_COUNT, MATCH_TOLERANCE_FRAMES)
+        long = _channel_metrics(group, HOLD_START_COUNT, MATCH_TOLERANCE_FRAMES)
+        row["score"] = mean((tap["f1"], long["f1"]))
+        row["long_type_accuracy"], row["long_duration_accuracy"], _ = _long_accuracy(group)
+        rows.append(row)
+    return rows
+
+
+def evaluate_generation(items: list[EvaluationItem], reference: dict[float, dict] | None = None) -> dict:
+    if not items:
+        return {
+            "score": 0.0, "strict_score": 0.0,
+            "tap": _prf(0, 0, 0), "long": _prf(0, 0, 0),
+            "duration_mae_frames": 0.0, "duration_median_frames": 0.0,
+            "long_type_accuracy": None, "long_duration_accuracy": None,
+            "matched_durations": 0, "generated_count": 0, "target_count": 0,
+            "count_error": 0.0, "dropped": 0, "dropped_rate": 0.0,
+            "empty_rate": 0.0, "levels": [],
+        }
+
+    tap = _channel_metrics(items, TAP_COUNT, MATCH_TOLERANCE_FRAMES)
+    long = _channel_metrics(items, HOLD_START_COUNT, MATCH_TOLERANCE_FRAMES)
+    strict_tap = _channel_metrics(items, TAP_COUNT, 0)
+    strict_long = _channel_metrics(items, HOLD_START_COUNT, 0)
+    long_type_accuracy, long_duration_accuracy, duration_errors = _long_accuracy(items)
+
+    generated_count = sum(_counts(item.predicted)["total"] for item in items)
+    target_count = sum(_counts(item.target)["total"] for item in items)
+    dropped = sum(item.dropped for item in items)
+    raw_taps = sum(_counts(item.predicted)["tap"] for item in items) + dropped
+    empty = sum(_counts(item.predicted)["total"] == 0 for item in items)
+    return {
+        "score": mean((tap["f1"], long["f1"])),
+        "strict_score": mean((strict_tap["f1"], strict_long["f1"])),
+        "tap": tap,
+        "long": long,
+        "duration_mae_frames": float(mean(duration_errors)) if duration_errors else 0.0,
+        "duration_median_frames": float(median(duration_errors)) if duration_errors else 0.0,
+        "long_type_accuracy": long_type_accuracy,
+        "long_duration_accuracy": long_duration_accuracy,
+        "matched_durations": len(duration_errors),
+        "generated_count": generated_count,
+        "target_count": target_count,
+        "count_error": (generated_count - target_count) / target_count if target_count else 0.0,
+        "dropped": dropped,
+        "dropped_rate": dropped / raw_taps if raw_taps else 0.0,
+        "empty_rate": empty / len(items),
+        "levels": _level_metrics(items, reference),
+    }
 
 
 def _self_check() -> None:
     target = np.array(((1, 1, 10, 0), (0, 0, 0, 0), (1, 0, 0, 0)), dtype=np.int32)
-    predicted = np.array(((1, 1, 10, 0), (1, 0, 0, 0), (0, 0, 0, 0)), dtype=np.int32)
-    text = "\n".join(format_generation_comparison([("test", target, predicted, 2)]))
-    assert "Tap=2/2 (100.0%)" in text and "F1=50.0%" in text and "过滤 Tap=2" in text
-    assert generation_score([("test", target, predicted, 2)]) == 0.75
+    predicted = np.array(((0, 0, 0, 0), (1, 1, 12, 0), (1, 0, 0, 0)), dtype=np.int32)
+    item = EvaluationItem("test", 13.7, target, predicted, 2)
+    metrics = evaluate_generation([item])
+    assert metrics["score"] == 1.0 and metrics["strict_score"] == 0.25
+    assert metrics["duration_mae_frames"] == 2 and metrics["matched_durations"] == 1
+    assert metrics["long_type_accuracy"] == 1.0 and metrics["long_duration_accuracy"] == 1.0
+    assert metrics["dropped_rate"] == 0.5 and metrics["levels"][0]["level_query"] == 13.7
+
+    duration_target = np.array(((0, 1, 100, 0), (0, 1, 100, 0)), dtype=np.int32)
+    duration_predicted = np.array(((0, 1, 110, 0), (0, 1, 111, 0)), dtype=np.int32)
+    duration_metrics = evaluate_generation([EvaluationItem("duration", 13.7, duration_target, duration_predicted, 0)])
+    assert duration_metrics["long_type_accuracy"] == 1.0 and duration_metrics["long_duration_accuracy"] == 0.5
+
+    no_long_metrics = evaluate_generation([EvaluationItem("no-long", 13.7, np.zeros((1, 4), dtype=np.int32), np.zeros((1, 4), dtype=np.int32), 0)])
+    assert no_long_metrics["long_type_accuracy"] is None and no_long_metrics["long_duration_accuracy"] is None
+
+    duplicate = np.array(((2, 0, 0, 0),), dtype=np.int32)
+    single = np.array(((1, 0, 0, 0),), dtype=np.int32)
+    score = evaluate_generation([EvaluationItem("duplicate", 13.1, single, duplicate, 0)])["tap"]
+    assert score == {"precision": 0.5, "recall": 1.0, "f1": 2 / 3}
     print("[generation-metrics] 自检通过")
 
 

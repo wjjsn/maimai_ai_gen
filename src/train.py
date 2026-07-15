@@ -5,6 +5,10 @@ import shutil
 
 import numpy as np
 import torch
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 from torch import nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -13,13 +17,14 @@ from audio_features import MERT_HIDDEN_DIM, extract_audio_features
 from chart import Chart, Level
 from config import CONFIG, checkpoint_config
 from dataset import SongDataset, SongEntry, _target_scale, chart_to_targets, collate_songs, discover_songs, parse_level
-from generation_metrics import format_generation_comparison, generation_score
+from generation_metrics import EvaluationItem, build_level_reference, evaluate_generation
 from infer import MODEL_KIND, events_to_frames, frames_to_maidata, predict_events, save_inference_files
 from model import ChartCNN, ModelDimensions
 from tensor_roundtrip import HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, chart_to_tracks
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CONSOLE = Console()
 if DEVICE.type == "cuda":
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -39,17 +44,6 @@ def split_entries(entries, seed: int, overfit_charts: int):
     val_count, test_count = max(1, round(len(keys) * CONFIG.training.val_ratio)), max(1, round(len(keys) * CONFIG.training.test_ratio))
     groups = shuffled[val_count + test_count:], shuffled[:val_count], shuffled[val_count:val_count + test_count]
     return tuple([entry for path in group for entry in songs[path]] for group in groups)
-
-
-def first_songs(entries, count: int):
-    selected, keys = [], set()
-    for entry in entries:
-        if entry.song_key not in keys:
-            if len(keys) == count:
-                break
-            keys.add(entry.song_key)
-        selected.append(entry)
-    return selected
 
 
 def _duration_target(events: torch.Tensor) -> torch.Tensor:
@@ -86,7 +80,7 @@ def run_epoch(model, loader, optimizer, scaler):
     training = optimizer is not None
     model.train(training)
     totals = np.zeros(3)
-    correct = frames = 0
+    evaluation_items = []
     for batch in tqdm(loader, desc="训练" if training else "验证", leave=False):
         for key in ("features", "events", "mask", "level_queries", "level_indices"):
             batch[key] = batch[key].to(DEVICE, non_blocking=True)
@@ -100,17 +94,31 @@ def run_epoch(model, loader, optimizer, scaler):
             nn.utils.clip_grad_norm_(model.parameters(), CONFIG.training.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-        prediction = torch.cat((output[0].argmax(dim=-1, keepdim=True), output[1].argmax(dim=-1, keepdim=True), _duration_frames(output[2])), dim=-1)
-        target = torch.cat(((batch["events"][..., :2] * torch.tensor((8, 2), device=DEVICE)).round(), batch["events"][..., HOLD_DURATION_1:] * round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)), dim=-1)
-        duration_match = ((prediction[..., HOLD_DURATION_1:] == target[..., HOLD_DURATION_1:]) | (target[..., HOLD_DURATION_1:] == 0)).all(dim=-1)
-        correct += ((prediction[..., :HOLD_DURATION_1] == target[..., :HOLD_DURATION_1]).all(dim=-1) & duration_match & batch["mask"]).sum().item()
-        frames += batch["mask"].sum().item()
+        if not training:
+            predictions = torch.cat((
+                output[0].argmax(dim=-1, keepdim=True),
+                output[1].argmax(dim=-1, keepdim=True),
+                _duration_frames(output[2]),
+            ), dim=-1).cpu().numpy().astype(np.int32)
+            targets = (batch["events"] * torch.tensor(_target_scale(), device=DEVICE)).round().cpu().numpy().astype(np.int32)
+            masks = batch["mask"].cpu().numpy()
+            for prediction, target, valid, entry in zip(predictions, targets, masks, batch["entries"]):
+                prediction, target = prediction[valid], target[valid]
+                frames, song_stats = events_to_frames(prediction)
+                generated = Chart(all_levels=[None] * 7)
+                generated.all_levels[entry.level_idx] = Level("generated", entry.level_query, frames)
+                postprocessed = chart_to_tracks(generated, entry.level_idx)
+                postprocessed = np.pad(postprocessed, ((0, max(0, len(prediction) - len(postprocessed))), (0, 0)))[:len(prediction)]
+                evaluation_items.append(EvaluationItem(
+                    f"{entry.chart_path.parent.name} level={entry.level_idx} ds={entry.level_query:g}",
+                    entry.level_query, target, postprocessed, song_stats["dropped"],
+                ))
         totals += (loss.item(), count_loss.item(), duration_loss.item())
-    return (*((totals / max(len(loader), 1)).tolist()), correct / max(frames, 1))
+    return tuple((totals / max(len(loader), 1)).tolist()), evaluation_items
 
 
 @torch.no_grad()
-def generation_eval(model, entries, output_dir: Path | None = None):
+def generation_eval(model, entries, reference=None, output_dir: Path | None = None):
     stats = {"songs": 0, "charts": 0, "events": 0, "dropped": 0, "comparison": []}
     groups = {}
     for entry in entries:
@@ -134,17 +142,28 @@ def generation_eval(model, entries, output_dir: Path | None = None):
             stats["dropped"] += song_stats["dropped"]
             relative = entry.chart_path.parent.relative_to(CONFIG.paths.charts_dir)
             label = f"{relative} level={entry.level_idx} ds={entry.level_query:g}"
-            stats["comparison"].append((label, target, predicted, song_stats["dropped"]))
+            stats["comparison"].append(EvaluationItem(label, entry.level_query, target, predicted, song_stats["dropped"]))
             if output_dir is not None:
                 difficulty_dir = output_dir / relative / f"level_{entry.level_idx}_{entry.level_query:g}"
                 save_inference_files(entry.audio_path, frames_to_maidata(frames, entry.level_idx, entry.level_query, relative.name), difficulty_dir)
-    stats["score"] = generation_score(stats["comparison"])
+    stats["metrics"] = evaluate_generation(stats["comparison"], reference)
+    stats["score"] = stats["metrics"]["score"]
     return stats
+
+
+def build_reference(entries) -> dict[float, dict]:
+    items = []
+    texts = {}
+    for entry in tqdm(entries, desc="统计精确定数基准", leave=False):
+        text = texts.setdefault(entry.chart_path, entry.chart_path.read_text(encoding="utf-8"))
+        items.append((entry.level_query, chart_to_tracks(parse_level(text, entry.level_idx), entry.level_idx)))
+    return build_level_reference(items)
 
 
 def checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics, training_state, data_info):
     return {
         "checkpoint_version": 7,
+        "evaluation_version": 2,
         "model_kind": MODEL_KIND,
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -162,6 +181,7 @@ def checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics, traini
 def validate_checkpoint(state, dims, data_info) -> None:
     if (
         state.get("checkpoint_version") != 7
+        or state.get("evaluation_version") != 2
         or state.get("model_kind") != MODEL_KIND
         or state.get("config") != checkpoint_config()
         or state.get("dims") != dims
@@ -170,37 +190,77 @@ def validate_checkpoint(state, dims, data_info) -> None:
         raise ValueError("检查点的架构、配置或难度数据快照与当前训练不一致")
 
 
-def format_epoch_log(epoch: int, train_metrics, val_metrics, learning_rate: float, saved_best: bool, bad_epochs: int) -> str:
-    """将一轮训练的数字拆成可直接阅读的说明。"""
-    best_text = "这轮验证损失刷新最低记录，已保存为 checkpoints/best.pt。" if saved_best else f"这轮没有刷新最低验证损失；已经连续 {bad_epochs} 轮未改善。"
-    return "\n".join([
-        "",
-        f"========== 第 {epoch} 轮训练完成 ==========" ,
-        "训练集结果（训练集会使用随机数据增强，因此不应直接和验证集逐项比较）：",
-        f"  训练总损失：{train_metrics[0]:.6f}。这是数量预测损失和长按时长预测损失之和，越低表示训练数据上的回归误差越小。",
-        "验证集结果（不使用数据增强，也不会更新模型参数，用它决定最佳模型）：",
-        f"  验证总损失：{val_metrics[0]:.6f}。这是选择最佳 checkpoint 和提前停止时使用的主要指标，越低越好。",
-        f"  音符数量预测损失：{val_metrics[1]:.6f}。它衡量每个 5 毫秒时间帧中 Tap/Touch 数量和长按起点数量是否接近真实谱面；预测成错误整数的帧会按配置加重。",
-        f"  长按时长预测损失：{val_metrics[2]:.6f}。它只在真实存在长按或 Slide 的起点计算，衡量预测持续时间与真实持续时间的差距。",
-        f"  完整时间帧命中率：{val_metrics[3] * 100:.2f}%。只有 Tap/Touch 数量、长按起点数量，以及真实存在的长按时长都完全正确时，该 5 毫秒帧才算命中。",
-        f"  当前学习率：{learning_rate:.6e}。这是下一轮参数更新使用的步长，余弦退火会让它逐步降低。",
-        f"检查点状态：{best_text}",
-        "================================",
-    ])
+def format_epoch_log(epoch: int, train_metrics, val_metrics, learning_rate: float, saved_best: bool, bad_epochs: int):
+    table = Table(title=f"第 {epoch} 轮训练", show_header=True, header_style="bold cyan")
+    for column in ("训练损失", "验证损失", "数量损失", "时长损失", "学习率", "生成未改善"):
+        table.add_column(column, justify="right")
+    style = "bold green" if bad_epochs == 0 else ("red" if bad_epochs >= CONFIG.training.early_stop_patience - 2 else "yellow")
+    table.add_row(
+        f"{train_metrics[0]:.5f}", f"{val_metrics[0]:.5f}", f"{val_metrics[1]:.5f}",
+        f"{val_metrics[2]:.5f}", f"{learning_rate:.2e}", Text(str(bad_epochs), style=style),
+    )
+    status = Text("验证损失新低，已保存 best.pt", style="bold green") if saved_best else Text("验证损失未刷新", style="dim")
+    return Group(table, status)
 
 
-def format_generation_log(label: str, stats: dict[str, int]) -> str:
-    return "\n".join([
-        "",
-        f"---------- {label} ----------",
-        f"参与整曲推理的歌曲数：{stats['songs']} 首。",
-        f"参与整曲推理的谱面数：{stats['charts']} 张。",
-        f"成功写入生成谱面的音符事件总数：{stats['events']} 个。这个数字只表示模型生成量，不代表与原谱面的匹配程度。",
-        f"因为短音之间少于最小间隔而被丢弃的 Tap/Touch 数量：{stats['dropped']} 个。该数值很高通常表示模型把短音生成得过密。",
-        f"正式生成选模 F1：{stats['score'] * 100:.2f}%。这是 Tap 与持续音起点微平均 F1 的均值，越高越好。",
-        *format_generation_comparison(stats["comparison"]),
-        "--------------------------------",
-    ])
+def _deviation_style(value: float, reference: float, samples: int) -> str:
+    if samples < 3:
+        return "yellow"
+    difference = abs(value / reference - 1) if reference else float("inf")
+    return "green" if difference <= 0.10 else "yellow" if difference <= 0.25 else "red"
+
+
+def _deviation(values, references, samples: int) -> Text:
+    average, _middle = values
+    reference_average, _reference_middle = references
+    difference = (average / reference_average - 1) * 100 if reference_average else 0.0
+    return Text(f"{difference:+.1f}%", style=_deviation_style(average, reference_average, samples))
+
+
+def _accuracy(value: float | None) -> str:
+    return f"{value:.1%}" if value is not None else "无样本"
+
+
+def format_generation_log(label: str, stats: dict[str, int], saved_best: bool = False, show_levels: bool = True):
+    metrics = stats["metrics"]
+    summary = Table(show_header=True, header_style="bold cyan")
+    for column in ("综合 F1", "Tap F1", "持续起点 F1", "严格 F1", "时长 MAE", "数量偏差", "过滤率", "空谱率"):
+        summary.add_column(column, justify="right")
+    score_style = "bold green" if saved_best else "white"
+    duration = (
+        f"{metrics['duration_mae_frames'] / CONFIG.audio.frames_per_sec * 1000:.0f} ms"
+        if metrics["matched_durations"] else "无匹配"
+    )
+    summary.add_row(
+        Text(f"{metrics['score']:.1%}", style=score_style), f"{metrics['tap']['f1']:.1%}",
+        f"{metrics['long']['f1']:.1%}", f"{metrics['strict_score']:.1%}",
+        duration,
+        f"{metrics['count_error']:+.1%}", f"{metrics['dropped_rate']:.1%}", f"{metrics['empty_rate']:.1%}",
+    )
+
+    levels = Table(title="精确定数生成分布（生成/完整数据集基准）", header_style="bold cyan")
+    for column in ("DS", "验证", "基准", "Tap 偏差", "持续偏差", "总数偏差", "间隔偏差", "持续类型准确率", "持续时长准确率", "F1"):
+        levels.add_column(column, justify="right")
+    for row in metrics["levels"]:
+        samples = row["charts"]
+        levels.add_row(
+            f"{row['level_query']:.1f}", str(samples), str(row["reference_charts"]),
+            _deviation(row["generated_tap"], row["target_tap"], samples),
+            _deviation(row["generated_long"], row["target_long"], samples),
+            _deviation(row["generated_total"], row["target_total"], samples),
+            _deviation(row["generated_interval"], row["target_interval"], samples),
+            _accuracy(row["long_type_accuracy"]),
+            _accuracy(row["long_duration_accuracy"]),
+            f"{row['score']:.1%}",
+        )
+    subtitle = Text(
+        f"{stats['songs']} 首 / {stats['charts']} 张谱面 / 10 ms 容差",
+        style="dim",
+    )
+    if saved_best:
+        subtitle.append(" / 新最佳生成模型", style="bold green")
+    content = Group(subtitle, summary, levels) if show_levels else Group(subtitle, summary)
+    return Panel(content, title=label, border_style="green" if saved_best else "cyan")
 
 
 def _self_check() -> None:
@@ -228,7 +288,6 @@ def _self_check() -> None:
     ]
     train, val, test = split_entries(entries, 42, 0)
     assert not ({entry.song_key for entry in train} & {entry.song_key for entry in val + test})
-    assert len(first_songs(entries, 1)) == 3
     source = Chart(all_levels=[None] * 7)
     source.all_levels[2] = Level("basic", 4.0, [])
     source.all_levels[5] = Level("master", 13.0, [])
@@ -248,7 +307,7 @@ def _self_check() -> None:
     assert extract.call_count == 1 and stats["songs"] == 1 and stats["charts"] == 2
 
     dims = ModelDimensions(4, 8, 1, 3, 0)
-    state = {"checkpoint_version": 7, "model_kind": MODEL_KIND, "config": checkpoint_config(), "dims": dims, "data_info": {"schema_version": 1, "digest": "test"}}
+    state = {"checkpoint_version": 7, "evaluation_version": 2, "model_kind": MODEL_KIND, "config": checkpoint_config(), "dims": dims, "data_info": {"schema_version": 1, "digest": "test"}}
     validate_checkpoint(state, dims, state["data_info"])
     try:
         validate_checkpoint(state, dims, {"schema_version": 1, "digest": "changed"})
@@ -256,7 +315,9 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("难度数据快照变化时必须拒绝检查点")
-    assert "完整时间帧命中率" in format_epoch_log(1, (0.1, 0.1, 0.0, 0.0), (0.1, 0.1, 0.0, 0.0), 0.001, True, 0)
+    console = Console(record=True, width=140, color_system=None)
+    console.print(format_epoch_log(1, (0.1, 0.1, 0.0), (0.1, 0.1, 0.0), 0.001, True, 0))
+    assert "验证损失新低" in console.export_text() and "完整时间帧命中率" not in console.export_text()
     print("[train] 自检通过")
 
 
@@ -273,7 +334,13 @@ def main() -> None:
         raise ValueError(f"有效歌曲只有 {len(songs)} 首，需要至少 {minimum} 首")
     train_entries, val_entries, test_entries = split_entries(entries, CONFIG.training.seed, CONFIG.training.overfit_charts)
     song_count = lambda group: len({entry.song_key for entry in group})
-    print(f"设备={DEVICE}，训练/验证/测试歌曲={song_count(train_entries)}/{song_count(val_entries)}/{song_count(test_entries)} 首，谱面={len(train_entries)}/{len(val_entries)}/{len(test_entries)} 张", flush=True)
+    CONSOLE.print(f"设备={DEVICE}，训练/验证/测试歌曲={song_count(train_entries)}/{song_count(val_entries)}/{song_count(test_entries)} 首，谱面={len(train_entries)}/{len(val_entries)}/{len(test_entries)} 张")
+    if CONFIG.training.overfit_charts:
+        CONSOLE.print(Panel(
+            "训练集与验证集是同一批歌曲，只能衡量记忆能力，不能代表未见歌曲上的泛化效果。",
+            title="OVERFIT 模式", border_style="bold red",
+        ))
+    reference = build_reference(entries)
     options = {"num_workers": CONFIG.training.num_workers, "pin_memory": CONFIG.training.pin_memory, "collate_fn": collate_songs}
     if CONFIG.training.num_workers:
         options["prefetch_factor"] = CONFIG.training.prefetch_factor
@@ -318,26 +385,35 @@ def main() -> None:
     for epoch in range(start_epoch, CONFIG.training.num_epochs + 1):
         if epoch == 1:
             print("开始现场解码音频并提取首批 MERT 特征", flush=True)
-        train_metrics, val_metrics = run_epoch(model, train_loader, optimizer, scaler), run_epoch(model, val_loader, None, scaler)
+        train_metrics, _ = run_epoch(model, train_loader, optimizer, scaler)
+        val_metrics, validation_items = run_epoch(model, val_loader, None, scaler)
+        generation_metrics = evaluate_generation(validation_items, reference)
         scheduler.step()
-        metrics = {"train_loss": train_metrics[0], "val_loss": val_metrics[0], "count_loss": val_metrics[1], "duration_loss": val_metrics[2], "exact_frame_accuracy": val_metrics[3] * 100}
+        metrics = {
+            "train_loss": train_metrics[0], "val_loss": val_metrics[0],
+            "count_loss": val_metrics[1], "duration_loss": val_metrics[2],
+            "generation_score": generation_metrics["score"],
+        }
         if val_metrics[0] < best_loss:
-            best_loss, bad_epochs = val_metrics[0], 0
+            best_loss = val_metrics[0]
             saved_best = True
         else:
-            bad_epochs += 1
             saved_best = False
-        print(format_epoch_log(epoch, train_metrics, val_metrics, scheduler.get_last_lr()[0], saved_best, bad_epochs))
-        if epoch == 1 or epoch % CONFIG.training.generation_interval == 0:
-            generated = generation_eval(model, first_songs(val_entries, CONFIG.training.val_gen_charts))
-            if generated["score"] > best_gen_score:
-                best_gen_score = generated["score"]
-                saved_best_gen = True
-            else:
-                saved_best_gen = False
-            print(format_generation_log("定期整曲推理检查", generated))
+        if generation_metrics["score"] > best_gen_score:
+            best_gen_score, bad_epochs = generation_metrics["score"], 0
+            saved_best_gen = True
         else:
+            bad_epochs += 1
             saved_best_gen = False
+        CONSOLE.print(format_epoch_log(epoch, train_metrics, val_metrics, scheduler.get_last_lr()[0], saved_best, bad_epochs))
+        validation_stats = {
+            "songs": song_count(val_entries), "charts": len(validation_items),
+            "metrics": generation_metrics,
+        }
+        CONSOLE.print(format_generation_log(
+            "完整验证集实际生成效果", validation_stats, saved_best_gen,
+            show_levels=epoch == 1 or epoch % CONFIG.training.generation_interval == 0,
+        ))
         training_state = {"best_loss": best_loss, "best_gen_score": best_gen_score, "bad_epochs": bad_epochs}
         state = checkpoint(model, optimizer, scheduler, scaler, dims, epoch, metrics, training_state, data_info)
         torch.save(state, CONFIG.paths.checkpoint_dir / "newest.pt")
@@ -346,7 +422,7 @@ def main() -> None:
         if saved_best_gen:
             torch.save(state, best_gen_path)
         if bad_epochs >= CONFIG.training.early_stop_patience:
-            print("验证损失长期没有改善，提前停止")
+            CONSOLE.print("[bold red]完整验证集综合 F1 长期没有改善，提前停止[/bold red]")
             break
     if not best_gen_path.is_file():
         raise ValueError(f"没有可用的最佳生成检查点：{best_gen_path}")
@@ -355,7 +431,7 @@ def main() -> None:
     model.load_state_dict(best["model_state_dict"])
     output_entries = train_entries if CONFIG.training.overfit_charts else test_entries
     output_dir = CONFIG.paths.overfit_output_dir if CONFIG.training.overfit_charts else CONFIG.paths.train_output_dir
-    print(format_generation_log("最终整曲推理完成", generation_eval(model, output_entries, output_dir)))
+    CONSOLE.print(format_generation_log("最终整曲推理完成", generation_eval(model, output_entries, reference, output_dir)))
 
 
 if __name__ == "__main__":

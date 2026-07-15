@@ -77,7 +77,6 @@ class TrainingConfig:
     early_stop_patience: int
     lr_t_max: int
     seed: int
-    val_gen_charts: int
     generation_interval: int
     overfit_charts: int
     short_loss_weight: float
@@ -136,7 +135,7 @@ SECTIONS = {
         "学习率": "learning_rate", "最低学习率": "min_learning_rate", "权重衰减": "weight_decay",
         "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
         "提前停止耐心轮数": "early_stop_patience", "学习率退火周期": "lr_t_max",
-        "随机种子": "seed", "整曲验证歌曲数": "val_gen_charts", "整曲验证间隔": "generation_interval",
+        "随机种子": "seed", "整曲验证间隔": "generation_interval",
         "过拟合歌曲数": "overfit_charts", "短音损失权重": "short_loss_weight",
         "预测错误损失权重": "wrong_loss_weight",
     }),
@@ -232,7 +231,7 @@ def _validate(config: AppConfig) -> None:
     _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
     _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
     _require(training.grad_clip > 0 and training.early_stop_patience > 0 and training.lr_t_max > 0, "训练控制参数无效")
-    _require(training.val_gen_charts >= 0 and training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
+    _require(training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
     _require(training.short_loss_weight > 0 and training.wrong_loss_weight >= 1, "损失权重无效")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
     _require(0 <= inference.long_threshold <= 1, "持续音阈值必须在 [0, 1] 内")
