@@ -80,8 +80,6 @@ class TrainingConfig:
     val_gen_charts: int
     generation_interval: int
     overfit_charts: int
-    short_loss_weight: float
-    max_long_pos_weight: float
 
 
 @dataclass(frozen=True)
@@ -89,6 +87,7 @@ class InferenceConfig:
     audio_path: Path
     checkpoint: Path
     level_idx: int
+    level_query: float
     short_min_gap_frames: int
     long_min_frames: int
     long_threshold: float
@@ -136,11 +135,11 @@ SECTIONS = {
         "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
         "提前停止耐心轮数": "early_stop_patience", "学习率退火周期": "lr_t_max",
         "随机种子": "seed", "整曲验证歌曲数": "val_gen_charts", "整曲验证间隔": "generation_interval",
-        "过拟合歌曲数": "overfit_charts", "短音损失权重": "short_loss_weight",
-        "长音正样本权重上限": "max_long_pos_weight",
+        "过拟合歌曲数": "overfit_charts",
     }),
     "推理": (InferenceConfig, {
         "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
+        "浮点难度": "level_query",
         "短音最小间隔帧": "short_min_gap_frames", "持续音最短帧数": "long_min_frames",
         "持续音阈值": "long_threshold", "最短持续秒数": "min_duration_sec",
         "最长持续秒数": "max_duration_sec",
@@ -216,13 +215,13 @@ def _validate(config: AppConfig) -> None:
     _require(model.kernel_size > 0 and model.kernel_size % 2 == 1, "模型卷积核必须是正奇数")
     _require(0 <= model.dropout < 1, "模型丢弃率必须在 [0, 1) 内")
     _require(0 <= training.level_idx <= 6 and 0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
+    _require(0 < inference.level_query <= 15, "推理浮点难度必须在 (0, 15] 内")
     _require(training.batch_size > 0 and training.num_workers >= 0 and training.prefetch_factor > 0, "DataLoader 配置无效")
     _require(training.num_epochs > 0 and training.learning_rate > 0 and training.min_learning_rate >= 0, "学习率或训练轮数无效")
     _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
     _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
     _require(training.grad_clip > 0 and training.early_stop_patience > 0 and training.lr_t_max > 0, "训练控制参数无效")
     _require(training.val_gen_charts >= 0 and training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
-    _require(training.short_loss_weight > 0 and training.max_long_pos_weight >= 1, "损失权重无效")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
     _require(0 <= inference.long_threshold <= 1, "持续音阈值必须在 [0, 1] 内")
     _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")
@@ -257,6 +256,7 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
     return {
         "audio": vars(config.audio),
         "model": vars(config.model),
+        "max_duration_sec": config.inference.max_duration_sec,
     }
 
 
@@ -265,6 +265,7 @@ def _self_check() -> None:
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert load_config() == CONFIG
     assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "kernel_size", "dropout"}
+    assert CONFIG.inference.level_query == 13.0
     print("[config] 自检通过")
 
 
