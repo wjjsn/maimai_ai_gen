@@ -8,9 +8,6 @@
 
 ## 当前架构
 
-输入歌曲音频，训练时由 DataLoader 现场提取 200Hz log-mel，不读写任何特征或谱面缓存。
-整曲 CNN 等长预测一条短音轴和两条持续轴，再转换为 `maidata.txt`。
-
 - `config.yaml`：全部可调默认参数。
 - `src/config.py`：配置读取和校验。
 - `src/audio_features.py`：现场解码音频并提取 log-mel。
