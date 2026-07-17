@@ -12,7 +12,8 @@ from config import CONFIG
 from maidata_parser import parse_maidata
 
 
-RATE = 200
+RATE = CONFIG.audio.frames_per_sec
+MIN_GAP = CONFIG.inference.short_min_gap_frames
 
 
 @dataclass
@@ -28,6 +29,11 @@ class SongMetrics:
     slide_frames: Counter[int]
     default_wait_segments: int
     custom_wait_segments: int
+    label_gaps: dict[str, list[int]]
+    close_start_points: dict[str, int]
+    close_note_counts: dict[str, int]
+    closest_starts: dict[str, tuple[int, int] | None]
+    label_note_counts: dict[str, int]
 
 
 def _index(time_sec: float) -> int:
@@ -49,6 +55,15 @@ def _slide_intervals(note: Note, time_sec: float) -> list[tuple[int, int]]:
         if end > start:
             intervals.append((start, end))
     return intervals
+
+
+def _slide_trace_starts(note: Note, time_sec: float) -> list[int]:
+    branches: list[list] = []
+    for segment in note.data:
+        if not branches or segment.start_lane != branches[-1][-1].end_lane:
+            branches.append([])
+        branches[-1].append(segment)
+    return [_index(time_sec + branch[0].wait_duration) for branch in branches]
 
 
 def _add_interval(axis: np.ndarray, start: int, end: int, first: int) -> None:
@@ -80,14 +95,17 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
     start_counts = {name: [] for name in ("tap", "hold", "slide")}
     note_counts = {name: 0 for name in ("tap", "hold", "slide")}
     default_wait_segments = custom_wait_segments = 0
+    label_starts = {name: Counter() for name in ("tap", "hold")}
     for frame_index, note, time_sec in events:
         if note.type in (NoteType.TAP, NoteType.TOUCH):
             axes["tap"][frame_index - first] += 1
             start_counts["tap"].append(frame_index)
+            label_starts["tap"][frame_index] += 1
             note_counts["tap"] += 1
         elif note.type in (NoteType.HOLD, NoteType.TOUCH_HOLD):
             _add_interval(axes["hold"], frame_index, _index(time_sec + note.data.holdTime), first)
             start_counts["hold"].append(frame_index)
+            label_starts["hold"][frame_index] += 1
             note_counts["hold"] += 1
         elif note.type is NoteType.SLIDE:
             for segment in note.data:
@@ -99,6 +117,8 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
                     custom_wait_segments += 1
             for start, end in _slide_intervals(note, time_sec):
                 _add_interval(axes["slide"], start, end, first)
+            for start in _slide_trace_starts(note, time_sec):
+                label_starts["hold"][start] += 1
             start_counts["slide"].append(frame_index)
             note_counts["slide"] += 1
 
@@ -108,6 +128,26 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
     for kind, indices in start_counts.items():
         counts = Counter(indices)
         starts_by_type[kind] = list(counts.values())
+    label_gaps: dict[str, list[int]] = {}
+    close_start_points: dict[str, int] = {}
+    close_note_counts: dict[str, int] = {}
+    closest_starts: dict[str, tuple[int, int] | None] = {}
+    for kind, counts in label_starts.items():
+        points = sorted(counts)
+        label_gaps[kind] = [right - left for left, right in zip(points, points[1:])]
+        kept: list[int] = []
+        ignored_points = ignored_notes = 0
+        for point in points:
+            if kept and point - kept[-1] < MIN_GAP:
+                ignored_points += 1
+                ignored_notes += counts[point]
+            else:
+                kept.append(point)
+        close_start_points[kind] = ignored_points
+        close_note_counts[kind] = ignored_notes
+        closest_starts[kind] = min(
+            zip(points, points[1:]), key=lambda pair: pair[1] - pair[0], default=None,
+        )
     return SongMetrics(
         title=title,
         level_query=level_query,
@@ -120,6 +160,11 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
         slide_frames=Counter(axes["slide"][axes["slide"] > 0].tolist()),
         default_wait_segments=default_wait_segments,
         custom_wait_segments=custom_wait_segments,
+        label_gaps=label_gaps,
+        close_start_points=close_start_points,
+        close_note_counts=close_note_counts,
+        closest_starts=closest_starts,
+        label_note_counts={kind: sum(counts.values()) for kind, counts in label_starts.items()},
     )
 
 
@@ -176,6 +221,41 @@ def _print_new_start_metrics(songs: list[SongMetrics]) -> None:
             print(f"{label}: 时间点数=0")
 
 
+def _print_label_gap_metrics(songs: list[SongMetrics]) -> None:
+    print(f"\n模型标签相邻起点间隔统计（小于 {MIN_GAP} 帧将忽略后一个时间点）")
+    for kind, label in (("tap", "Tap/Touch"), ("hold", "Hold/Touch Hold/Slide轨迹")):
+        gaps = [gap for song in songs for gap in song.label_gaps[kind]]
+        ignored_points = sum(song.close_start_points[kind] for song in songs)
+        ignored_notes = sum(song.close_note_counts[kind] for song in songs)
+        affected = [song for song in songs if song.close_start_points[kind]]
+        total_notes = sum(song.label_note_counts[kind] for song in songs)
+        if not gaps:
+            print(f"{label}: 无相邻时间点")
+            continue
+        array = np.asarray(gaps, dtype=np.int64)
+        closest_song = min(
+            (song for song in songs if song.closest_starts[kind] is not None),
+            key=lambda song: song.closest_starts[kind][1] - song.closest_starts[kind][0],
+        )
+        closest = closest_song.closest_starts[kind]
+        percentiles = np.percentile(array, (1, 5, 95, 99))
+        histogram = Counter(int(value) for value in array if 0 < value < MIN_GAP)
+        print(
+            f"{label}: 间隔数={len(gaps)} 平均={_format(float(array.mean()))} "
+            f"中位数={_format(float(np.median(array)))} 最小={int(array.min())} 最大={int(array.max())} "
+            f"P1/P5/P95/P99={'/'.join(_format(float(value)) for value in percentiles)}"
+        )
+        print(
+            f"  将忽略时间点={ignored_points} 音符={ignored_notes}/{total_notes} "
+            f"({ignored_notes / total_notes:.4%}) 受影响歌曲={len(affected)}/{len(songs)} "
+            f"1-{MIN_GAP - 1}帧分布={dict(sorted(histogram.items()))}"
+        )
+        print(
+            f"  极端样本={closest_song.title} 帧={closest[0]}->{closest[1]} "
+            f"间隔={closest[1] - closest[0]}"
+        )
+
+
 def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.inference.level_idx) -> None:
     songs: list[SongMetrics] = []
     missing_level = parse_errors = 0
@@ -221,6 +301,7 @@ def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.i
             frames = slide_counts[count]
             print(f"并发{count}={frames}帧 ({frames / active_slide_frames:.4%})")
     _print_new_start_metrics(songs)
+    _print_label_gap_metrics(songs)
     _print_global_active_metrics(songs)
     _print_difficulty_metrics(songs)
 
@@ -231,12 +312,17 @@ def _self_check() -> None:
     slide = Note(NoteType.SLIDE, [SlideSegment(SlideShape.Line, TapType.LANE1, TapType.LANE2, 0.5, 1.0)])
     custom = Note(NoteType.SLIDE, [SlideSegment(SlideShape.Line, TapType.LANE3, TapType.LANE4, 0.3, 0.5, False)])
     # 构造的长期音、默认等待和显式等待覆盖三种统计路径。
-    frames = [Frame((Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.0)), slide, custom), 0.0)]
+    frames = [
+        Frame((Note(NoteType.TAP, TapType.LANE1), Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.0)), slide, custom), 0.0),
+        Frame((Note(NoteType.TAP, TapType.LANE2), Note(NoteType.HOLD, HoldData(TapType.LANE2, 1.0))), 0.02),
+    ]
     metrics = analyze_level("test", 13.5, frames)
     assert metrics.default_wait_segments == 1 and metrics.custom_wait_segments == 1
     assert metrics.slide_frames[1] == 140 and metrics.slide_frames[2] == 160
-    assert metrics.note_counts == {"tap": 0, "hold": 1, "slide": 2, "total": 3}
+    assert metrics.note_counts == {"tap": 2, "hold": 2, "slide": 2, "total": 6}
     assert metrics.type_means["hold"] > 0 and metrics.type_medians["total"] >= 1
+    assert metrics.close_start_points == {"tap": 1, "hold": 1}
+    assert metrics.close_note_counts == {"tap": 1, "hold": 1}
     print("[chart-metrics] 自检通过")
 
 

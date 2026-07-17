@@ -221,6 +221,7 @@ def _validate(config: AppConfig) -> None:
     _require(0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
     _require(0 < inference.level_query <= 15, "推理浮点难度必须在 (0, 15] 内")
     _require(training.window_frames > 0 and training.stride > 0, "训练窗口和步长必须大于 0")
+    _require(training.stride <= training.window_frames, "训练窗口步长不能大于窗口帧数")
     _require(training.song_limit >= 0, "训练歌曲数不能为负")
     _require(training.batch_size > 0, "批大小必须大于 0")
     _require(training.num_workers >= 0, "数据加载进程数不能为负")
@@ -265,6 +266,10 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
         "audio": vars(config.audio),
         "model": vars(config.model),
         "window_frames": config.training.window_frames,
+        "label_min_gap_frames": config.inference.short_min_gap_frames,
+        "max_hold_duration_frames": round(
+            config.inference.max_duration_sec * config.audio.frames_per_sec,
+        ),
     }
 
 

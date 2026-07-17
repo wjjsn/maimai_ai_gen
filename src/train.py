@@ -17,7 +17,7 @@ from dataset import (
     build_dataset_index, iter_loaded_window_batches, iter_window_batches,
     load_song_data, split_songs, window_starts,
 )
-from infer import MODEL_KIND, infer_features, model_dimensions
+from infer import LABEL_PROTOCOL, MODEL_KIND, infer_features, model_dimensions
 from model import NoteTimingTransformer
 
 
@@ -298,6 +298,7 @@ def _split_summary(index: DatasetIndex, splits: dict[str, tuple[SongRecord, ...]
             for name, songs in splits.items()
         },
         "excluded": index.excluded,
+        "label_normalization": index.label_normalization,
     }
 
 
@@ -308,7 +309,7 @@ def _checkpoint(
     return {
         "checkpoint_version": 3,
         "model_kind": MODEL_KIND,
-        "label_protocol": "tap-0-1-2-hold-trace-start-duration-v3",
+        "label_protocol": LABEL_PROTOCOL,
         "epoch": epoch,
         "global_step": global_step,
         "model_state_dict": model.state_dict(),
@@ -335,7 +336,7 @@ def _validate_training_checkpoint(state: dict, split_summary: dict) -> bool:
     incompatible = (
         state.get("checkpoint_version") != 3
         or state.get("model_kind") != MODEL_KIND
-        or state.get("label_protocol") != "tap-0-1-2-hold-trace-start-duration-v3"
+        or state.get("label_protocol") != LABEL_PROTOCOL
         or state.get("dims") != model_dimensions()
         or any(saved_config.get(key) != value for key, value in expected_config.items())
     )
@@ -452,7 +453,7 @@ def _self_check() -> None:
     compatible_state = {
         "checkpoint_version": 3,
         "model_kind": MODEL_KIND,
-        "label_protocol": "tap-0-1-2-hold-trace-start-duration-v3",
+        "label_protocol": LABEL_PROTOCOL,
         "dims": model_dimensions(),
         "config": checkpoint_config(),
         "training_config": vars(CONFIG.training),
@@ -530,6 +531,7 @@ def main() -> None:
         f"预计每轮批次={train_batches[0]} 总更新={total_steps}",
         flush=True,
     )
+    print(f"标签规范化={index.label_normalization}", flush=True)
     for epoch in range(start_epoch, CONFIG.training.num_epochs + 1):
         started = time.perf_counter()
         if DEVICE.type == "cuda":

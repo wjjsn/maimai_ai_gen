@@ -1,7 +1,7 @@
 """全量歌曲索引、现场音频增强和四列逐帧监督轴。"""
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -68,6 +68,7 @@ class DatasetIndex:
     digest: str
     music_data_digest: str
     excluded: dict[str, int]
+    label_normalization: dict[str, int] = field(default_factory=dict)
 
 
 def _slide_branches(note: Note) -> list[list[SlideSegment]]:
@@ -378,6 +379,7 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
     music_data, music_digest = load_music_data()
     songs: list[SongRecord] = []
     excluded: Counter[str] = Counter()
+    label_normalization: Counter[str] = Counter()
     maximum_duration = round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)
     chart_paths = sorted(charts_dir.rglob("maidata.txt"))
     for chart_path in tqdm(
@@ -420,8 +422,11 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
                 continue
             try:
                 tracks = chart_to_tracks(chart, level_idx)
+                level_stats: Counter[str] = Counter()
+                tracks = normalize_tracks(tracks, estimated_frames, level_stats)
                 if tracks[:, HOLD_DURATION_1:].max(initial=0) > maximum_duration:
                     raise ValueError("持续音超过配置上限")
+                label_normalization.update(level_stats)
                 levels.append(LevelRecord(level_idx, float(difficulty)))
             except Exception as error:
                 message = str(error)
@@ -449,7 +454,9 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
     index_digest = hashlib.sha256(json.dumps(
         summary, ensure_ascii=False, separators=(",", ":"),
     ).encode()).hexdigest()
-    return DatasetIndex(tuple(songs), index_digest, music_digest, dict(excluded))
+    return DatasetIndex(
+        tuple(songs), index_digest, music_digest, dict(excluded), dict(label_normalization),
+    )
 
 
 def _group_songs(index: DatasetIndex) -> list[tuple[str, list[SongRecord]]]:
@@ -520,11 +527,55 @@ def load_song(record: SongRecord) -> tuple[Chart, torch.Tensor]:
     return chart, prepare_waveform(record.audio_path)
 
 
-def _fit_tracks(tracks: np.ndarray, length: int) -> np.ndarray:
-    tracks[:, TAP_COUNT] = np.minimum(tracks[:, TAP_COUNT], 2)
+def normalize_tracks(
+    tracks: np.ndarray, length: int, stats: Counter[str] | None = None,
+) -> np.ndarray:
+    if length <= 0:
+        raise ValueError("标签长度必须大于 0")
+    if stats is not None and len(tracks) > length:
+        stats["Tap音频外忽略音符"] += int(tracks[length:, TAP_COUNT].sum())
+        stats["Hold音频外忽略音符"] += int(tracks[length:, HOLD_START_COUNT].sum())
+    tracks = tracks[:length].copy()
     if len(tracks) < length:
-        return np.pad(tracks, ((0, length - len(tracks)), (0, 0)))
-    return tracks[:length]
+        tracks = np.pad(tracks, ((0, length - len(tracks)), (0, 0)))
+    tap_overflow = np.maximum(tracks[:, TAP_COUNT] - 2, 0)
+    if stats is not None:
+        stats["Tap同帧超过2忽略音符"] += int(tap_overflow.sum())
+    tracks[:, TAP_COUNT] = np.minimum(tracks[:, TAP_COUNT], 2)
+
+    gap = CONFIG.inference.short_min_gap_frames
+    if gap:
+        for column, name in ((TAP_COUNT, "Tap"), (HOLD_START_COUNT, "Hold")):
+            last_kept = -gap
+            for frame_index in np.flatnonzero(tracks[:, column]):
+                if frame_index - last_kept >= gap:
+                    last_kept = int(frame_index)
+                    continue
+                count = int(tracks[frame_index, column])
+                if stats is not None:
+                    stats[f"{name}间隔不足忽略时间点"] += 1
+                    stats[f"{name}间隔不足忽略音符"] += count
+                if column == TAP_COUNT:
+                    tracks[frame_index, TAP_COUNT] = 0
+                else:
+                    tracks[frame_index, HOLD_START_COUNT:] = 0
+
+    for frame_index in np.flatnonzero(tracks[:, HOLD_START_COUNT]):
+        count = int(tracks[frame_index, HOLD_START_COUNT])
+        remaining = length - int(frame_index)
+        for slot in range(count):
+            column = HOLD_DURATION_1 + slot
+            duration = int(tracks[frame_index, column])
+            if duration > remaining:
+                if stats is not None:
+                    stats["Hold音频尾部截断音符"] += 1
+                    stats["Hold音频尾部截断帧数"] += duration - remaining
+                tracks[frame_index, column] = remaining
+    return tracks
+
+
+def _fit_tracks(tracks: np.ndarray, length: int) -> np.ndarray:
+    return normalize_tracks(tracks, length)
 
 
 def _resize_tracks(tracks: np.ndarray, speed: float, length: int) -> np.ndarray:
@@ -542,7 +593,7 @@ def _resize_tracks(tracks: np.ndarray, speed: float, length: int) -> np.ndarray:
             result[target, HOLD_DURATION_1 + target_slot] = max(
                 1, round(int(tracks[source, HOLD_DURATION_1 + slot]) / speed),
             )
-    return result
+    return normalize_tracks(result, length)
 
 
 def _augment_waveform(waveform: torch.Tensor, rng: np.random.Generator) -> tuple[torch.Tensor, float]:
@@ -613,9 +664,12 @@ def _stack_batch(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor
 def window_starts(length: int, offset: int, training: bool) -> list[int]:
     if length <= 0:
         return []
-    starts = set(range(offset if training else 0, length, TRAIN_STRIDE))
+    if length <= WINDOW_FRAMES:
+        return [0]
+    last = length - WINDOW_FRAMES
+    starts = set(range(offset if training else 0, last + 1, TRAIN_STRIDE))
     starts.add(0)
-    starts.add(max(0, length - WINDOW_FRAMES))
+    starts.add(last)
     return sorted(starts)
 
 
@@ -641,16 +695,16 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
         for level in record.levels:
             tracks = chart_to_tracks(chart, level.level_idx)
             tracks = _resize_tracks(tracks, speed, len(features)) if speed != 1.0 else _fit_tracks(tracks, len(features))
-            source_starts = window_starts(record.estimated_frames, offset, training)
-            starts = [max(0, min(len(features) - 1, round(start / speed))) for start in source_starts]
+            starts = window_starts(len(features), offset, training)
             if training and CONFIG.training.event_window_ratio and starts:
                 count = round(len(starts) * CONFIG.training.event_window_ratio)
                 event_frames = np.flatnonzero(tracks[:, TAP_COUNT] | tracks[:, HOLD_START_COUNT])
                 if event_frames.size and count:
                     centers = rng.choice(event_frames, count, replace=event_frames.size < count)
                     starts.extend(max(0, min(
-                        len(features) - 1, int(x) - WINDOW_FRAMES // 2,
+                        max(0, len(features) - WINDOW_FRAMES), int(x) - WINDOW_FRAMES // 2,
                     )) for x in centers)
+                    starts = list(set(starts))
             if training:
                 rng.shuffle(starts)
             for start in starts:
@@ -748,14 +802,17 @@ def _self_check() -> None:
 
     aligned = np.zeros((32, TRACK_COUNT), dtype=np.int32)
     aligned[4] = (1, 1, 9, 0)
-    aligned[5] = (1, 1, 7, 0)
+    aligned[10] = (1, 1, 7, 0)
     aligned[20] = (2, 2, 11, 13)
     for speed in (0.98, 1.0, 1.02):
         length = round(len(aligned) / speed)
         scaled = _resize_tracks(aligned, speed, length)
-        assert scaled[round(5 / speed), HOLD_DURATION_1] == max(1, round(7 / speed))
+        assert scaled[round(10 / speed), HOLD_DURATION_1] == max(1, round(7 / speed))
+        target = round(20 / speed)
         assert scaled[round(20 / speed)].tolist() == [
-            2, 2, max(1, round(11 / speed)), max(1, round(13 / speed)),
+            2, 2,
+            min(max(1, round(11 / speed)), length - target),
+            min(max(1, round(13 / speed)), length - target),
         ]
 
     class _SpeedRng:
@@ -772,8 +829,21 @@ def _self_check() -> None:
     assert np.flatnonzero(scaled[:, TAP_COUNT]).tolist() == sorted({
         round(frame / speed) for frame in np.flatnonzero(aligned[:, TAP_COUNT])
     })
-    collided = _resize_tracks(aligned, 2.0, len(aligned) // 2)
-    assert collided[2].tolist() == [2, 2, 4, 4]
+    close = np.zeros((32, TRACK_COUNT), dtype=np.int32)
+    close[4] = (1, 1, 9, 0)
+    close[5] = (2, 2, 7, 8)
+    stats: Counter[str] = Counter()
+    normalized = normalize_tracks(close, len(close), stats)
+    assert normalized[4].tolist() == [1, 1, 9, 0] and not normalized[5].any()
+    assert stats["Tap间隔不足忽略音符"] == 2
+    assert stats["Hold间隔不足忽略音符"] == 2
+    tail = np.zeros((12, TRACK_COUNT), dtype=np.int32)
+    tail[1] = (0, 1, 100, 0)
+    tail[11] = (0, 1, 10, 0)
+    stats.clear()
+    tail = normalize_tracks(tail, len(tail), stats)
+    assert tail[1, HOLD_DURATION_1] == 11 and tail[11, HOLD_DURATION_1] == 1
+    assert stats["Hold音频尾部截断音符"] == 2
 
     sample = {
         "features": torch.arange(8, dtype=torch.float32).unsqueeze(1),
@@ -828,8 +898,12 @@ def _self_check() -> None:
     }
     assert _fallback_music_id("test [DX]") == "fallback:dx:test"
     assert _fallback_music_id("test", Path("test [DX]/maidata.txt")) == "fallback:dx:test"
+    assert window_starts(1, 0, False) == [0]
+    assert window_starts(WINDOW_FRAMES, 0, False) == [0]
+    assert window_starts(WINDOW_FRAMES + 1, 0, False) == [0, 1]
+    assert window_starts(1536, 0, False) == [0, 512]
     starts = window_starts(3000, 511, True)
-    assert starts[0] == 0 and 1976 in starts and starts[-1] == 2559
+    assert starts == [0, 511, 1023, 1535, 1976]
     negative = Chart(first_sec=-0.1)
     negative.all_levels[5] = Level("test", 1.0, [
         Frame((Note(NoteType.TAP, TapType.LANE1),), 0.0),
