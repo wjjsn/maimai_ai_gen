@@ -64,13 +64,18 @@ def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor
 
 def estimate_batches(songs: tuple[SongRecord, ...], epoch: int) -> int:
     rng = np.random.default_rng(CONFIG.training.seed + epoch)
+    order = rng.permutation(len(songs))
     offset = int(rng.integers(0, CONFIG.training.stride))
-    windows = 0
-    for song in songs:
+    worker_count = max(1, CONFIG.training.num_workers)
+    worker_windows = [0] * worker_count
+    for position, song_index in enumerate(order):
+        song = songs[int(song_index)]
         regular = len(window_starts(song.estimated_frames, offset, True))
         events = round(regular * CONFIG.training.event_window_ratio)
-        windows += (regular + events) * len(song.levels)
-    return max(1, math.ceil(windows / CONFIG.training.batch_size))
+        worker_windows[position % worker_count] += (regular + events) * len(song.levels)
+    return max(1, sum(
+        math.ceil(windows / CONFIG.training.batch_size) for windows in worker_windows if windows
+    ))
 
 
 def build_scheduler(optimizer, total_steps: int):
@@ -86,12 +91,14 @@ def build_scheduler(optimizer, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
-def run_epoch(model, batches, optimizer, scheduler, scaler, description: str) -> tuple[tuple[float, ...], int]:
+def run_epoch(
+    model, batches, optimizer, scheduler, scaler, description: str, total: int | None = None,
+) -> tuple[tuple[float, ...], int]:
     training = optimizer is not None
     model.train(training)
     totals = np.zeros(6, dtype=np.float64)
     count = 0
-    for batch in tqdm(batches, desc=description, leave=False):
+    for batch in tqdm(batches, desc=description, total=total, leave=False):
         for key in ("features", "events", "mask", "difficulty"):
             batch[key] = batch[key].to(DEVICE, non_blocking=True)
         with torch.set_grad_enabled(training), torch.autocast(
@@ -322,24 +329,42 @@ def _checkpoint(
     }
 
 
-def _validate_training_checkpoint(state: dict, split_summary: dict) -> None:
-    if (
+def _validate_training_checkpoint(state: dict, split_summary: dict) -> bool:
+    saved_config = state.get("config", {})
+    expected_config = checkpoint_config()
+    incompatible = (
         state.get("checkpoint_version") != 3
         or state.get("model_kind") != MODEL_KIND
         or state.get("label_protocol") != "tap-0-1-2-hold-trace-start-duration-v3"
         or state.get("dims") != model_dimensions()
-        or state.get("config") != checkpoint_config()
-        or state.get("training_config") != vars(CONFIG.training)
-        or state.get("augmentation_config") != vars(CONFIG.augmentation)
-        or state.get("split_summary") != split_summary
-    ):
-        raise ValueError("训练检查点的架构、配置、标签协议或数据划分不一致")
+        or any(saved_config.get(key) != value for key, value in expected_config.items())
+    )
+    if incompatible:
+        raise ValueError("训练检查点的模型架构、音频特征、窗口或标签协议不兼容")
+    changed = []
+    if state.get("training_config") != vars(CONFIG.training):
+        changed.append("训练配置")
+    if state.get("augmentation_config") != vars(CONFIG.augmentation):
+        changed.append("数据增强")
+    if state.get("split_summary") != split_summary:
+        changed.append("数据划分")
+    if changed:
+        print(f"警告: 检查点的{'、'.join(changed)}与当前配置不同，继续完整恢复", flush=True)
+    schedule_keys = {
+        "num_epochs", "learning_rate", "min_learning_rate", "warmup_ratio",
+        "batch_size", "num_workers", "prefetch_factor",
+    }
+    saved_training = state.get("training_config", {})
+    return all(saved_training.get(key) == getattr(CONFIG.training, key) for key in schedule_keys)
 
 
-def _restore_training(state, model, optimizer, scheduler, scaler):
+def _restore_training(state, model, optimizer, scaler):
     model.load_state_dict(state["model_state_dict"])
     optimizer.load_state_dict(state["optimizer_state_dict"])
-    scheduler.load_state_dict(state["scheduler_state_dict"])
+    for group in optimizer.param_groups:
+        group["lr"] = CONFIG.training.learning_rate
+        group["initial_lr"] = CONFIG.training.learning_rate
+        group["weight_decay"] = CONFIG.training.weight_decay
     scaler.load_state_dict(state["scaler_state_dict"])
     torch.set_rng_state(state["torch_rng_state"])
     np.random.set_state(state["numpy_rng_state"])
@@ -424,6 +449,30 @@ def _self_check() -> None:
         optimizer.step()
         scheduler.step()
     assert first < 1 and scheduler.get_last_lr()[0] <= CONFIG.training.min_learning_rate / CONFIG.training.learning_rate + 1e-6
+    compatible_state = {
+        "checkpoint_version": 3,
+        "model_kind": MODEL_KIND,
+        "label_protocol": "tap-0-1-2-hold-trace-start-duration-v3",
+        "dims": model_dimensions(),
+        "config": checkpoint_config(),
+        "training_config": vars(CONFIG.training),
+        "augmentation_config": vars(CONFIG.augmentation),
+        "split_summary": {"test": True},
+    }
+    assert _validate_training_checkpoint(compatible_state, {"test": True})
+    changed_state = {**compatible_state, "training_config": {
+        **compatible_state["training_config"], "early_stop_patience": 1,
+    }}
+    assert _validate_training_checkpoint(changed_state, {"test": True})
+    incompatible_state = {**compatible_state, "config": {
+        **compatible_state["config"], "window_frames": CONFIG.training.window_frames + 1,
+    }}
+    try:
+        _validate_training_checkpoint(incompatible_state, {"test": True})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("结构不兼容的检查点必须拒绝恢复")
     print("[train] 自检通过")
 
 
@@ -432,22 +481,11 @@ def main() -> None:
     np.random.seed(CONFIG.training.seed)
     index = build_dataset_index()
     splits = split_songs(index)
-    available_train_songs = len(splits["train"])
-    if CONFIG.training.song_limit > available_train_songs:
-        raise ValueError("训练歌曲数超过训练集可用歌曲数")
-    if CONFIG.training.song_limit:
-        splits["train"] = splits["train"][:CONFIG.training.song_limit]
     if any(not splits[name] for name in splits):
         raise ValueError("训练、验证和测试集合都必须至少包含一首歌曲")
-    if len(splits["validation"]) < CONFIG.training.val_gen_charts:
-        raise ValueError("验证集歌曲数少于整曲验证歌曲数")
     summary = _split_summary(index, splits)
     CONFIG.paths.train_output_dir.mkdir(parents=True, exist_ok=True)
     CONFIG.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    validation_songs = splits["validation"][:CONFIG.training.val_gen_charts]
-    summary["validation_selection"] = [
-        str(song.chart_path.relative_to(CONFIG.paths.charts_dir)) for song in validation_songs
-    ]
     _write_json(CONFIG.paths.train_output_dir / "split-summary.json", summary)
     train_batches = [
         estimate_batches(splits["train"], epoch)
@@ -459,19 +497,33 @@ def main() -> None:
         model.parameters(), lr=CONFIG.training.learning_rate,
         weight_decay=CONFIG.training.weight_decay, fused=DEVICE.type == "cuda",
     )
-    scheduler = build_scheduler(optimizer, total_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
     newest_path = CONFIG.paths.checkpoint_dir / "newest-v3.pt"
     best_path = CONFIG.paths.checkpoint_dir / "best-v3.pt"
     metrics_path = CONFIG.paths.train_output_dir / "metrics.jsonl"
     start_epoch, global_step, best_f1, stale_epochs = 1, 0, -1.0, 0
-    if newest_path.is_file():
-        state = torch.load(newest_path, map_location=DEVICE, weights_only=False)
-        _validate_training_checkpoint(state, summary)
+    scheduler_state = None
+    resume_path = CONFIG.training.resume_checkpoint
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"恢复检查点不存在: {resume_path}")
+        state = torch.load(resume_path, map_location=DEVICE, weights_only=False)
+        schedule_compatible = _validate_training_checkpoint(state, summary)
         start_epoch, global_step, best_f1, stale_epochs = _restore_training(
-            state, model, optimizer, scheduler, scaler,
+            state, model, optimizer, scaler,
         )
-        print(f"从 {newest_path} 恢复，下一轮 epoch={start_epoch} step={global_step}", flush=True)
+        scheduler_state = state["scheduler_state_dict"] if schedule_compatible else None
+        print(f"从 {resume_path} 恢复，下一轮 epoch={start_epoch} step={global_step}", flush=True)
+    if scheduler_state is None:
+        for group in optimizer.param_groups:
+            group["lr"] = CONFIG.training.learning_rate
+            group["initial_lr"] = CONFIG.training.learning_rate
+        scheduler = build_scheduler(optimizer, total_steps)
+        if global_step:
+            scheduler.step(global_step)
+    else:
+        scheduler = build_scheduler(optimizer, total_steps)
+        scheduler.load_state_dict(scheduler_state)
     print(
         f"设备={DEVICE} 参数={sum(p.numel() for p in model.parameters()):,} "
         f"歌曲={len(index.songs)} 划分={{训练:{len(splits['train'])},验证:{len(splits['validation'])},测试:{len(splits['test'])}}} "
@@ -483,10 +535,11 @@ def main() -> None:
         if DEVICE.type == "cuda":
             torch.cuda.reset_peak_memory_stats()
         train_losses, updates = run_epoch(
-            model, iter_window_batches(splits["train"], epoch, True), optimizer, scheduler, scaler, "训练",
+            model, iter_window_batches(splits["train"], epoch, True), optimizer, scheduler, scaler,
+            "训练", train_batches[epoch - 1],
         )
         global_step += updates
-        validation_losses, generation = validate_songs(model, validation_songs, scaler)
+        validation_losses, generation = validate_songs(model, splits["validation"], scaler)
         seconds = time.perf_counter() - started
         main_f1 = generation["tolerances"]["6"]["total"]["macro_f1"]
         improved = main_f1 > best_f1

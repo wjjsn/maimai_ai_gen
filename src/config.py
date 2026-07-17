@@ -66,6 +66,9 @@ class TrainingConfig:
     song_limit: int
     batch_size: int
     pin_memory: bool
+    num_workers: int
+    prefetch_factor: int
+    resume_checkpoint: Path | None
     num_epochs: int
     learning_rate: float
     min_learning_rate: float
@@ -76,7 +79,6 @@ class TrainingConfig:
     grad_clip: float
     early_stop_patience: int
     seed: int
-    val_gen_charts: int
     event_window_ratio: float
 
 
@@ -128,12 +130,14 @@ SECTIONS = {
     "训练": (TrainingConfig, {
         "窗口帧数": "window_frames", "窗口步长": "stride", "训练歌曲数": "song_limit",
         "批大小": "batch_size",
-        "锁页内存": "pin_memory", "训练轮数": "num_epochs",
+        "锁页内存": "pin_memory", "数据加载进程数": "num_workers",
+        "每进程预取批次数": "prefetch_factor", "恢复检查点": "resume_checkpoint",
+        "训练轮数": "num_epochs",
         "学习率": "learning_rate", "最低学习率": "min_learning_rate", "权重衰减": "weight_decay",
         "预热比例": "warmup_ratio",
         "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
         "提前停止耐心轮数": "early_stop_patience", "随机种子": "seed",
-        "整曲验证歌曲数": "val_gen_charts", "事件窗口比例": "event_window_ratio",
+        "事件窗口比例": "event_window_ratio",
     }),
     "推理": (InferenceConfig, {
         "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
@@ -173,7 +177,10 @@ def _load_section(raw: dict, name: str):
         expected = hints[field_name]
         if not _matches(value, expected):
             raise TypeError(f"配置 {name}.{yaml_name} 类型错误: {value!r}")
-        if expected is Path:
+        if expected is Path or Path in get_args(expected):
+            if value is None:
+                values[field_name] = None
+                continue
             value = (ROOT_DIR / value).resolve()
         elif expected is float:
             value = float(value)
@@ -216,12 +223,14 @@ def _validate(config: AppConfig) -> None:
     _require(training.window_frames > 0 and training.stride > 0, "训练窗口和步长必须大于 0")
     _require(training.song_limit >= 0, "训练歌曲数不能为负")
     _require(training.batch_size > 0, "批大小必须大于 0")
+    _require(training.num_workers >= 0, "数据加载进程数不能为负")
+    _require(training.prefetch_factor > 0, "每进程预取批次数必须大于 0")
     _require(training.num_epochs > 0 and training.learning_rate > 0 and training.min_learning_rate >= 0, "学习率或训练轮数无效")
     _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
     _require(0 <= training.warmup_ratio < 1, "预热比例必须在 [0, 1) 内")
     _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
     _require(training.grad_clip > 0 and training.early_stop_patience > 0, "训练控制参数无效")
-    _require(training.val_gen_charts > 0 and 0 <= training.event_window_ratio <= 1, "训练采样配置无效")
+    _require(0 <= training.event_window_ratio <= 1, "事件窗口比例必须在 [0, 1] 内")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
     _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")
 
@@ -256,12 +265,6 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
         "audio": vars(config.audio),
         "model": vars(config.model),
         "window_frames": config.training.window_frames,
-        "inference_rules": {
-            "short_min_gap_frames": config.inference.short_min_gap_frames,
-            "long_min_frames": config.inference.long_min_frames,
-            "min_duration_sec": config.inference.min_duration_sec,
-            "max_duration_sec": config.inference.max_duration_sec,
-        },
     }
 
 
@@ -270,8 +273,10 @@ def _self_check() -> None:
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert load_config() == CONFIG
     assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "attention_heads", "dropout"}
-    assert CONFIG.training.stride == 512 and CONFIG.training.song_limit == 0
+    assert CONFIG.training.stride == 512 and CONFIG.training.song_limit == 100
     assert CONFIG.training.batch_size == 48
+    assert CONFIG.training.num_workers == 4 and CONFIG.training.prefetch_factor == 2
+    assert CONFIG.training.resume_checkpoint is None
     assert CONFIG.inference.level_query == 13.0
     print("[config] 自检通过")
 

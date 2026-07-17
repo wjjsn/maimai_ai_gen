@@ -28,7 +28,11 @@ def load_model(path: str | Path, device: torch.device) -> NoteTimingTransformer:
     state = torch.load(path, map_location=device, weights_only=False)
     if state.get("checkpoint_version") != 3 or state.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自不兼容架构")
-    if state.get("config") != checkpoint_config() or state.get("dims") != model_dimensions():
+    saved_config = state.get("config", {})
+    if (
+        state.get("dims") != model_dimensions()
+        or any(saved_config.get(key) != value for key, value in checkpoint_config().items())
+    ):
         raise ValueError("检查点配置与当前配置不一致")
     model = NoteTimingTransformer(model_dimensions()).to(device)
     model.load_state_dict(state["model_state_dict"])

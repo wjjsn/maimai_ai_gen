@@ -7,16 +7,17 @@ import json
 import math
 import os
 from pathlib import Path
-import queue
 import re
+import shutil
 import subprocess
-import threading
 import unicodedata
 from urllib.request import urlopen
 
 import numpy as np
 import torch
 import torchaudio
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
+from tqdm import tqdm
 
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, SlideSegment, SlideShape, TapType
 from config import CONFIG, ROOT_DIR
@@ -143,6 +144,15 @@ def tracks_to_chart(
         raise ValueError("张量必须包含非负整数")
     if (tracks[:, TAP_COUNT] > 2).any() or (tracks[:, HOLD_START_COUNT] > 2).any():
         raise ValueError("Tap 和 Hold Start Count 不能超过 2")
+    hold_count = tracks[:, HOLD_START_COUNT]
+    durations = tracks[:, HOLD_DURATION_1:]
+    invalid_durations = (
+        ((hold_count == 0) & (durations != 0).any(axis=1))
+        | ((hold_count == 1) & ((durations[:, 0] == 0) | (durations[:, 1] != 0)))
+        | ((hold_count == 2) & (durations == 0).any(axis=1))
+    )
+    if invalid_durations.any():
+        raise ValueError("Hold 数量和持续时长槽位不一致")
     rate = CONFIG.audio.frames_per_sec
     grouped: dict[int, list[Note]] = {}
     for frame, values in enumerate(tracks.astype(np.int64, copy=False)):
@@ -174,6 +184,59 @@ def txt2tensor2txt(text: str, level_idx: int = 5) -> tuple[np.ndarray, str]:
     tracks = maidata_to_tracks(text, level_idx)
     tracks[:, TAP_COUNT] = np.minimum(tracks[:, TAP_COUNT], 2)
     return tracks, tracks_to_maidata(tracks, level_idx)
+
+
+def validate_all_songs() -> None:
+    charts_dir = CONFIG.paths.charts_dir
+    level_idx = CONFIG.inference.level_idx
+    output_dir = ROOT_DIR / "tmp" / "txt2tensor2txt"
+    report = ROOT_DIR / "tmp" / "tensor-roundtrip-failures.txt"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    paths = sorted(charts_dir.rglob("maidata.txt"))
+    if not paths:
+        raise ValueError(f"谱面目录中没有 maidata.txt: {charts_dir}")
+
+    passed = 0
+    generated_count = 0
+    skipped: list[str] = []
+    failed: list[str] = []
+    for path in tqdm(paths, desc="全曲往返验证", disable=len(paths) <= 500):
+        relative = path.relative_to(charts_dir)
+        try:
+            source = path.read_text(encoding="utf-8")
+            tracks = maidata_to_tracks(source, level_idx)
+            tracks[:, TAP_COUNT] = np.minimum(tracks[:, TAP_COUNT], 2)
+        except Exception as error:
+            skipped.append(f"{relative.parent}: {error}")
+            continue
+        try:
+            generated = tracks_to_maidata(tracks, level_idx)
+            destination = output_dir / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(generated, encoding="utf-8")
+            generated_count += 1
+            restored = maidata_to_tracks(generated, level_idx, len(tracks))
+            if not np.array_equal(tracks, restored):
+                raise ValueError("txt -> tensor -> txt -> tensor 不一致")
+            passed += 1
+        except Exception as error:
+            failed.append(f"{relative.parent}: {error}")
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text("\n".join(failed), encoding="utf-8")
+    print(
+        f"[dataset] 全曲往返验证完成: 总数={len(paths)} 生成={generated_count} "
+        f"通过={passed} 输入跳过={len(skipped)} 失败={len(failed)} "
+        f"难度={level_idx} 输出={output_dir}"
+    )
+    for error in skipped[:20]:
+        print(f"  [输入跳过] {error}")
+    for error in failed[:20]:
+        print(f"  [失败] {error}")
+    if failed:
+        print(f"[dataset] 完整失败清单: {report}")
+        raise AssertionError(f"有 {len(failed)} 首歌曲未通过张量往返验证")
 
 
 def load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
@@ -213,7 +276,9 @@ def extract_log_mel(path: str | Path) -> np.ndarray:
 def _validate_music_data(data: object) -> list[dict]:
     if not isinstance(data, list) or not data:
         raise ValueError("歌曲数据必须是非空数组")
-    for index, song in enumerate(data):
+    for index, song in enumerate(tqdm(
+        data, desc="校验歌曲元数据", disable=len(data) <= 500, leave=False,
+    )):
         if not isinstance(song, dict) or not all(key in song for key in ("id", "title", "type", "ds")):
             raise ValueError(f"第 {index} 首歌曲缺少必要字段")
         if not isinstance(song["title"], str) or song["type"] not in ("SD", "DX") or not isinstance(song["ds"], list):
@@ -314,7 +379,10 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
     songs: list[SongRecord] = []
     excluded: Counter[str] = Counter()
     maximum_duration = round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)
-    for chart_path in sorted(charts_dir.rglob("maidata.txt")):
+    chart_paths = sorted(charts_dir.rglob("maidata.txt"))
+    for chart_path in tqdm(
+        chart_paths, desc="建立数据索引", disable=len(chart_paths) <= 500,
+    ):
         audio_path = chart_path.parent / "track.mp3"
         if not audio_path.is_file():
             excluded["缺少音频"] += 1
@@ -384,23 +452,67 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
     return DatasetIndex(tuple(songs), index_digest, music_digest, dict(excluded))
 
 
-def split_songs(index: DatasetIndex) -> dict[str, tuple[SongRecord, ...]]:
+def _group_songs(index: DatasetIndex) -> list[tuple[str, list[SongRecord]]]:
     grouped: dict[str, list[SongRecord]] = {}
     for song in index.songs:
         grouped.setdefault(song.music_id, []).append(song)
-    result: dict[str, list[SongRecord]] = {"train": [], "validation": [], "test": []}
-    for music_id, songs in sorted(grouped.items()):
-        value = int.from_bytes(hashlib.sha256(
-            f"{CONFIG.training.seed}:{music_id}".encode(),
-        ).digest()[:8], "big") / 2**64
+    return sorted(grouped.items())
+
+
+def _take_grouped_songs(
+    groups: list[tuple[str, list[SongRecord]]], target: int,
+) -> tuple[list[SongRecord], list[tuple[str, list[SongRecord]]]]:
+    reachable: dict[int, tuple[int, ...]] = {0: ()}
+    for index, (_music_id, songs) in enumerate(groups):
+        for count, selected in tuple(reachable.items()):
+            new_count = count + len(songs)
+            if new_count <= target and new_count not in reachable:
+                reachable[new_count] = selected + (index,)
+        if target in reachable:
+            break
+    if target not in reachable:
+        raise ValueError(f"无法在不拆分同曲版本的前提下选出恰好 {target} 首歌曲")
+    selected_indexes = set(reachable[target])
+    selected = [song for index in sorted(selected_indexes) for song in groups[index][1]]
+    remaining = [group for index, group in enumerate(groups) if index not in selected_indexes]
+    return selected, remaining
+
+
+def split_songs(
+    index: DatasetIndex, train_limit: int = CONFIG.training.song_limit,
+) -> dict[str, tuple[SongRecord, ...]]:
+    grouped_result: dict[str, list[tuple[str, list[SongRecord]]]] = {
+        "train": [], "validation": [], "test": [],
+    }
+    for music_id, songs in _group_songs(index):
+        digest = hashlib.sha256(f"{CONFIG.training.seed}:{music_id}".encode()).digest()
+        value = int.from_bytes(digest[:8], "big") / 2**64
         if value < CONFIG.training.test_ratio:
             name = "test"
         elif value < CONFIG.training.test_ratio + CONFIG.training.val_ratio:
             name = "validation"
         else:
             name = "train"
-        result[name].extend(songs)
-    return {name: tuple(songs) for name, songs in result.items()}
+        grouped_result[name].append((music_id, songs))
+    for groups in grouped_result.values():
+        groups.sort(key=lambda item: hashlib.sha256(
+            f"{CONFIG.training.seed}:sample:{item[0]}".encode(),
+        ).digest())
+    if train_limit:
+        train_ratio = 1 - CONFIG.training.val_ratio - CONFIG.training.test_ratio
+        targets = {
+            "train": train_limit,
+            "validation": round(train_limit * CONFIG.training.val_ratio / train_ratio),
+            "test": round(train_limit * CONFIG.training.test_ratio / train_ratio),
+        }
+        return {
+            name: tuple(_take_grouped_songs(grouped_result[name], target)[0])
+            for name, target in targets.items()
+        }
+    return {
+        name: tuple(song for _music_id, songs in groups for song in songs)
+        for name, groups in grouped_result.items()
+    }
 
 
 def load_song(record: SongRecord) -> tuple[Chart, torch.Tensor]:
@@ -495,10 +607,7 @@ def _shift_window(sample: dict[str, torch.Tensor], shift: int) -> None:
 
 
 def _stack_batch(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    result = {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
-    if CONFIG.training.pin_memory and torch.cuda.is_available():
-        result = {key: value.pin_memory() for key, value in result.items()}
-    return result
+    return {key: torch.stack([item[key] for item in batch]) for key in batch[0]}
 
 
 def window_starts(length: int, offset: int, training: bool) -> list[int]:
@@ -511,10 +620,15 @@ def window_starts(length: int, offset: int, training: bool) -> list[int]:
 
 
 def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training: bool):
-    rng = np.random.default_rng(CONFIG.training.seed + epoch)
-    order = rng.permutation(len(songs)) if training else np.arange(len(songs))
+    worker = get_worker_info()
+    worker_id = worker.id if worker is not None else 0
+    worker_count = worker.num_workers if worker is not None else 1
+    base_rng = np.random.default_rng(CONFIG.training.seed + epoch)
+    order = base_rng.permutation(len(songs)) if training else np.arange(len(songs))
+    order = order[worker_id::worker_count]
     batch: list[dict[str, torch.Tensor]] = []
-    offset = int(rng.integers(0, TRAIN_STRIDE)) if training else 0
+    offset = int(base_rng.integers(0, TRAIN_STRIDE)) if training else 0
+    rng = np.random.default_rng(CONFIG.training.seed + epoch * 1009 + worker_id)
     for song_index in order:
         record = songs[int(song_index)]
         chart, waveform = load_song(record)
@@ -553,33 +667,34 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
         yield _stack_batch(batch)
 
 
+class WindowBatchDataset(IterableDataset):
+    def __init__(self, songs: tuple[SongRecord, ...], epoch: int, training: bool):
+        self.songs = songs
+        self.epoch = epoch
+        self.training = training
+
+    def __iter__(self):
+        return _produce_window_batches(self.songs, self.epoch, self.training)
+
+
+def _init_worker(_worker_id: int) -> None:
+    torch.set_num_threads(max(1, (os.cpu_count() or 1) // CONFIG.training.num_workers))
+
+
 def iter_window_batches(songs: tuple[SongRecord, ...], epoch: int, training: bool):
-    batches: queue.Queue = queue.Queue(maxsize=2)
-    sentinel = object()
-
-    def produce() -> None:
-        try:
-            for batch in _produce_window_batches(songs, epoch, training):
-                batches.put(batch)
-        except BaseException as error:
-            batches.put(error)
-        finally:
-            batches.put(sentinel)
-
-    thread = threading.Thread(target=produce, name="音频批次预取", daemon=True)
-    thread.start()
-    failure: BaseException | None = None
-    while True:
-        item = batches.get()
-        if item is sentinel:
-            break
-        if isinstance(item, BaseException):
-            failure = item
-        elif failure is None:
-            yield item
-    thread.join()
-    if failure is not None:
-        raise failure
+    workers = CONFIG.training.num_workers
+    options = {
+        "batch_size": None,
+        "num_workers": workers,
+        "pin_memory": CONFIG.training.pin_memory and torch.cuda.is_available(),
+    }
+    if workers:
+        options.update({
+            "prefetch_factor": CONFIG.training.prefetch_factor,
+            "persistent_workers": False,
+            "worker_init_fn": _init_worker,
+        })
+    return DataLoader(WindowBatchDataset(songs, epoch, training), **options)
 
 
 def load_song_data(record: SongRecord) -> tuple[np.ndarray, tuple[tuple[LevelRecord, np.ndarray], ...]]:
@@ -630,11 +745,87 @@ def _self_check() -> None:
     assert chart_to_tracks(chart, 5)[410, HOLD_START_COUNT] == 2
     resized = _resize_tracks(tracks, 2.0, len(tracks) // 2)
     assert resized[5, TAP_COUNT] == 2 and resized[65, HOLD_DURATION_1] == 100
+
+    aligned = np.zeros((32, TRACK_COUNT), dtype=np.int32)
+    aligned[4] = (1, 1, 9, 0)
+    aligned[5] = (1, 1, 7, 0)
+    aligned[20] = (2, 2, 11, 13)
+    for speed in (0.98, 1.0, 1.02):
+        length = round(len(aligned) / speed)
+        scaled = _resize_tracks(aligned, speed, length)
+        assert scaled[round(5 / speed), HOLD_DURATION_1] == max(1, round(7 / speed))
+        assert scaled[round(20 / speed)].tolist() == [
+            2, 2, max(1, round(11 / speed)), max(1, round(13 / speed)),
+        ]
+
+    class _SpeedRng:
+        def random(self):
+            return 0.0
+
+        def uniform(self, _minimum, _maximum):
+            return 1.02
+
+    waveform = torch.arange(320, dtype=torch.float32).unsqueeze(0)
+    augmented, speed = _augment_waveform(waveform, _SpeedRng())
+    scaled = _resize_tracks(aligned, speed, round(len(aligned) / speed))
+    assert augmented.shape[-1] == round(waveform.shape[-1] / speed)
+    assert np.flatnonzero(scaled[:, TAP_COUNT]).tolist() == sorted({
+        round(frame / speed) for frame in np.flatnonzero(aligned[:, TAP_COUNT])
+    })
+    collided = _resize_tracks(aligned, 2.0, len(aligned) // 2)
+    assert collided[2].tolist() == [2, 2, 4, 4]
+
+    sample = {
+        "features": torch.arange(8, dtype=torch.float32).unsqueeze(1),
+        "events": torch.arange(8, dtype=torch.int64).unsqueeze(1).repeat(1, TRACK_COUNT),
+        "mask": torch.ones(8, dtype=torch.bool),
+    }
+    original = {key: value.clone() for key, value in sample.items()}
+    _shift_window(sample, 3)
+    for key in sample:
+        assert torch.equal(sample[key][3:], original[key][:-3])
+        assert not sample[key][:3].any()
+    sample = {key: value.clone() for key, value in original.items()}
+    _shift_window(sample, -2)
+    for key in sample:
+        assert torch.equal(sample[key][:-2], original[key][2:])
+        assert not sample[key][-2:].any()
+
+    canonical = np.zeros((41, TRACK_COUNT), dtype=np.int32)
+    canonical[0] = (1, 0, 0, 0)
+    canonical[5] = (2, 0, 0, 0)
+    canonical[12] = (0, 1, 3, 0)
+    canonical[24] = (1, 2, 7, 11)
+    canonical[40] = (2, 1, 1, 0)
+    generated = tracks_to_maidata(canonical, 5, "roundtrip", 14.0)
+    restored = maidata_to_tracks(generated, 5, len(canonical))
+    assert np.array_equal(canonical, restored)
+    source = "&title=source\n&artist=test\n&first=0.005\n&lv_5=14\n&inote_5=(12000){4}1/8,2h[4:1],E"
+    source_tracks, source_generated = txt2tensor2txt(source, 5)
+    assert np.array_equal(
+        source_tracks, maidata_to_tracks(source_generated, 5, len(source_tracks)),
+    )
+    invalid = canonical.copy()
+    invalid[1, HOLD_DURATION_1] = 2
+    try:
+        tracks_to_chart(invalid)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("非规范 Hold 时长槽位必须被拒绝")
     first = SongRecord(Path("a"), Path("b"), "A", "same", (LevelRecord(5, 13.0),))
     second = SongRecord(Path("c"), Path("d"), "A", "same", (LevelRecord(5, 13.0),))
-    split = split_songs(DatasetIndex((first, second), "x", "y", {}))
+    split = split_songs(DatasetIndex((first, second), "x", "y", {}), 0)
     assert sum(len(value) for value in split.values()) == 2
     assert any(len(value) == 2 for value in split.values())
+    records = tuple(
+        SongRecord(Path(str(index)), Path("b"), str(index), str(index), (LevelRecord(5, 13.0),))
+        for index in range(40)
+    )
+    limited = split_songs(DatasetIndex(records, "x", "y", {}), 10)
+    assert {name: len(value) for name, value in limited.items()} == {
+        "train": 10, "validation": 2, "test": 1,
+    }
     assert _fallback_music_id("test [DX]") == "fallback:dx:test"
     assert _fallback_music_id("test", Path("test [DX]/maidata.txt")) == "fallback:dx:test"
     starts = window_starts(3000, 511, True)
@@ -650,4 +841,4 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
-    _self_check()
+    validate_all_songs()
