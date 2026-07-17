@@ -44,7 +44,7 @@ class NoteTimingTransformer(nn.Module):
             use_cache=False,
         )
         self.encoder = BertModel(config, add_pooling_layer=False)
-        self.tap_head = nn.Linear(dims.hidden_dim, 9)
+        self.tap_head = nn.Linear(dims.hidden_dim, 3)
         self.hold_head = nn.Linear(dims.hidden_dim, 3)
         self.duration_head = nn.Linear(dims.hidden_dim, 2)
 
@@ -75,7 +75,7 @@ def _self_check() -> None:
     features = torch.randn(2, 32, 8)
     mask = torch.ones(2, 32, dtype=torch.bool)
     output = model(features, torch.tensor([12.3, 14.7]), mask)
-    assert tuple(value.shape for value in output) == ((2, 32, 9), (2, 32, 3), (2, 32, 2))
+    assert tuple(value.shape for value in output) == ((2, 32, 3), (2, 32, 3), (2, 32, 2))
     sum(value.mean() for value in output).backward()
     assert model.audio_projection.weight.grad is not None
     assert model.encoder.encoder.layer[0].attention.self.query.weight.grad is not None

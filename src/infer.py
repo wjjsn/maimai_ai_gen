@@ -14,20 +14,19 @@ from dataset import (
 from model import ModelDimensions, NoteTimingTransformer
 
 
-MODEL_KIND = "log-mel-difficulty-bert-window-event-v1"
-INFER_STRIDE = WINDOW_FRAMES // 2
+MODEL_KIND = "log-mel-difficulty-bert-window-event-v3"
 
 
 def model_dimensions() -> ModelDimensions:
     return ModelDimensions(
         CONFIG.audio.n_mels, CONFIG.model.hidden_dim, CONFIG.model.layers,
-        CONFIG.model.dropout, WINDOW_FRAMES,
+        CONFIG.model.dropout, WINDOW_FRAMES, CONFIG.model.attention_heads,
     )
 
 
 def load_model(path: str | Path, device: torch.device) -> NoteTimingTransformer:
     state = torch.load(path, map_location=device, weights_only=False)
-    if state.get("checkpoint_version") != 1 or state.get("model_kind") != MODEL_KIND:
+    if state.get("checkpoint_version") != 3 or state.get("model_kind") != MODEL_KIND:
         raise ValueError("检查点来自不兼容架构")
     if state.get("config") != checkpoint_config() or state.get("dims") != model_dimensions():
         raise ValueError("检查点配置与当前配置不一致")
@@ -38,7 +37,8 @@ def load_model(path: str | Path, device: torch.device) -> NoteTimingTransformer:
     return model
 
 
-def _starts(length: int, window: int = WINDOW_FRAMES, stride: int = INFER_STRIDE) -> list[int]:
+def _starts(length: int, window: int = WINDOW_FRAMES, stride: int | None = None) -> list[int]:
+    stride = stride or window // 2
     if length <= window:
         return [0]
     starts = list(range(0, length - window + 1, stride))
@@ -53,7 +53,7 @@ def predict_tracks(
     device: torch.device,
 ) -> np.ndarray:
     length = len(features)
-    tap_sum = np.zeros((length, 9), dtype=np.float32)
+    tap_sum = np.zeros((length, 3), dtype=np.float32)
     hold_sum = np.zeros((length, 3), dtype=np.float32)
     duration_sum = np.zeros((length, 2), dtype=np.float32)
     weight_sum = np.zeros(length, dtype=np.float32)

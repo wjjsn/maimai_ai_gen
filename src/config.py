@@ -16,7 +16,6 @@ class PathsConfig:
     charts_dir: Path
     checkpoint_dir: Path
     train_output_dir: Path
-    overfit_output_dir: Path
     inference_output_dir: Path
 
 
@@ -56,30 +55,29 @@ class AugmentationConfig:
 class ModelConfig:
     hidden_dim: int
     layers: int
-    kernel_size: int
+    attention_heads: int
     dropout: float
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    level_idx: int
+    window_frames: int
+    stride: int
+    song_limit: int
     batch_size: int
-    num_workers: int
-    prefetch_factor: int
     pin_memory: bool
     num_epochs: int
     learning_rate: float
     min_learning_rate: float
+    warmup_ratio: float
     weight_decay: float
     val_ratio: float
     test_ratio: float
     grad_clip: float
     early_stop_patience: int
-    lr_t_max: int
     seed: int
     val_gen_charts: int
-    generation_interval: int
-    overfit_charts: int
+    event_window_ratio: float
 
 
 @dataclass(frozen=True)
@@ -90,7 +88,6 @@ class InferenceConfig:
     level_query: float
     short_min_gap_frames: int
     long_min_frames: int
-    long_threshold: float
     min_duration_sec: float
     max_duration_sec: float
 
@@ -108,8 +105,7 @@ class AppConfig:
 SECTIONS = {
     "路径": (PathsConfig, {
         "谱面目录": "charts_dir", "检查点目录": "checkpoint_dir",
-        "训练输出目录": "train_output_dir", "过拟合输出目录": "overfit_output_dir",
-        "推理输出目录": "inference_output_dir",
+        "训练输出目录": "train_output_dir", "推理输出目录": "inference_output_dir",
     }),
     "音频": (AudioConfig, {
         "采样率": "sample_rate", "跳步长度": "hop_length", "FFT长度": "n_fft",
@@ -126,23 +122,24 @@ SECTIONS = {
         "最大噪声标准差": "max_noise_std",
     }),
     "模型": (ModelConfig, {
-        "隐藏维度": "hidden_dim", "层数": "layers", "卷积核": "kernel_size", "丢弃率": "dropout",
+        "隐藏维度": "hidden_dim", "层数": "layers",
+        "注意力头数": "attention_heads", "丢弃率": "dropout",
     }),
     "训练": (TrainingConfig, {
-        "难度编号": "level_idx", "批大小": "batch_size", "数据加载进程数": "num_workers",
-        "预取批数": "prefetch_factor", "锁页内存": "pin_memory", "训练轮数": "num_epochs",
+        "窗口帧数": "window_frames", "窗口步长": "stride", "训练歌曲数": "song_limit",
+        "批大小": "batch_size",
+        "锁页内存": "pin_memory", "训练轮数": "num_epochs",
         "学习率": "learning_rate", "最低学习率": "min_learning_rate", "权重衰减": "weight_decay",
+        "预热比例": "warmup_ratio",
         "验证集比例": "val_ratio", "测试集比例": "test_ratio", "梯度裁剪": "grad_clip",
-        "提前停止耐心轮数": "early_stop_patience", "学习率退火周期": "lr_t_max",
-        "随机种子": "seed", "整曲验证歌曲数": "val_gen_charts", "整曲验证间隔": "generation_interval",
-        "过拟合歌曲数": "overfit_charts",
+        "提前停止耐心轮数": "early_stop_patience", "随机种子": "seed",
+        "整曲验证歌曲数": "val_gen_charts", "事件窗口比例": "event_window_ratio",
     }),
     "推理": (InferenceConfig, {
         "输入音频": "audio_path", "检查点": "checkpoint", "难度编号": "level_idx",
         "浮点难度": "level_query",
         "短音最小间隔帧": "short_min_gap_frames", "持续音最短帧数": "long_min_frames",
-        "持续音阈值": "long_threshold", "最短持续秒数": "min_duration_sec",
-        "最长持续秒数": "max_duration_sec",
+        "最短持续秒数": "min_duration_sec", "最长持续秒数": "max_duration_sec",
     }),
 }
 
@@ -211,19 +208,21 @@ def _validate(config: AppConfig) -> None:
     _require(augmentation.max_shift_sec >= 0, "最大平移秒数不能为负")
     _require(0 <= augmentation.max_frequency_mask_bins <= audio.n_mels, "频率遮蔽范围无效")
     _require(augmentation.max_eq_gain >= 0 and augmentation.max_noise_std >= 0, "EQ 或噪声强度不能为负")
-    _require(model.hidden_dim > 0 and model.layers > 0, "模型维度和层数必须大于 0")
-    _require(model.kernel_size > 0 and model.kernel_size % 2 == 1, "模型卷积核必须是正奇数")
+    _require(model.hidden_dim > 0 and model.layers > 0 and model.attention_heads > 0, "模型维度、层数和注意力头数必须大于 0")
+    _require(model.hidden_dim % model.attention_heads == 0, "隐藏维度必须能被注意力头数整除")
     _require(0 <= model.dropout < 1, "模型丢弃率必须在 [0, 1) 内")
-    _require(0 <= training.level_idx <= 6 and 0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
+    _require(0 <= inference.level_idx <= 6, "难度编号必须在 0 到 6 之间")
     _require(0 < inference.level_query <= 15, "推理浮点难度必须在 (0, 15] 内")
-    _require(training.batch_size > 0 and training.num_workers >= 0 and training.prefetch_factor > 0, "DataLoader 配置无效")
+    _require(training.window_frames > 0 and training.stride > 0, "训练窗口和步长必须大于 0")
+    _require(training.song_limit >= 0, "训练歌曲数不能为负")
+    _require(training.batch_size > 0, "批大小必须大于 0")
     _require(training.num_epochs > 0 and training.learning_rate > 0 and training.min_learning_rate >= 0, "学习率或训练轮数无效")
     _require(training.min_learning_rate <= training.learning_rate, "最低学习率不能高于学习率")
+    _require(0 <= training.warmup_ratio < 1, "预热比例必须在 [0, 1) 内")
     _require(0 < training.val_ratio < 1 and 0 < training.test_ratio < 1 and training.val_ratio + training.test_ratio < 1, "数据集比例无效")
-    _require(training.grad_clip > 0 and training.early_stop_patience > 0 and training.lr_t_max > 0, "训练控制参数无效")
-    _require(training.val_gen_charts >= 0 and training.generation_interval > 0 and training.overfit_charts >= 0, "训练计数配置无效")
+    _require(training.grad_clip > 0 and training.early_stop_patience > 0, "训练控制参数无效")
+    _require(training.val_gen_charts > 0 and 0 <= training.event_window_ratio <= 1, "训练采样配置无效")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
-    _require(0 <= inference.long_threshold <= 1, "持续音阈值必须在 [0, 1] 内")
     _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")
 
 
@@ -256,7 +255,13 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
     return {
         "audio": vars(config.audio),
         "model": vars(config.model),
-        "max_duration_sec": config.inference.max_duration_sec,
+        "window_frames": config.training.window_frames,
+        "inference_rules": {
+            "short_min_gap_frames": config.inference.short_min_gap_frames,
+            "long_min_frames": config.inference.long_min_frames,
+            "min_duration_sec": config.inference.min_duration_sec,
+            "max_duration_sec": config.inference.max_duration_sec,
+        },
     }
 
 
@@ -264,7 +269,9 @@ def _self_check() -> None:
     assert CONFIG.audio.frames_per_sec == 200
     assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert load_config() == CONFIG
-    assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "kernel_size", "dropout"}
+    assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "attention_heads", "dropout"}
+    assert CONFIG.training.stride == 512 and CONFIG.training.song_limit == 0
+    assert CONFIG.training.batch_size == 48
     assert CONFIG.inference.level_query == 13.0
     print("[config] 自检通过")
 

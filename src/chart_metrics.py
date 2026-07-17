@@ -176,7 +176,7 @@ def _print_new_start_metrics(songs: list[SongMetrics]) -> None:
             print(f"{label}: 时间点数=0")
 
 
-def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.training.level_idx) -> None:
+def report(charts_dir: Path = CONFIG.paths.charts_dir, level_idx: int = CONFIG.inference.level_idx) -> None:
     songs: list[SongMetrics] = []
     missing_level = parse_errors = 0
     for path in sorted(charts_dir.rglob("maidata.txt")):
