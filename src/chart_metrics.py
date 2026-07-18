@@ -7,7 +7,7 @@ from statistics import mean, median
 
 import numpy as np
 
-from chart import Frame, Note, NoteType
+from chart import Frame, Note, NoteType, SlideSegment
 from config import CONFIG
 from maidata_parser import parse_maidata
 
@@ -40,17 +40,29 @@ def _index(time_sec: float) -> int:
     return round(time_sec * RATE)
 
 
-def _slide_intervals(note: Note, time_sec: float) -> list[tuple[int, int]]:
-    """按多轨分支拆分 Slide；等待及轨迹阶段都属于活跃 Slide。"""
-    branches: list[list] = []
+def _slide_branches(note: Note) -> list[list[SlideSegment]]:
+    branches: list[list[SlideSegment]] = []
     for segment in note.data:
-        if not branches or segment.start_lane != branches[-1][-1].end_lane:
+        if not branches or segment.starts_new_branch:
             branches.append([])
         branches[-1].append(segment)
+    return branches
+
+
+def _slide_branch_timing(branch: list[SlideSegment]) -> tuple[float, float]:
+    timed_segment = next(
+        (segment for segment in branch if segment.trace_duration > 0), branch[0],
+    )
+    return timed_segment.wait_duration, sum(segment.trace_duration for segment in branch)
+
+
+def _slide_intervals(note: Note, time_sec: float) -> list[tuple[int, int]]:
+    """按多轨分支拆分 Slide；等待及轨迹阶段都属于活跃 Slide。"""
     intervals = []
-    for branch in branches:
+    for branch in _slide_branches(note):
+        wait_duration, trace_duration = _slide_branch_timing(branch)
         start_sec = time_sec
-        end_sec = time_sec + sum(s.wait_duration + s.trace_duration for s in branch)
+        end_sec = time_sec + wait_duration + trace_duration
         start, end = _index(start_sec), _index(end_sec)
         if end > start:
             intervals.append((start, end))
@@ -58,12 +70,10 @@ def _slide_intervals(note: Note, time_sec: float) -> list[tuple[int, int]]:
 
 
 def _slide_trace_starts(note: Note, time_sec: float) -> list[int]:
-    branches: list[list] = []
-    for segment in note.data:
-        if not branches or segment.start_lane != branches[-1][-1].end_lane:
-            branches.append([])
-        branches[-1].append(segment)
-    return [_index(time_sec + branch[0].wait_duration) for branch in branches]
+    return [
+        _index(time_sec + _slide_branch_timing(branch)[0])
+        for branch in _slide_branches(note)
+    ]
 
 
 def _add_interval(axis: np.ndarray, start: int, end: int, first: int) -> None:
@@ -323,6 +333,29 @@ def _self_check() -> None:
     assert metrics.type_means["hold"] > 0 and metrics.type_medians["total"] >= 1
     assert metrics.close_start_points == {"tap": 1, "hold": 1}
     assert metrics.close_note_counts == {"tap": 1, "hold": 1}
+    parallel = Note(NoteType.SLIDE, [
+        SlideSegment(
+            SlideShape.PP, TapType.LANE4, TapType.LANE4, 0.5, 0.0,
+            starts_new_branch=True,
+        ),
+        SlideSegment(
+            SlideShape.QQ, TapType.LANE4, TapType.LANE4, 0.3, 0.5,
+            starts_new_branch=True,
+        ),
+    ])
+    chained = Note(NoteType.SLIDE, [
+        SlideSegment(
+            SlideShape.Line, TapType.LANE1, TapType.LANE3,
+            starts_new_branch=True,
+        ),
+        SlideSegment(SlideShape.Line, TapType.LANE3, TapType.LANE5, 0.4, 0.6),
+    ])
+    assert _slide_trace_starts(parallel, 1.0) == [_index(1.5), _index(1.3)]
+    assert _slide_intervals(parallel, 1.0) == [
+        (_index(1.0), _index(1.5)), (_index(1.0), _index(1.8)),
+    ]
+    assert _slide_trace_starts(chained, 1.0) == [_index(1.4)]
+    assert _slide_intervals(chained, 1.0) == [(_index(1.0), _index(2.0))]
     print("[chart-metrics] 自检通过")
 
 

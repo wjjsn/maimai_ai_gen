@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from chart import Chart, Frame, HoldData, Level, Note, NoteType, SlideSegment, SlideShape, TapType
-from config import CONFIG, ROOT_DIR
+from config import CONFIG, ROOT_DIR, max_hold_duration_frames
 from maidata_parser import generate_maidata, parse_maidata
 
 
@@ -74,10 +74,17 @@ class DatasetIndex:
 def _slide_branches(note: Note) -> list[list[SlideSegment]]:
     branches: list[list[SlideSegment]] = []
     for segment in note.data:
-        if not branches or segment.start_lane != branches[-1][-1].end_lane:
+        if not branches or segment.starts_new_branch:
             branches.append([])
         branches[-1].append(segment)
     return branches
+
+
+def _slide_branch_timing(branch: list[SlideSegment]) -> tuple[float, float]:
+    timed_segment = next(
+        (segment for segment in branch if segment.trace_duration > 0), branch[0],
+    )
+    return timed_segment.wait_duration, sum(segment.trace_duration for segment in branch)
 
 
 def chart_to_tracks(chart: Chart, level_idx: int, length: int | None = None) -> np.ndarray:
@@ -104,12 +111,9 @@ def chart_to_tracks(chart: Chart, level_idx: int, length: int | None = None) -> 
                     required_length = max(required_length, end)
             elif note.type is NoteType.SLIDE:
                 for branch in _slide_branches(note):
-                    if not all(segment.is_default_wait for segment in branch):
-                        raise ValueError(f"{start / rate:.3f}s SLIDE 使用非默认等待")
-                    trace_start = start + round(branch[0].wait_duration * rate)
-                    duration = max(1, round(sum(
-                        segment.trace_duration for segment in branch
-                    ) * rate))
+                    wait_duration, trace_duration = _slide_branch_timing(branch)
+                    trace_start = start + round(wait_duration * rate)
+                    duration = max(1, round(trace_duration * rate))
                     end = trace_start + duration
                     if end > 0:
                         clipped_start = max(trace_start, 0)
@@ -438,9 +442,7 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
                 levels.append(LevelRecord(level_idx, float(difficulty)))
             except Exception as error:
                 message = str(error)
-                if "SLIDE 使用非默认等待" in message:
-                    reason = "难度跳过: SLIDE 使用非默认等待"
-                elif "持续音超过配置上限" in message:
+                if "持续音超过配置上限" in message:
                     reason = "难度跳过: 持续音超过配置上限"
                 else:
                     reason = f"难度跳过: {type(error).__name__}"
@@ -641,7 +643,9 @@ def _augment_features(features: np.ndarray, rng: np.random.Generator) -> np.ndar
     return result
 
 
-def _window(features: np.ndarray, events: np.ndarray, start: int) -> dict[str, torch.Tensor]:
+def _window(
+    features: np.ndarray, events: np.ndarray, start: int, duration_anchor: bool = False,
+) -> dict[str, torch.Tensor]:
     end = min(start + WINDOW_FRAMES, len(features))
     length = end - start
     feature_window = np.zeros((WINDOW_FRAMES, features.shape[1]), dtype=np.float32)
@@ -654,6 +658,7 @@ def _window(features: np.ndarray, events: np.ndarray, start: int) -> dict[str, t
         "features": torch.from_numpy(feature_window),
         "events": torch.from_numpy(event_window),
         "mask": torch.from_numpy(mask),
+        "duration_anchor": torch.tensor(duration_anchor, dtype=torch.bool),
     }
 
 
@@ -689,6 +694,26 @@ def _event_window_start(tracks: np.ndarray, frame: int, length: int) -> int:
     return max(0, min(last, frame - WINDOW_FRAMES // 2))
 
 
+def _duration_anchor_frames(tracks: np.ndarray, length: int) -> list[int]:
+    maximum = max_hold_duration_frames()
+    result = []
+    for frame in np.flatnonzero(tracks[:, HOLD_START_COUNT]):
+        count = int(tracks[frame, HOLD_START_COUNT])
+        durations = tracks[frame, HOLD_DURATION_1:HOLD_DURATION_1 + count]
+        if any(0 < int(duration) <= maximum and frame + int(duration) <= length for duration in durations):
+            result.append(int(frame))
+    return result
+
+
+def _training_window_starts(
+    tracks: np.ndarray, length: int, offset: int, event_centers=(),
+) -> tuple[list[int], set[int]]:
+    duration_anchors = set(_duration_anchor_frames(tracks, length))
+    starts = set(window_starts(length, offset, True)) | duration_anchors
+    starts.update(_event_window_start(tracks, int(frame), length) for frame in event_centers)
+    return list(starts), duration_anchors
+
+
 def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training: bool):
     worker = get_worker_info()
     worker_id = worker.id if worker is not None else 0
@@ -713,27 +738,28 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
             tracks = chart_to_tracks(chart, level.level_idx)
             tracks = _resize_tracks(tracks, speed, len(features)) if speed != 1.0 else _fit_tracks(tracks, len(features))
             starts = window_starts(len(features), offset, training)
-            hold_anchors: set[int] = set()
+            duration_anchors: set[int] = set()
             if training and CONFIG.training.event_window_ratio and starts:
                 count = round(len(starts) * CONFIG.training.event_window_ratio)
                 event_frames = np.flatnonzero(tracks[:, TAP_COUNT] | tracks[:, HOLD_START_COUNT])
                 if event_frames.size and count:
                     centers = rng.choice(event_frames, count, replace=event_frames.size < count)
-                    hold_anchors = {
-                        int(frame) for frame in centers
-                        if tracks[int(frame), HOLD_START_COUNT]
-                    }
-                    starts.extend(
-                        _event_window_start(tracks, int(frame), len(features))
-                        for frame in centers
-                    )
-                    starts = list(set(starts))
+                else:
+                    centers = ()
+                starts, duration_anchors = _training_window_starts(
+                    tracks, len(features), offset, centers,
+                )
+            elif training:
+                starts, duration_anchors = _training_window_starts(
+                    tracks, len(features), offset,
+                )
             if training:
                 rng.shuffle(starts)
             for start in starts:
-                sample = _window(features, tracks, start)
+                is_duration_anchor = start in duration_anchors
+                sample = _window(features, tracks, start, is_duration_anchor)
                 if (
-                    training and start not in hold_anchors
+                    training and not is_duration_anchor
                     and rng.random() < CONFIG.augmentation.shift_probability
                 ):
                     maximum = round(CONFIG.augmentation.max_shift_sec * CONFIG.audio.frames_per_sec)
@@ -811,8 +837,9 @@ def iter_loaded_window_batches(loaded_songs):
     for _record, features, levels in loaded_songs:
         starts = window_starts(len(features), 0, False)
         for level, tracks in levels:
-            for start in starts:
-                sample = _window(features, tracks, start)
+            duration_anchors = set(_duration_anchor_frames(tracks, len(features)))
+            for start in set(starts) | duration_anchors:
+                sample = _window(features, tracks, start, start in duration_anchors)
                 sample["difficulty"] = torch.tensor(level.difficulty, dtype=torch.float32)
                 batch.append(sample)
                 if len(batch) == CONFIG.training.batch_size:
@@ -836,6 +863,34 @@ def _self_check() -> None:
     assert tracks[10].tolist() == [3, 0, 0, 0]
     assert tracks[20].tolist() == [0, 1, 8, 0]
     assert tracks[130, HOLD_DURATION_1] == 200
+    custom_cases = (
+        ("1-3[0.3##0.4]", [(60, 1, 80, 0)]),
+        ("1-3-5[0.3##0.4]", [(60, 1, 80, 0)]),
+        ("1-3-5[0.3##0.4]*-7[0.3##0.6]", [(60, 2, 80, 120)]),
+    )
+    for slide_text, expected in custom_cases:
+        parsed = parse_maidata(
+            f"&title=custom-wait\n&lv_5=14\n&inote_5=(120){{4}}{slide_text},E",
+        )
+        custom_tracks = chart_to_tracks(parsed, 5)
+        assert [
+            (int(frame), *custom_tracks[frame, HOLD_START_COUNT:].tolist())
+            for frame in np.flatnonzero(custom_tracks[:, HOLD_START_COUNT])
+        ] == expected
+    branch_cases = (
+        ("4pp4[4:1]*qq4[4:1]", 2, 1.0),
+        ("1-3[8:1]-1[8:1]*-5[8:1]", 2, 0.75),
+    )
+    for slide_text, branch_count, total_trace in branch_cases:
+        parsed = parse_maidata(
+            f"&title=branches\n&lv_5=14\n&inote_5=(120){{4}}{slide_text},E",
+        )
+        note = parsed.all_levels[5].frames[0].notes[0]
+        branches = _slide_branches(note)
+        assert len(branches) == branch_count
+        assert abs(sum(_slide_branch_timing(branch)[1] for branch in branches) - total_trace) < 1e-9
+        restored_note = parse_maidata(generate_maidata(parsed)).all_levels[5].frames[0].notes[0]
+        assert len(_slide_branches(restored_note)) == branch_count
     chart.all_levels[5].frames.append(Frame((
         Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.2)),
         Note(NoteType.HOLD, HoldData(TapType.LANE2, 0.8)),
@@ -964,6 +1019,34 @@ def _self_check() -> None:
     assert _event_window_start(event_tracks, 700, len(event_tracks)) == 188
     assert _event_window_start(event_tracks, 1200, len(event_tracks)) == 1200
     assert _event_window_start(event_tracks, 2500, len(event_tracks)) == 2500
+    assert _duration_anchor_frames(event_tracks, len(event_tracks)) == [1200, 2500]
+    merged_starts, merged_anchors = _training_window_starts(
+        event_tracks, len(event_tracks), 0, (700, 1200, 1200),
+    )
+    expected_starts = set(window_starts(len(event_tracks), 0, True))
+    expected_starts.update((188, 1200, 2500))
+    estimated_count = len(expected_starts)
+    assert set(merged_starts) == expected_starts
+    assert merged_anchors == {1200, 2500}
+    assert len(merged_starts) == estimated_count
+    overlap_tracks = np.zeros((3000, TRACK_COUNT), dtype=np.int32)
+    overlap_tracks[1024] = (0, 1, 400, 0)
+    overlap_tracks[1536, TAP_COUNT] = 1
+    actual_starts, overlap_anchors = _training_window_starts(
+        overlap_tracks, len(overlap_tracks), 0, (1024, 1024, 1536),
+    )
+    regular_starts = set(window_starts(len(overlap_tracks), 0, True))
+    estimated_starts = regular_starts | {1024} | {
+        _event_window_start(overlap_tracks, frame, len(overlap_tracks))
+        for frame in (1024, 1024, 1536)
+    }
+    assert 1024 in regular_starts and overlap_anchors == {1024}
+    assert set(actual_starts) == estimated_starts
+    assert len(actual_starts) == len(estimated_starts) == len(regular_starts)
+    anchor_sample = _window(
+        np.zeros((3000, 1), dtype=np.float32), event_tracks, 1200, True,
+    )
+    assert anchor_sample["duration_anchor"] and anchor_sample["events"][0, HOLD_DURATION_1] == 500
     negative = Chart(first_sec=-0.1)
     negative.all_levels[5] = Level("test", 1.0, [
         Frame((Note(NoteType.TAP, TapType.LANE1),), 0.0),

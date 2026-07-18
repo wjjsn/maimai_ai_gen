@@ -339,6 +339,7 @@ class _Parser:
         cur_start = start_lane
         previous_shape: SlideShape | None = None
         previous_cw: bool | None = None
+        starts_new_branch = True
 
         while i < n:
             while i < n and t[i] in ("@", "$", "x", "b", "?", "!"):
@@ -371,6 +372,7 @@ class _Parser:
                 # (multiple slides share the same start point)
                 # actually after *, next segment starts from the *original* start
                 cur_start = start_lane
+                starts_new_branch = True
 
                 while i < n and t[i] in ("@", "$", "x", "b", "?", "!"):
                     if t[i] == "$":
@@ -474,8 +476,10 @@ class _Parser:
                 isFakeRotate=is_fake_rotate,
                 isSlideBreak=is_slide_break,
                 isSlideNoHead=is_no_star or is_no_head,
+                starts_new_branch=starts_new_branch,
             )
             segments.append(seg)
+            starts_new_branch = False
             cur_start = end_lane  # chaining: next starts where this ended
             previous_shape = shape
             previous_cw = is_cw
@@ -546,7 +550,9 @@ class _Parser:
             trace_bpm = float(bp_s)
             return wait_sec, _length_to_seconds(rest, trace_bpm)
 
-        return wait_sec, _length_to_seconds(trace_rest, bpm)
+        if ":" in trace_rest:
+            return wait_sec, _length_to_seconds(trace_rest, bpm)
+        return wait_sec, float(trace_rest)
 
     # ── BPM / length divider tracking ─────────────────────────────────────
 
@@ -843,6 +849,8 @@ class _Parser:
                 if seg.isFakeRotate:
                     mod += "$$"
                 parts.append(start_num + mod)
+            elif seg.starts_new_branch:
+                parts.append("*")
             elif seg.start_lane == prev_end:
                 pass  # chaining: shape follows directly
             elif seg.start_lane == first_start:
@@ -865,27 +873,15 @@ class _Parser:
                 default_wait = 240.0 / bpm  # 1 beat at generation BPM
                 if wait_sec <= 0:
                     ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
-                    parts.append(f"[0###{ts}]")
+                    parts.append(f"[0##{ts}]")
                 elif abs(wait_sec - default_wait) < 0.005:
                     # wait = 1 beat at gen BPM, use simple [D:M] notation
                     trace_str = self._duration_to_notation(trace_sec, bpm)
                     parts.append(f"[{trace_str}]")
                 else:
-                    # wait ≠ 1 beat at gen BPM: find BPM where wait = 1 beat,
-                    # then express trace at that same BPM.
-                    wait_bpm = 240.0 / wait_sec
-                    trace_beats = trace_sec * wait_bpm / 240.0
-                    # try to find clean D:M for trace at wait_bpm
-                    dm = self._beats_to_divider_mult(trace_beats)
-                    if dm is not None:
-                        d, m = dm
-                        bpm_s = f"{wait_bpm:.4f}".rstrip('0').rstrip('.')
-                        parts.append(f"[{bpm_s}#{d}:{m}]")
-                    else:
-                        # trace can't be expressed as clean beats; use seconds
-                        ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
-                        bpm_s = f"{wait_bpm:.4f}".rstrip('0').rstrip('.')
-                        parts.append(f"[{bpm_s}#{ts}]")
+                    ws = f"{wait_sec:.6f}".rstrip('0').rstrip('.')
+                    ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
+                    parts.append(f"[{ws}##{ts}]")
 
             prev_end = seg.end_lane
 
@@ -968,6 +964,25 @@ def _self_check() -> None:
     generated = generate_maidata(chart)
     restored = parse_maidata(generated)
     assert restored.first_sec == 0.125 and len(restored.all_levels[5].frames) == 2
+    slides = parse_maidata(
+        "&title=slides\n&lv_5=14\n&inote_5=(120){4}"
+        "1-3[0.3##0.15],2-4[8:1],4pp4[4:1]*qq4[4:1],"
+        "1-3[8:1]-1[8:1]*-5[8:1],E"
+    ).all_levels[5].frames
+    absolute, beats, self_loop, returned = (frame.notes[0] for frame in slides)
+    assert absolute.data[0].wait_duration == 0.3
+    assert absolute.data[0].trace_duration == 0.15
+    assert beats.data[0].wait_duration == 2.0
+    assert beats.data[0].trace_duration == 0.25
+    assert [segment.starts_new_branch for segment in self_loop.data] == [True, True]
+    assert [segment.starts_new_branch for segment in returned.data] == [True, False, True]
+    regenerated = generate_maidata(parse_maidata(
+        "&title=roundtrip\n&lv_5=14\n&inote_5=(120){4}1-3[0.3##0.15],"
+        "4pp4[4:1]*qq4[4:1],1-3[8:1]-1[8:1]*-5[8:1],E"
+    ))
+    assert "[0.3##0.15]" in regenerated
+    assert "4pp4[" in regenerated and "*qq4[" in regenerated
+    assert "1-3[" in regenerated and "-1[" in regenerated and "*-5[" in regenerated
     print("[maidata-parser] 自检通过")
 
 

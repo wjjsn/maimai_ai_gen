@@ -15,7 +15,7 @@ from config import CONFIG, checkpoint_config, max_hold_duration_frames
 from dataset import (
     HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, DatasetIndex, SongRecord,
     build_dataset_index, iter_loaded_window_batches, iter_window_batches,
-    load_song_data, split_songs, window_starts, _shift_window,
+    load_song_data, split_songs, _shift_window,
 )
 from infer import LABEL_PROTOCOL, MODEL_KIND, infer_features, model_dimensions
 from model import NoteTimingTransformer
@@ -36,7 +36,9 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
-def _duration_supervision_mask(events: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def _duration_supervision_mask(
+    events: torch.Tensor, mask: torch.Tensor, duration_anchor: torch.Tensor,
+) -> torch.Tensor:
     hold_count = events[..., HOLD_START_COUNT]
     durations = events[..., HOLD_DURATION_1:]
     slots = torch.stack((hold_count >= 1, hold_count >= 2), dim=-1)
@@ -46,6 +48,8 @@ def _duration_supervision_mask(events: torch.Tensor, mask: torch.Tensor) -> torc
     ).amax(dim=1, keepdim=True).unsqueeze(-1)
     return (
         slots
+        & duration_anchor.view(-1, 1, 1)
+        & (positions == 0)
         & mask.unsqueeze(-1)
         & (durations > 0)
         & (durations <= max_hold_duration_frames())
@@ -96,7 +100,7 @@ def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor
         hold_logits[..., 1:].transpose(1, 2), (hold_target - 1).clamp_min(0), reduction="none",
     ), valid * (hold_target > 0))
     count_loss = (tap_presence_loss + hold_presence_loss + tap_count_loss + hold_count_loss) / 4
-    duration_mask = _duration_supervision_mask(events, mask)
+    duration_mask = _duration_supervision_mask(events, mask, batch["duration_anchor"])
     duration_error = nn.functional.smooth_l1_loss(duration, _duration_target(events), reduction="none")
     duration_loss = (duration_error * duration_mask).sum() / duration_mask.sum().clamp_min(1)
     return (
@@ -109,33 +113,26 @@ def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor
     )
 
 
-def estimate_batches(songs: tuple[SongRecord, ...], epoch: int) -> int:
-    rng = np.random.default_rng(CONFIG.training.seed + epoch)
-    order = rng.permutation(len(songs))
-    offset = int(rng.integers(0, CONFIG.training.stride))
-    worker_count = max(1, CONFIG.training.num_workers)
-    worker_windows = [0] * worker_count
-    for position, song_index in enumerate(order):
-        song = songs[int(song_index)]
-        regular = len(window_starts(song.estimated_frames, offset, True))
-        events = round(regular * CONFIG.training.event_window_ratio)
-        worker_windows[position % worker_count] += (regular + events) * len(song.levels)
-    return max(1, sum(
-        math.ceil(windows / CONFIG.training.batch_size) for windows in worker_windows if windows
-    ))
-
-
-def build_scheduler(optimizer, total_steps: int):
-    warmup_steps = round(total_steps * CONFIG.training.warmup_ratio)
+def build_scheduler(optimizer, total_epochs: int):
+    warmup_epochs = round(total_epochs * CONFIG.training.warmup_ratio)
     minimum_ratio = CONFIG.training.min_learning_rate / CONFIG.training.learning_rate
 
-    def factor(step: int) -> float:
-        if warmup_steps and step < warmup_steps:
-            return max((step + 1) / warmup_steps, 1 / warmup_steps)
-        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    def factor(epoch: int) -> float:
+        if warmup_epochs and epoch < warmup_epochs:
+            return max((epoch + 1) / warmup_epochs, 1 / warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(total_epochs - warmup_epochs, 1)
         return minimum_ratio + (1 - minimum_ratio) * (1 + math.cos(math.pi * min(progress, 1))) / 2
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
+def _load_scheduler_state(scheduler, optimizer, state: dict) -> None:
+    scheduler.load_state_dict(state)
+    learning_rates = scheduler.get_last_lr()
+    if len(learning_rates) != len(optimizer.param_groups):
+        raise ValueError("学习率调度器与优化器参数组数量不一致")
+    for group, learning_rate in zip(optimizer.param_groups, learning_rates):
+        group["lr"] = learning_rate
 
 
 def run_epoch(
@@ -146,7 +143,7 @@ def run_epoch(
     totals = np.zeros(6, dtype=np.float64)
     count = 0
     for batch in tqdm(batches, desc=description, total=total, leave=False):
-        for key in ("features", "events", "mask", "difficulty"):
+        for key in ("features", "events", "mask", "duration_anchor", "difficulty"):
             batch[key] = batch[key].to(DEVICE, non_blocking=True)
         with torch.set_grad_enabled(training), torch.autocast(
             device_type=DEVICE.type, dtype=torch.float16, enabled=DEVICE.type == "cuda",
@@ -159,7 +156,6 @@ def run_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), CONFIG.training.grad_clip)
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
         totals += [value.item() for value in losses]
         count += 1
     if not count:
@@ -441,7 +437,6 @@ def _validate_training_checkpoint(state: dict, split_summary: dict) -> bool:
         print(f"警告: 检查点的{'、'.join(changed)}与当前配置不同，继续完整恢复", flush=True)
     schedule_keys = {
         "num_epochs", "learning_rate", "min_learning_rate", "warmup_ratio",
-        "batch_size", "num_workers", "prefetch_factor",
     }
     saved_training = state.get("training_config", {})
     return all(saved_training.get(key) == getattr(CONFIG.training, key) for key in schedule_keys)
@@ -520,6 +515,7 @@ def _self_check() -> None:
     batch = {
         "events": torch.zeros(1, 8, 4, dtype=torch.long),
         "mask": torch.ones(1, 8, dtype=torch.bool),
+        "duration_anchor": torch.ones(1, dtype=torch.bool),
     }
     output = (
         torch.zeros(1, 8, 3), torch.zeros(1, 8, 3), torch.full((1, 8, 2), 0.5),
@@ -539,15 +535,22 @@ def _self_check() -> None:
     assert compute_loss(correct, batch)[0] < losses[0]
     visibility_events = torch.zeros(1, 8, 4, dtype=torch.long)
     visibility_mask = torch.ones(1, 8, dtype=torch.bool)
+    visibility_events[0, 0] = torch.tensor((0, 1, 8, 0))
     visibility_events[0, 1] = torch.tensor((0, 1, 7, 0))
-    visibility_events[0, 2] = torch.tensor((0, 1, 7, 0))
     visibility_events[0, 4] = torch.tensor((0, 1, CONFIG.training.window_frames + 1, 0))
-    duration_mask = _duration_supervision_mask(visibility_events, visibility_mask)
-    assert duration_mask[0, 1, 0] and not duration_mask[0, 2, 0]
+    duration_mask = _duration_supervision_mask(
+        visibility_events, visibility_mask, torch.ones(1, dtype=torch.bool),
+    )
+    assert duration_mask[0, 0, 0] and not duration_mask[0, 1, 0]
     assert not duration_mask[0, 4, 0]
+    assert not _duration_supervision_mask(
+        visibility_events, visibility_mask, torch.zeros(1, dtype=torch.bool),
+    ).any()
     tail_events = torch.zeros(1, 8, 4, dtype=torch.long)
     tail_events[0, 1] = torch.tensor((0, 1, 8, 0))
-    assert not _duration_supervision_mask(tail_events, visibility_mask).any()
+    assert not _duration_supervision_mask(
+        tail_events, visibility_mask, torch.ones(1, dtype=torch.bool),
+    ).any()
     shifted = {
         "features": torch.zeros(8, 1),
         "events": torch.zeros(8, 4, dtype=torch.long),
@@ -557,6 +560,7 @@ def _self_check() -> None:
     _shift_window(shifted, 1)
     assert not _duration_supervision_mask(
         shifted["events"].unsqueeze(0), shifted["mask"].unsqueeze(0),
+        torch.ones(1, dtype=torch.bool),
     ).any()
     target = np.zeros((30, 4), dtype=np.int32)
     predicted = np.zeros_like(target)
@@ -605,6 +609,22 @@ def _self_check() -> None:
         scheduler.step()
     assert 0 < first <= 1
     assert scheduler.get_last_lr()[0] <= CONFIG.training.min_learning_rate / CONFIG.training.learning_rate + 1e-6
+    resume_optimizer = torch.optim.AdamW(
+        nn.Linear(2, 1).parameters(), lr=CONFIG.training.learning_rate,
+    )
+    resume_scheduler = build_scheduler(resume_optimizer, 100)
+    for _ in range(20):
+        resume_optimizer.step()
+        resume_scheduler.step()
+    saved_scheduler_state = resume_scheduler.state_dict()
+    saved_learning_rate = resume_scheduler.get_last_lr()[0]
+    restored_optimizer = torch.optim.AdamW(
+        nn.Linear(2, 1).parameters(), lr=CONFIG.training.learning_rate,
+    )
+    restored_scheduler = build_scheduler(restored_optimizer, 100)
+    _load_scheduler_state(restored_scheduler, restored_optimizer, saved_scheduler_state)
+    assert restored_scheduler.get_last_lr()[0] == saved_learning_rate
+    assert restored_optimizer.param_groups[0]["lr"] == saved_learning_rate
     compatible_state = {
         "checkpoint_version": 3,
         "model_kind": MODEL_KIND,
@@ -643,11 +663,6 @@ def main() -> None:
     CONFIG.paths.train_output_dir.mkdir(parents=True, exist_ok=True)
     CONFIG.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_json(CONFIG.paths.train_output_dir / "split-summary.json", summary)
-    train_batches = [
-        estimate_batches(splits["train"], epoch)
-        for epoch in range(1, CONFIG.training.num_epochs + 1)
-    ]
-    total_steps = sum(train_batches)
     model = NoteTimingTransformer(model_dimensions()).to(DEVICE)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=CONFIG.training.learning_rate,
@@ -676,16 +691,16 @@ def main() -> None:
         for group in optimizer.param_groups:
             group["lr"] = CONFIG.training.learning_rate
             group["initial_lr"] = CONFIG.training.learning_rate
-        scheduler = build_scheduler(optimizer, total_steps)
+        scheduler = build_scheduler(optimizer, CONFIG.training.num_epochs)
         if global_step:
-            scheduler.step(global_step)
+            scheduler.step(start_epoch - 1)
     else:
-        scheduler = build_scheduler(optimizer, total_steps)
-        scheduler.load_state_dict(scheduler_state)
+        scheduler = build_scheduler(optimizer, CONFIG.training.num_epochs)
+        _load_scheduler_state(scheduler, optimizer, scheduler_state)
     print(
         f"设备={DEVICE} 参数={sum(p.numel() for p in model.parameters()):,} "
         f"歌曲={len(index.songs)} 划分={{训练:{len(splits['train'])},验证:{len(splits['validation'])},测试:{len(splits['test'])}}} "
-        f"预计每轮批次={train_batches[0]} 总更新={total_steps}",
+        f"学习率调度轮数={CONFIG.training.num_epochs}",
         flush=True,
     )
     print(f"标签规范化={index.label_normalization}", flush=True)
@@ -695,9 +710,10 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats()
         train_losses, updates = run_epoch(
             model, iter_window_batches(splits["train"], epoch, True), optimizer, scheduler, scaler,
-            "训练", train_batches[epoch - 1],
+            "训练",
         )
         global_step += updates
+        scheduler.step()
         training_generation = (
             evaluate_songs(model, splits["train"])
             if CONFIG.training.song_limit else None

@@ -15,7 +15,7 @@ from model import ModelDimensions, NoteTimingTransformer
 
 
 MODEL_KIND = "log-mel-difficulty-bert-window-event-v3"
-LABEL_PROTOCOL = "event-heatmap-balanced-shuffled-window-duration-v6"
+LABEL_PROTOCOL = "event-heatmap-balanced-shuffled-anchored-duration-v8"
 
 
 def model_dimensions() -> ModelDimensions:
