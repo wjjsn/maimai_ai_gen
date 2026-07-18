@@ -15,7 +15,7 @@ from config import CONFIG, checkpoint_config, max_hold_duration_frames
 from dataset import (
     HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, DatasetIndex, SongRecord,
     build_dataset_index, iter_loaded_window_batches, iter_window_batches,
-    load_song_data, split_songs, _shift_window,
+    load_song_data, split_songs, window_starts, _shift_window,
 )
 from infer import LABEL_PROTOCOL, MODEL_KIND, infer_features, model_dimensions
 from model import NoteTimingTransformer
@@ -113,6 +113,22 @@ def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor
     )
 
 
+def estimate_batches(songs: tuple[SongRecord, ...], epoch: int) -> int:
+    rng = np.random.default_rng(CONFIG.training.seed + epoch)
+    order = rng.permutation(len(songs))
+    offset = int(rng.integers(0, CONFIG.training.stride))
+    worker_windows = [0] * max(1, CONFIG.training.num_workers)
+    for position, song_index in enumerate(order):
+        song = songs[int(song_index)]
+        regular = len(window_starts(song.estimated_frames, offset, True))
+        events = round(regular * CONFIG.training.event_window_ratio)
+        worker_windows[position % len(worker_windows)] += (regular + events) * len(song.levels)
+    return max(1, sum(
+        math.ceil(windows / CONFIG.training.batch_size)
+        for windows in worker_windows if windows
+    ))
+
+
 def build_scheduler(optimizer, total_epochs: int):
     warmup_epochs = round(total_epochs * CONFIG.training.warmup_ratio)
     minimum_ratio = CONFIG.training.min_learning_rate / CONFIG.training.learning_rate
@@ -142,7 +158,7 @@ def run_epoch(
     model.train(training)
     totals = np.zeros(6, dtype=np.float64)
     count = 0
-    for batch in tqdm(batches, desc=description, total=total, leave=False):
+    for batch in tqdm(batches, desc=description, total=total, unit="批", leave=False):
         for key in ("features", "events", "mask", "duration_anchor", "difficulty"):
             batch[key] = batch[key].to(DEVICE, non_blocking=True)
         with torch.set_grad_enabled(training), torch.autocast(
@@ -487,22 +503,28 @@ def _format_epoch(record: dict) -> str:
     main = record["validation"]["generation"]["tolerances"]["6"]["total"]
     duration = record["validation"]["generation"]["tolerances"]["6"]["duration_error_ms"]["mae"]
     training_generation = record["train"].get("generation")
-    training_text = ""
+    training_metrics = ""
     if training_generation is not None:
         training_strict = training_generation["tolerances"]["3"]["total"]
         training_main = training_generation["tolerances"]["6"]["total"]
-        training_text = (
-            f"训练F1@3={training_strict['macro_f1']:.2%} "
-            f"训练F1@6={training_main['macro_f1']:.2%} "
+        training_metrics = (
+            f"  F1@3={training_strict['macro_f1']:.2%}"
+            f"  F1@6={training_main['macro_f1']:.2%}"
         )
+    duration_text = f"{duration:.2f}ms" if duration is not None else "无数据"
     return (
-        f"epoch={record['epoch']} step={record['global_step']} lr={record['learning_rate']:.3e} "
-        f"train_loss={record['train']['loss']:.6f} val_loss={record['validation']['loss']:.6f} "
-        f"{training_text}"
-        f"F1@3={strict['macro_f1']:.2%} 准确率@3={strict['precision']:.2%} 召回率@3={strict['recall']:.2%} "
-        f"F1@6={main['macro_f1']:.2%} 准确率@6={main['precision']:.2%} 召回率@6={main['recall']:.2%} "
-        f"时长MAE={duration if duration is not None else 0:.2f}ms "
-        f"耗时={record['seconds']:.1f}s 吞吐={record['windows_per_sec']:.1f}窗口/s"
+        f"\n[Epoch {record['epoch']}/{CONFIG.training.num_epochs}] "
+        f"step={record['global_step']}  lr={record['learning_rate']:.3e}\n"
+        f"  训练 | loss={record['train']['loss']:.6f}{training_metrics}\n"
+        f"  验证 | loss={record['validation']['loss']:.6f}\n"
+        f"       | @3  F1={strict['macro_f1']:.2%}  "
+        f"准确率={strict['precision']:.2%}  召回率={strict['recall']:.2%}\n"
+        f"       | @6  F1={main['macro_f1']:.2%}  "
+        f"准确率={main['precision']:.2%}  召回率={main['recall']:.2%}  "
+        f"时长MAE={duration_text}\n"
+        f"  性能 | 耗时={record['seconds']:.1f}s  "
+        f"吞吐={record['windows_per_sec']:.1f}窗口/s  "
+        f"显存峰值={record['peak_gpu_gib']:.2f}GiB"
     )
 
 
@@ -649,6 +671,44 @@ def _self_check() -> None:
         pass
     else:
         raise AssertionError("结构不兼容的检查点必须拒绝恢复")
+    estimated_song = SongRecord(
+        Path("chart"), Path("audio"), "test", "test",
+        (object(), object()), CONFIG.training.window_frames * 3,
+    )
+    assert estimate_batches((estimated_song,), 1) > 0
+    scores = {"macro_f1": 0.1, "precision": 0.2, "recall": 0.3}
+    generation = {
+        "tolerances": {
+            "3": {"total": scores},
+            "6": {
+                "total": scores,
+                "duration_error_ms": {"mae": 123.0},
+            },
+        },
+    }
+    formatted = _format_epoch({
+        "epoch": 1,
+        "global_step": 10,
+        "learning_rate": 1e-4,
+        "seconds": 2.0,
+        "windows_per_sec": 3.0,
+        "peak_gpu_gib": 4.0,
+        "train": {"loss": 0.5, "generation": generation},
+        "validation": {"loss": 0.6, "generation": generation},
+    })
+    assert "\n  训练 |" in formatted and "\n  验证 |" in formatted
+    assert "\n  性能 |" in formatted and "F1@3=10.00%" in formatted
+    without_training_f1 = _format_epoch({
+        "epoch": 1,
+        "global_step": 10,
+        "learning_rate": 1e-4,
+        "seconds": 2.0,
+        "windows_per_sec": 3.0,
+        "peak_gpu_gib": 0.0,
+        "train": {"loss": 0.5},
+        "validation": {"loss": 0.6, "generation": generation},
+    })
+    assert without_training_f1.splitlines()[2] == "  训练 | loss=0.500000"
     print("[train] 自检通过")
 
 
@@ -700,6 +760,7 @@ def main() -> None:
     print(
         f"设备={DEVICE} 参数={sum(p.numel() for p in model.parameters()):,} "
         f"歌曲={len(index.songs)} 划分={{训练:{len(splits['train'])},验证:{len(splits['validation'])},测试:{len(splits['test'])}}} "
+        f"预计首轮批次≈{estimate_batches(splits['train'], start_epoch)} "
         f"学习率调度轮数={CONFIG.training.num_epochs}",
         flush=True,
     )
@@ -710,7 +771,8 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats()
         train_losses, updates = run_epoch(
             model, iter_window_batches(splits["train"], epoch, True), optimizer, scheduler, scaler,
-            "训练",
+            f"训练 {epoch}/{CONFIG.training.num_epochs}",
+            estimate_batches(splits["train"], epoch),
         )
         global_step += updates
         scheduler.step()
