@@ -11,11 +11,11 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from config import CONFIG, checkpoint_config
+from config import CONFIG, checkpoint_config, max_hold_duration_frames
 from dataset import (
     HOLD_DURATION_1, HOLD_START_COUNT, TAP_COUNT, DatasetIndex, SongRecord,
     build_dataset_index, iter_loaded_window_batches, iter_window_batches,
-    load_song_data, split_songs, window_starts,
+    load_song_data, split_songs, window_starts, _shift_window,
 )
 from infer import LABEL_PROTOCOL, MODEL_KIND, infer_features, model_dimensions
 from model import NoteTimingTransformer
@@ -28,12 +28,29 @@ if DEVICE.type == "cuda":
 
 
 def _duration_target(events: torch.Tensor) -> torch.Tensor:
-    maximum = round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)
+    maximum = max_hold_duration_frames()
     return torch.log1p(events[..., HOLD_DURATION_1:].float()) / np.log1p(maximum)
 
 
 def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
+
+
+def _duration_supervision_mask(events: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    hold_count = events[..., HOLD_START_COUNT]
+    durations = events[..., HOLD_DURATION_1:]
+    slots = torch.stack((hold_count >= 1, hold_count >= 2), dim=-1)
+    positions = torch.arange(mask.shape[1], device=mask.device).view(1, -1, 1)
+    valid_end = torch.where(
+        mask, torch.arange(1, mask.shape[1] + 1, device=mask.device), 0,
+    ).amax(dim=1, keepdim=True).unsqueeze(-1)
+    return (
+        slots
+        & mask.unsqueeze(-1)
+        & (durations > 0)
+        & (durations <= max_hold_duration_frames())
+        & (positions + durations <= valid_end)
+    )
 
 
 def _event_heatmap(target: torch.Tensor, mask: torch.Tensor, radius: int) -> torch.Tensor:
@@ -79,7 +96,7 @@ def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor
         hold_logits[..., 1:].transpose(1, 2), (hold_target - 1).clamp_min(0), reduction="none",
     ), valid * (hold_target > 0))
     count_loss = (tap_presence_loss + hold_presence_loss + tap_count_loss + hold_count_loss) / 4
-    duration_mask = torch.stack((hold_target >= 1, hold_target >= 2), dim=-1) & mask.unsqueeze(-1)
+    duration_mask = _duration_supervision_mask(events, mask)
     duration_error = nn.functional.smooth_l1_loss(duration, _duration_target(events), reduction="none")
     duration_loss = (duration_error * duration_mask).sum() / duration_mask.sum().clamp_min(1)
     return (
@@ -159,11 +176,12 @@ def _events(tracks: np.ndarray, column: int) -> list[tuple[int, int]]:
     return result
 
 
-def _match_events(target, predicted, tolerance: int):
+def _match_events(target, predicted, tolerance: int, target_length: int | None = None):
     target, predicted = sorted(target), sorted(predicted)
     target_index = predicted_index = matches = 0
     start_errors: list[int] = []
     duration_errors: list[int] = []
+    duration_samples: list[tuple[int, int]] = []
     while target_index < len(target) and predicted_index < len(predicted):
         target_frame, target_duration = target[target_index]
         predicted_frame, predicted_duration = predicted[predicted_index]
@@ -175,10 +193,18 @@ def _match_events(target, predicted, tolerance: int):
             matches += 1
             start_errors.append(abs(target_frame - predicted_frame))
             if target_duration:
-                duration_errors.append(abs(target_duration - predicted_duration))
+                error = abs(target_duration - predicted_duration)
+                endpoint_visible = target_length is None or target_frame + target_duration <= target_length
+                if endpoint_visible:
+                    duration_samples.append((target_duration, error))
+                    if target_duration <= max_hold_duration_frames():
+                        duration_errors.append(error)
             target_index += 1
             predicted_index += 1
-    return matches, len(predicted) - matches, len(target) - matches, start_errors, duration_errors
+    return (
+        matches, len(predicted) - matches, len(target) - matches,
+        start_errors, duration_errors, duration_samples,
+    )
 
 
 def _scores(tp: int, fp: int, fn: int) -> dict[str, float | int]:
@@ -193,7 +219,10 @@ def _scores(tp: int, fp: int, fn: int) -> dict[str, float | int]:
 
 def evaluate_tracks(target: np.ndarray, predicted: np.ndarray, tolerance: int) -> dict:
     tap = _match_events(_events(target, TAP_COUNT), _events(predicted, TAP_COUNT), tolerance)
-    hold = _match_events(_events(target, HOLD_START_COUNT), _events(predicted, HOLD_START_COUNT), tolerance)
+    hold = _match_events(
+        _events(target, HOLD_START_COUNT), _events(predicted, HOLD_START_COUNT),
+        tolerance, len(target),
+    )
     total = tuple(tap[index] + hold[index] for index in range(3))
     return {
         "tap": _scores(*tap[:3]),
@@ -201,6 +230,7 @@ def evaluate_tracks(target: np.ndarray, predicted: np.ndarray, tolerance: int) -
         "total": _scores(*total),
         "start_errors": tap[3] + hold[3],
         "duration_errors": hold[4],
+        "duration_samples": hold[5],
         "tap_confusion": np.bincount(
             target[:, TAP_COUNT].clip(0, 2) * 3 + predicted[:, TAP_COUNT].clip(0, 2), minlength=9,
         ).reshape(3, 3).tolist(),
@@ -221,6 +251,30 @@ def _percentiles(values: list[int], scale: float = 1.0) -> dict[str, float | Non
     }
 
 
+def _duration_error_buckets(samples: list[tuple[int, int]]) -> dict[str, dict]:
+    one_second = round(CONFIG.audio.frames_per_sec)
+    two_point_five_seconds = round(2.5 * CONFIG.audio.frames_per_sec)
+    maximum = max_hold_duration_frames()
+    groups = {
+        "<1s": [], "1-2.5s": [], "2.5s-window_limit": [], ">window_limit": [],
+    }
+    for target, error in samples:
+        if target > maximum:
+            name = ">window_limit"
+        elif target < one_second:
+            name = "<1s"
+        elif target < two_point_five_seconds:
+            name = "1-2.5s"
+        else:
+            name = "2.5s-window_limit"
+        groups[name].append(error)
+    scale = 1000 / CONFIG.audio.frames_per_sec
+    return {
+        name: {"count": len(values), **_percentiles(values, scale)}
+        for name, values in groups.items()
+    }
+
+
 def merge_evaluations(evaluations: list[dict]) -> dict:
     result = {}
     for kind in ("tap", "hold", "total"):
@@ -234,6 +288,9 @@ def merge_evaluations(evaluations: list[dict]) -> dict:
     result["duration_error_ms"] = _percentiles([
         value for item in evaluations for value in item["duration_errors"]
     ], 1000 / CONFIG.audio.frames_per_sec)
+    result["duration_error_buckets_ms"] = _duration_error_buckets([
+        value for item in evaluations for value in item["duration_samples"]
+    ])
     for name in ("tap_confusion", "hold_confusion"):
         result[name] = np.sum([item[name] for item in evaluations], axis=0).astype(int).tolist() if evaluations else [[0] * 3 for _ in range(3)]
     return result
@@ -248,6 +305,7 @@ def _combine_raw_evaluations(evaluations: list[dict]) -> dict:
         combined[kind] = scores
     combined["start_errors"] = [value for item in evaluations for value in item["start_errors"]]
     combined["duration_errors"] = [value for item in evaluations for value in item["duration_errors"]]
+    combined["duration_samples"] = [value for item in evaluations for value in item["duration_samples"]]
     combined["tap_confusion"] = np.sum([item["tap_confusion"] for item in evaluations], axis=0).astype(int).tolist()
     combined["hold_confusion"] = np.sum([item["hold_confusion"] for item in evaluations], axis=0).astype(int).tolist()
     return combined
@@ -479,6 +537,27 @@ def _self_check() -> None:
         logits[..., 1] = margin / 2
     correct[0][0, 0, 2] = correct[0][0, 0, 1] + 10
     assert compute_loss(correct, batch)[0] < losses[0]
+    visibility_events = torch.zeros(1, 8, 4, dtype=torch.long)
+    visibility_mask = torch.ones(1, 8, dtype=torch.bool)
+    visibility_events[0, 1] = torch.tensor((0, 1, 7, 0))
+    visibility_events[0, 2] = torch.tensor((0, 1, 7, 0))
+    visibility_events[0, 4] = torch.tensor((0, 1, CONFIG.training.window_frames + 1, 0))
+    duration_mask = _duration_supervision_mask(visibility_events, visibility_mask)
+    assert duration_mask[0, 1, 0] and not duration_mask[0, 2, 0]
+    assert not duration_mask[0, 4, 0]
+    tail_events = torch.zeros(1, 8, 4, dtype=torch.long)
+    tail_events[0, 1] = torch.tensor((0, 1, 8, 0))
+    assert not _duration_supervision_mask(tail_events, visibility_mask).any()
+    shifted = {
+        "features": torch.zeros(8, 1),
+        "events": torch.zeros(8, 4, dtype=torch.long),
+        "mask": torch.ones(8, dtype=torch.bool),
+    }
+    shifted["events"][0] = torch.tensor((0, 1, 8, 0))
+    _shift_window(shifted, 1)
+    assert not _duration_supervision_mask(
+        shifted["events"].unsqueeze(0), shifted["mask"].unsqueeze(0),
+    ).any()
     target = np.zeros((30, 4), dtype=np.int32)
     predicted = np.zeros_like(target)
     target[10] = (2, 1, 20, 0)
@@ -489,6 +568,35 @@ def _self_check() -> None:
     assert evaluate_tracks(target, predicted, 5)["hold"] == _scores(0, 1, 1)
     merged = merge_evaluations([evaluate_tracks(target, predicted, 6)])
     assert merged["total"]["macro_f1"] == 1.0
+    maximum = max_hold_duration_frames()
+    buckets = _duration_error_buckets([
+        (round(CONFIG.audio.frames_per_sec) - 1, 1),
+        (round(CONFIG.audio.frames_per_sec), 2),
+        (round(2.5 * CONFIG.audio.frames_per_sec) - 1, 3),
+        (round(2.5 * CONFIG.audio.frames_per_sec), 4),
+        (maximum, 5), (maximum + 1, 6),
+    ])
+    assert [bucket["count"] for bucket in buckets.values()] == [1, 2, 2, 1]
+    unsupported_target = np.zeros((maximum + 2, 4), dtype=np.int32)
+    unsupported_prediction = np.zeros_like(unsupported_target)
+    unsupported_target[1] = (0, 1, maximum + 1, 0)
+    unsupported_prediction[1] = (0, 1, maximum, 0)
+    unsupported = merge_evaluations([
+        evaluate_tracks(unsupported_target, unsupported_prediction, 0),
+    ])
+    assert unsupported["duration_error_ms"]["mae"] is None
+    assert unsupported["duration_error_buckets_ms"][">window_limit"]["count"] == 1
+    tail_target = np.zeros((12, 4), dtype=np.int32)
+    tail_prediction = np.zeros_like(tail_target)
+    tail_target[10] = (0, 1, 4, 0)
+    tail_prediction[10] = (0, 1, 2, 0)
+    tail_metrics = merge_evaluations([
+        evaluate_tracks(tail_target, tail_prediction, 0),
+    ])
+    assert tail_metrics["duration_error_ms"]["mae"] is None
+    assert sum(
+        bucket["count"] for bucket in tail_metrics["duration_error_buckets_ms"].values()
+    ) == 0
     optimizer = torch.optim.AdamW(nn.Linear(2, 1).parameters(), lr=1.0)
     scheduler = build_scheduler(optimizer, 100)
     first = scheduler.get_last_lr()[0]

@@ -234,6 +234,14 @@ def _validate(config: AppConfig) -> None:
     _require(0 <= training.event_window_ratio <= 1, "事件窗口比例必须在 [0, 1] 内")
     _require(inference.short_min_gap_frames >= 0 and inference.long_min_frames > 0, "推理帧数阈值无效")
     _require(0 < inference.min_duration_sec <= inference.max_duration_sec, "持续音时长范围无效")
+    configured_maximum = round(inference.max_duration_sec * audio.frames_per_sec)
+    effective_maximum = min(configured_maximum, training.window_frames)
+    effective_minimum = max(
+        inference.long_min_frames,
+        round(inference.min_duration_sec * audio.frames_per_sec),
+    )
+    _require(configured_maximum >= 1, "持续音最长时长换算后必须至少为 1 帧")
+    _require(effective_minimum <= effective_maximum, "持续音帧数范围超过模型窗口")
 
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
@@ -261,15 +269,20 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
 CONFIG = load_config()
 
 
+def max_hold_duration_frames(config: AppConfig = CONFIG) -> int:
+    return min(
+        round(config.inference.max_duration_sec * config.audio.frames_per_sec),
+        config.training.window_frames,
+    )
+
+
 def checkpoint_config(config: AppConfig = CONFIG) -> dict:
     return {
         "audio": vars(config.audio),
         "model": vars(config.model),
         "window_frames": config.training.window_frames,
         "label_min_gap_frames": config.inference.short_min_gap_frames,
-        "max_hold_duration_frames": round(
-            config.inference.max_duration_sec * config.audio.frames_per_sec,
-        ),
+        "max_hold_duration_frames": max_hold_duration_frames(config),
     }
 
 
@@ -280,9 +293,8 @@ def _self_check() -> None:
     assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "attention_heads", "dropout"}
     saved = checkpoint_config()
     assert saved["window_frames"] == CONFIG.training.window_frames
-    assert saved["max_hold_duration_frames"] == round(
-        CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec,
-    )
+    configured = round(CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec)
+    assert saved["max_hold_duration_frames"] == min(configured, CONFIG.training.window_frames)
     print("[config] 自检通过")
 
 

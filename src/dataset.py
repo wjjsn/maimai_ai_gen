@@ -122,12 +122,15 @@ def chart_to_tracks(chart: Chart, level_idx: int, length: int | None = None) -> 
     tracks = np.zeros((length, TRACK_COUNT), dtype=np.int32)
     for start in tap_events:
         tracks[start, TAP_COUNT] += 1
+    grouped_holds: dict[int, list[int]] = {}
     for start, duration in hold_events:
-        slot = int(tracks[start, HOLD_START_COUNT])
-        if slot == 2:
-            continue
-        tracks[start, HOLD_START_COUNT] += 1
-        tracks[start, HOLD_DURATION_1 + slot] = duration
+        durations = grouped_holds.setdefault(start, [])
+        if len(durations) < 2:
+            durations.append(duration)
+    for start, durations in grouped_holds.items():
+        kept = sorted(durations)[:2]
+        tracks[start, HOLD_START_COUNT] = len(kept)
+        tracks[start, HOLD_DURATION_1:HOLD_DURATION_1 + len(kept)] = kept
     return tracks
 
 
@@ -151,6 +154,7 @@ def tracks_to_chart(
         ((hold_count == 0) & (durations != 0).any(axis=1))
         | ((hold_count == 1) & ((durations[:, 0] == 0) | (durations[:, 1] != 0)))
         | ((hold_count == 2) & (durations == 0).any(axis=1))
+        | ((hold_count == 2) & (durations[:, 0] > durations[:, 1]))
     )
     if invalid_durations.any():
         raise ValueError("Hold 数量和持续时长槽位不一致")
@@ -423,9 +427,13 @@ def build_dataset_index(charts_dir: Path = CONFIG.paths.charts_dir) -> DatasetIn
             try:
                 tracks = chart_to_tracks(chart, level_idx)
                 level_stats: Counter[str] = Counter()
-                tracks = normalize_tracks(tracks, estimated_frames, level_stats)
-                if tracks[:, HOLD_DURATION_1:].max(initial=0) > maximum_duration:
+                audible_tracks = tracks[:estimated_frames]
+                level_stats["Hold超过窗口不监督时长音符"] += int(
+                    (audible_tracks[:, HOLD_DURATION_1:] > WINDOW_FRAMES).sum()
+                )
+                if audible_tracks[:, HOLD_DURATION_1:].max(initial=0) > maximum_duration:
                     raise ValueError("持续音超过配置上限")
+                tracks = normalize_tracks(tracks, estimated_frames, level_stats)
                 label_normalization.update(level_stats)
                 levels.append(LevelRecord(level_idx, float(difficulty)))
             except Exception as error:
@@ -570,7 +578,8 @@ def normalize_tracks(
                 if stats is not None:
                     stats["Hold音频尾部截断音符"] += 1
                     stats["Hold音频尾部截断帧数"] += duration - remaining
-                tracks[frame_index, column] = remaining
+        active = tracks[frame_index, HOLD_DURATION_1:HOLD_DURATION_1 + count]
+        tracks[frame_index, HOLD_DURATION_1:HOLD_DURATION_1 + count] = np.sort(active)
     return tracks
 
 
@@ -673,6 +682,13 @@ def window_starts(length: int, offset: int, training: bool) -> list[int]:
     return sorted(starts)
 
 
+def _event_window_start(tracks: np.ndarray, frame: int, length: int) -> int:
+    last = max(0, length - WINDOW_FRAMES)
+    if tracks[frame, HOLD_START_COUNT]:
+        return frame
+    return max(0, min(last, frame - WINDOW_FRAMES // 2))
+
+
 def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training: bool):
     worker = get_worker_info()
     worker_id = worker.id if worker is not None else 0
@@ -697,20 +713,29 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
             tracks = chart_to_tracks(chart, level.level_idx)
             tracks = _resize_tracks(tracks, speed, len(features)) if speed != 1.0 else _fit_tracks(tracks, len(features))
             starts = window_starts(len(features), offset, training)
+            hold_anchors: set[int] = set()
             if training and CONFIG.training.event_window_ratio and starts:
                 count = round(len(starts) * CONFIG.training.event_window_ratio)
                 event_frames = np.flatnonzero(tracks[:, TAP_COUNT] | tracks[:, HOLD_START_COUNT])
                 if event_frames.size and count:
                     centers = rng.choice(event_frames, count, replace=event_frames.size < count)
-                    starts.extend(max(0, min(
-                        max(0, len(features) - WINDOW_FRAMES), int(x) - WINDOW_FRAMES // 2,
-                    )) for x in centers)
+                    hold_anchors = {
+                        int(frame) for frame in centers
+                        if tracks[int(frame), HOLD_START_COUNT]
+                    }
+                    starts.extend(
+                        _event_window_start(tracks, int(frame), len(features))
+                        for frame in centers
+                    )
                     starts = list(set(starts))
             if training:
                 rng.shuffle(starts)
             for start in starts:
                 sample = _window(features, tracks, start)
-                if training and rng.random() < CONFIG.augmentation.shift_probability:
+                if (
+                    training and start not in hold_anchors
+                    and rng.random() < CONFIG.augmentation.shift_probability
+                ):
                     maximum = round(CONFIG.augmentation.max_shift_sec * CONFIG.audio.frames_per_sec)
                     _shift_window(sample, int(rng.integers(-maximum, maximum + 1)) if maximum else 0)
                 sample["difficulty"] = torch.tensor(level.difficulty, dtype=torch.float32)
@@ -812,11 +837,12 @@ def _self_check() -> None:
     assert tracks[20].tolist() == [0, 1, 8, 0]
     assert tracks[130, HOLD_DURATION_1] == 200
     chart.all_levels[5].frames.append(Frame((
-        Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.0)),
-        Note(NoteType.HOLD, HoldData(TapType.LANE2, 1.0)),
+        Note(NoteType.HOLD, HoldData(TapType.LANE1, 1.2)),
+        Note(NoteType.HOLD, HoldData(TapType.LANE2, 0.8)),
         Note(NoteType.HOLD, HoldData(TapType.LANE3, 1.0)),
     ), 2.0))
-    assert chart_to_tracks(chart, 5)[410, HOLD_START_COUNT] == 2
+    same_start = chart_to_tracks(chart, 5)[410]
+    assert same_start.tolist() == [0, 2, 160, 240]
     resized = _resize_tracks(tracks, 2.0, len(tracks) // 2)
     assert resized[5, TAP_COUNT] == 2 and resized[65, HOLD_DURATION_1] == 100
 
@@ -831,8 +857,8 @@ def _self_check() -> None:
         target = round(20 / speed)
         assert scaled[round(20 / speed)].tolist() == [
             2, 2,
-            min(max(1, round(11 / speed)), length - target),
-            min(max(1, round(13 / speed)), length - target),
+            max(1, round(11 / speed)),
+            max(1, round(13 / speed)),
         ]
 
     class _SpeedRng:
@@ -862,8 +888,15 @@ def _self_check() -> None:
     tail[11] = (0, 1, 10, 0)
     stats.clear()
     tail = normalize_tracks(tail, len(tail), stats)
-    assert tail[1, HOLD_DURATION_1] == 11 and tail[11, HOLD_DURATION_1] == 1
+    assert tail[1, HOLD_DURATION_1] == 100 and tail[11, HOLD_DURATION_1] == 10
     assert stats["Hold音频尾部截断音符"] == 2
+    unsorted = np.zeros((12, TRACK_COUNT), dtype=np.int32)
+    unsorted[2] = (0, 2, 9, 4)
+    assert normalize_tracks(unsorted, len(unsorted))[2].tolist() == [0, 2, 4, 9]
+    collided = np.zeros((12, TRACK_COUNT), dtype=np.int32)
+    collided[4] = (0, 1, 8, 0)
+    collided[5] = (0, 1, 4, 0)
+    assert _resize_tracks(collided, 2.0, 6)[2].tolist() == [0, 2, 2, 4]
 
     sample = {
         "features": torch.arange(8, dtype=torch.float32).unsqueeze(1),
@@ -924,6 +957,13 @@ def _self_check() -> None:
     assert window_starts(1536, 0, False) == [0, 512]
     starts = window_starts(3000, 511, True)
     assert starts == [0, 511, 1023, 1535, 1976]
+    event_tracks = np.zeros((3000, TRACK_COUNT), dtype=np.int32)
+    event_tracks[700, TAP_COUNT] = 1
+    event_tracks[1200] = (1, 1, 500, 0)
+    event_tracks[2500, HOLD_START_COUNT:] = (1, 400, 0)
+    assert _event_window_start(event_tracks, 700, len(event_tracks)) == 188
+    assert _event_window_start(event_tracks, 1200, len(event_tracks)) == 1200
+    assert _event_window_start(event_tracks, 2500, len(event_tracks)) == 2500
     negative = Chart(first_sec=-0.1)
     negative.all_levels[5] = Level("test", 1.0, [
         Frame((Note(NoteType.TAP, TapType.LANE1),), 0.0),
