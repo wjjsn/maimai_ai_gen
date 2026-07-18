@@ -15,7 +15,7 @@ from model import ModelDimensions, NoteTimingTransformer
 
 
 MODEL_KIND = "log-mel-difficulty-bert-window-event-v3"
-LABEL_PROTOCOL = "tap-hold-min-gap-tail-clipped-v4"
+LABEL_PROTOCOL = "event-heatmap-balanced-shuffled-v5"
 
 
 def model_dimensions() -> ModelDimensions:
@@ -77,10 +77,10 @@ def predict_tracks(
         weight_sum[start:end] += window_weight[:valid]
     tap_logits = tap_sum / weight_sum[:, None]
     hold_logits = hold_sum / weight_sum[:, None]
-    tap = tap_logits.argmax(axis=-1)
-    hold = hold_logits.argmax(axis=-1)
     tap_score = tap_logits[:, 1:].max(axis=-1) - tap_logits[:, 0]
     hold_score = hold_logits[:, 1:].max(axis=-1) - hold_logits[:, 0]
+    tap = np.where(tap_score >= 0, tap_logits[:, 1:].argmax(axis=-1) + 1, 0)
+    hold = np.where(hold_score >= 0, hold_logits[:, 1:].argmax(axis=-1) + 1, 0)
     normalized_duration = duration_sum / weight_sum[:, None]
     durations = np.rint(np.expm1(normalized_duration * np.log1p(maximum))).astype(np.int32)
     tracks = np.column_stack((tap, hold, durations)).astype(np.int32)

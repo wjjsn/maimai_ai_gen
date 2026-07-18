@@ -36,28 +36,58 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1)
 
 
+def _event_heatmap(target: torch.Tensor, mask: torch.Tensor, radius: int) -> torch.Tensor:
+    centers = (target > 0).float()
+    heatmap = centers.clone()
+    for distance in range(1, radius + 1):
+        value = 1 - distance / (radius + 1)
+        heatmap[:, distance:] = torch.maximum(heatmap[:, distance:], centers[:, :-distance] * value)
+        heatmap[:, :-distance] = torch.maximum(heatmap[:, :-distance], centers[:, distance:] * value)
+    return heatmap * mask
+
+
+def _event_margin(logits: torch.Tensor) -> torch.Tensor:
+    return logits[..., 1:].amax(dim=-1) - logits[..., 0]
+
+
+def _presence_loss(logits: torch.Tensor, heatmap: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    loss = nn.functional.binary_cross_entropy_with_logits(
+        _event_margin(logits), heatmap, reduction="none",
+    )
+    event_region = valid * (heatmap > 0)
+    background = valid * (heatmap == 0)
+    return (_masked_mean(loss, event_region) + _masked_mean(loss, background)) / 2
+
+
 def compute_loss(output: tuple[torch.Tensor, ...], batch: dict[str, torch.Tensor]):
     tap_logits, hold_logits, duration = output
     events, mask = batch["events"], batch["mask"]
     tap_target = events[..., TAP_COUNT].clamp_max(2)
     hold_target = events[..., HOLD_START_COUNT].clamp_max(2)
-    tap_loss = nn.functional.cross_entropy(tap_logits.transpose(1, 2), tap_target, reduction="none")
-    hold_loss = nn.functional.cross_entropy(hold_logits.transpose(1, 2), hold_target, reduction="none")
     valid = mask.float()
-    tap_empty_loss = _masked_mean(tap_loss, valid * (tap_target == 0))
-    tap_event_loss = _masked_mean(tap_loss, valid * (tap_target > 0))
-    hold_empty_loss = _masked_mean(hold_loss, valid * (hold_target == 0))
-    hold_event_loss = _masked_mean(hold_loss, valid * (hold_target > 0))
-    count_loss = (tap_empty_loss + tap_event_loss + hold_empty_loss + hold_event_loss) / 4
+    radius = CONFIG.inference.short_min_gap_frames
+    tap_presence_loss = _presence_loss(
+        tap_logits, _event_heatmap(tap_target, valid, radius), valid,
+    )
+    hold_presence_loss = _presence_loss(
+        hold_logits, _event_heatmap(hold_target, valid, radius), valid,
+    )
+    tap_count_loss = _masked_mean(nn.functional.cross_entropy(
+        tap_logits[..., 1:].transpose(1, 2), (tap_target - 1).clamp_min(0), reduction="none",
+    ), valid * (tap_target > 0))
+    hold_count_loss = _masked_mean(nn.functional.cross_entropy(
+        hold_logits[..., 1:].transpose(1, 2), (hold_target - 1).clamp_min(0), reduction="none",
+    ), valid * (hold_target > 0))
+    count_loss = (tap_presence_loss + hold_presence_loss + tap_count_loss + hold_count_loss) / 4
     duration_mask = torch.stack((hold_target >= 1, hold_target >= 2), dim=-1) & mask.unsqueeze(-1)
     duration_error = nn.functional.smooth_l1_loss(duration, _duration_target(events), reduction="none")
     duration_loss = (duration_error * duration_mask).sum() / duration_mask.sum().clamp_min(1)
     return (
         count_loss + duration_loss,
-        tap_empty_loss,
-        tap_event_loss,
-        hold_empty_loss,
-        hold_event_loss,
+        tap_presence_loss,
+        tap_count_loss,
+        hold_presence_loss,
+        hold_count_loss,
         duration_loss,
     )
 
@@ -394,8 +424,8 @@ def _save_checkpoint(state: dict, path: Path) -> None:
 
 def _loss_dict(losses: tuple[float, ...]) -> dict[str, float]:
     return dict(zip((
-        "loss", "tap_empty_loss", "tap_event_loss", "hold_empty_loss",
-        "hold_event_loss", "duration_loss",
+        "loss", "tap_presence_loss", "tap_count_loss", "hold_presence_loss",
+        "hold_count_loss", "duration_loss",
     ), losses))
 
 
@@ -423,15 +453,15 @@ def _self_check() -> None:
     batch["events"][0, 0] = torch.tensor((3, 1, 20, 0))
     losses = compute_loss(output, batch)
     assert all(value.isfinite() for value in losses)
-    correct = (
-        torch.full((1, 8, 3), -10.0), torch.full((1, 8, 3), -10.0), _duration_target(batch["events"]),
-    )
-    correct[0][..., 0] = 10
-    correct[0][0, 0, 0] = -10
-    correct[0][0, 0, 2] = 10
-    correct[1][..., 0] = 10
-    correct[1][0, 0, 0] = -10
-    correct[1][0, 0, 1] = 10
+    heatmap = _event_heatmap(batch["events"][..., TAP_COUNT], batch["mask"].float(), 2)
+    assert torch.allclose(heatmap[0, :3], torch.tensor([1.0, 2 / 3, 1 / 3]))
+    correct = (torch.zeros(1, 8, 3), torch.zeros(1, 8, 3), _duration_target(batch["events"]))
+    for logits, column in ((correct[0], TAP_COUNT), (correct[1], HOLD_START_COUNT)):
+        target_heatmap = _event_heatmap(batch["events"][..., column], batch["mask"].float(), 6)
+        margin = torch.logit(target_heatmap.clamp(1e-4, 1 - 1e-4))
+        logits[..., 0] = -margin / 2
+        logits[..., 1] = margin / 2
+    correct[0][0, 0, 2] = correct[0][0, 0, 1] + 10
     assert compute_loss(correct, batch)[0] < losses[0]
     target = np.zeros((30, 4), dtype=np.int32)
     predicted = np.zeros_like(target)

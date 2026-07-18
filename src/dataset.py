@@ -681,6 +681,7 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
     order = base_rng.permutation(len(songs)) if training else np.arange(len(songs))
     order = order[worker_id::worker_count]
     batch: list[dict[str, torch.Tensor]] = []
+    shuffle_buffer: list[dict[str, torch.Tensor]] = []
     offset = int(base_rng.integers(0, TRAIN_STRIDE)) if training else 0
     rng = np.random.default_rng(CONFIG.training.seed + epoch * 1009 + worker_id)
     for song_index in order:
@@ -713,10 +714,29 @@ def _produce_window_batches(songs: tuple[SongRecord, ...], epoch: int, training:
                     maximum = round(CONFIG.augmentation.max_shift_sec * CONFIG.audio.frames_per_sec)
                     _shift_window(sample, int(rng.integers(-maximum, maximum + 1)) if maximum else 0)
                 sample["difficulty"] = torch.tensor(level.difficulty, dtype=torch.float32)
-                batch.append(sample)
-                if len(batch) == CONFIG.training.batch_size:
-                    yield _stack_batch(batch)
-                    batch.clear()
+                if training:
+                    shuffle_buffer.append(sample)
+                    if len(shuffle_buffer) < CONFIG.training.batch_size * 4:
+                        continue
+                    indexes = rng.choice(
+                        len(shuffle_buffer), CONFIG.training.batch_size, replace=False,
+                    )
+                    selected = set(int(index) for index in indexes)
+                    yield _stack_batch([shuffle_buffer[index] for index in indexes])
+                    shuffle_buffer = [
+                        item for index, item in enumerate(shuffle_buffer) if index not in selected
+                    ]
+                else:
+                    batch.append(sample)
+                    if len(batch) == CONFIG.training.batch_size:
+                        yield _stack_batch(batch)
+                        batch.clear()
+    if training:
+        rng.shuffle(shuffle_buffer)
+        batch.extend(shuffle_buffer)
+        while len(batch) >= CONFIG.training.batch_size:
+            yield _stack_batch(batch[:CONFIG.training.batch_size])
+            del batch[:CONFIG.training.batch_size]
     if batch:
         yield _stack_batch(batch)
 
