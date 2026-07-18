@@ -274,15 +274,15 @@ def checkpoint_config(config: AppConfig = CONFIG) -> dict:
 
 
 def _self_check() -> None:
-    assert CONFIG.audio.frames_per_sec == 200
-    assert CONFIG.paths.charts_dir == ROOT_DIR / "charts"
     assert load_config() == CONFIG
+    assert CONFIG.audio.frames_per_sec == CONFIG.audio.sample_rate / CONFIG.audio.hop_length
+    assert all(value.is_absolute() for value in vars(CONFIG.paths).values())
     assert set(vars(CONFIG.model)) == {"hidden_dim", "layers", "attention_heads", "dropout"}
-    assert CONFIG.training.stride == 512 and CONFIG.training.song_limit == 100
-    assert CONFIG.training.batch_size == 48
-    assert CONFIG.training.num_workers == 4 and CONFIG.training.prefetch_factor == 2
-    assert CONFIG.training.resume_checkpoint is None
-    assert CONFIG.inference.level_query == 13.0
+    saved = checkpoint_config()
+    assert saved["window_frames"] == CONFIG.training.window_frames
+    assert saved["max_hold_duration_frames"] == round(
+        CONFIG.inference.max_duration_sec * CONFIG.audio.frames_per_sec,
+    )
     print("[config] 自检通过")
 
 

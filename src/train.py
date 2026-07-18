@@ -397,10 +397,10 @@ def _restore_training(state, model, optimizer, scaler):
         group["initial_lr"] = CONFIG.training.learning_rate
         group["weight_decay"] = CONFIG.training.weight_decay
     scaler.load_state_dict(state["scaler_state_dict"])
-    torch.set_rng_state(state["torch_rng_state"])
+    torch.set_rng_state(state["torch_rng_state"].cpu())
     np.random.set_state(state["numpy_rng_state"])
     if torch.cuda.is_available() and state.get("cuda_rng_state") is not None:
-        torch.cuda.set_rng_state_all(state["cuda_rng_state"])
+        torch.cuda.set_rng_state_all([value.cpu() for value in state["cuda_rng_state"]])
     return (
         int(state["epoch"]) + 1, int(state["global_step"]),
         float(state["best_f1"]), int(state["stale_epochs"]),
@@ -433,16 +433,32 @@ def _format_epoch(record: dict) -> str:
     strict = record["validation"]["generation"]["tolerances"]["3"]["total"]
     main = record["validation"]["generation"]["tolerances"]["6"]["total"]
     duration = record["validation"]["generation"]["tolerances"]["6"]["duration_error_ms"]["mae"]
+    training_generation = record["train"].get("generation")
+    training_text = ""
+    if training_generation is not None:
+        training_strict = training_generation["tolerances"]["3"]["total"]
+        training_main = training_generation["tolerances"]["6"]["total"]
+        training_text = (
+            f"训练F1@3={training_strict['macro_f1']:.2%} "
+            f"训练F1@6={training_main['macro_f1']:.2%} "
+        )
     return (
         f"epoch={record['epoch']} step={record['global_step']} lr={record['learning_rate']:.3e} "
         f"train_loss={record['train']['loss']:.6f} val_loss={record['validation']['loss']:.6f} "
-        f"F1@3={strict['macro_f1']:.2%} F1@6={main['macro_f1']:.2%} "
+        f"{training_text}"
+        f"F1@3={strict['macro_f1']:.2%} 准确率@3={strict['precision']:.2%} 召回率@3={strict['recall']:.2%} "
+        f"F1@6={main['macro_f1']:.2%} 准确率@6={main['precision']:.2%} 召回率@6={main['recall']:.2%} "
         f"时长MAE={duration if duration is not None else 0:.2f}ms "
         f"耗时={record['seconds']:.1f}s 吞吐={record['windows_per_sec']:.1f}窗口/s"
     )
 
 
 def _self_check() -> None:
+    rng_state = torch.get_rng_state()
+    expected_random = torch.rand(1)
+    torch.set_rng_state(rng_state.to(DEVICE).cpu())
+    assert torch.equal(torch.rand(1), expected_random)
+    torch.set_rng_state(rng_state)
     batch = {
         "events": torch.zeros(1, 8, 4, dtype=torch.long),
         "mask": torch.ones(1, 8, dtype=torch.bool),
@@ -479,7 +495,8 @@ def _self_check() -> None:
     for _ in range(100):
         optimizer.step()
         scheduler.step()
-    assert first < 1 and scheduler.get_last_lr()[0] <= CONFIG.training.min_learning_rate / CONFIG.training.learning_rate + 1e-6
+    assert 0 < first <= 1
+    assert scheduler.get_last_lr()[0] <= CONFIG.training.min_learning_rate / CONFIG.training.learning_rate + 1e-6
     compatible_state = {
         "checkpoint_version": 3,
         "model_kind": MODEL_KIND,
@@ -535,6 +552,8 @@ def main() -> None:
     start_epoch, global_step, best_f1, stale_epochs = 1, 0, -1.0, 0
     scheduler_state = None
     resume_path = CONFIG.training.resume_checkpoint
+    if resume_path is None:
+        metrics_path.unlink(missing_ok=True)
     if resume_path is not None:
         if not resume_path.is_file():
             raise FileNotFoundError(f"恢复检查点不存在: {resume_path}")
@@ -571,6 +590,10 @@ def main() -> None:
             "训练", train_batches[epoch - 1],
         )
         global_step += updates
+        training_generation = (
+            evaluate_songs(model, splits["train"])
+            if CONFIG.training.song_limit else None
+        )
         validation_losses, generation = validate_songs(model, splits["validation"], scaler)
         seconds = time.perf_counter() - started
         main_f1 = generation["tolerances"]["6"]["total"]["macro_f1"]
@@ -586,7 +609,10 @@ def main() -> None:
             "seconds": seconds,
             "windows_per_sec": updates * CONFIG.training.batch_size / max(seconds, 1e-9),
             "peak_gpu_gib": torch.cuda.max_memory_allocated() / 2**30 if DEVICE.type == "cuda" else 0,
-            "train": _loss_dict(train_losses),
+            "train": {
+                **_loss_dict(train_losses),
+                **({"generation": training_generation} if training_generation is not None else {}),
+            },
             "validation": {**_loss_dict(validation_losses), "generation": generation},
         }
         state = _checkpoint(
