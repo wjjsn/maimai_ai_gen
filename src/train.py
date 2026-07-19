@@ -658,6 +658,15 @@ def _self_check() -> None:
         "split_summary": {"test": True},
     }
     assert _validate_training_checkpoint(compatible_state, {"test": True})
+    try:
+        _validate_training_checkpoint({
+            **compatible_state,
+            "label_protocol": "event-heatmap-balanced-shuffled-anchored-duration-v8",
+        }, {"test": True})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("旧错误标签协议的检查点必须拒绝恢复")
     changed_state = {**compatible_state, "training_config": {
         **compatible_state["training_config"], "early_stop_patience": 1,
     }}

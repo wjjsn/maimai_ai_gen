@@ -110,6 +110,9 @@ def chart_to_tracks(chart: Chart, level_idx: int, length: int | None = None) -> 
                     hold_events.append((clipped_start, end - clipped_start))
                     required_length = max(required_length, end)
             elif note.type is NoteType.SLIDE:
+                if note.data and not note.data[0].isSlideNoHead and start >= 0:
+                    tap_events.append(start)
+                    required_length = max(required_length, start + 1)
                 for branch in _slide_branches(note):
                     wait_duration, trace_duration = _slide_branch_timing(branch)
                     trace_start = start + round(wait_duration * rate)
@@ -877,6 +880,16 @@ def _self_check() -> None:
             (int(frame), *custom_tracks[frame, HOLD_START_COUNT:].tolist())
             for frame in np.flatnonzero(custom_tracks[:, HOLD_START_COUNT])
         ] == expected
+    slide_heads = maidata_to_tracks(
+        "&title=heads\n&lv_5=14\n&inote_5=(120){4}"
+        "1-3[8:1],2@-4[8:1],3?-5[8:1],4!-6[8:1],5-7[8:1]*-1[8:1],E",
+        5,
+    )
+    assert slide_heads[0, TAP_COUNT] == 1
+    assert slide_heads[100, TAP_COUNT] == 1
+    assert slide_heads[200, TAP_COUNT] == 0
+    assert slide_heads[300, TAP_COUNT] == 0
+    assert slide_heads[400, TAP_COUNT] == 1
     branch_cases = (
         ("4pp4[4:1]*qq4[4:1]", 2, 1.0),
         ("1-3[8:1]-1[8:1]*-5[8:1]", 2, 0.75),

@@ -15,7 +15,7 @@ from model import ModelDimensions, NoteTimingTransformer
 
 
 MODEL_KIND = "log-mel-difficulty-bert-window-event-v3"
-LABEL_PROTOCOL = "event-heatmap-balanced-shuffled-anchored-duration-v8"
+LABEL_PROTOCOL = "event-heatmap-balanced-shuffled-anchored-duration-v9"
 
 
 def model_dimensions() -> ModelDimensions:
@@ -212,6 +212,7 @@ def save_inference(audio_path: Path, text: str, output_dir: Path) -> Path:
 
 
 def _self_check() -> None:
+    assert LABEL_PROTOCOL == "event-heatmap-balanced-shuffled-anchored-duration-v9"
     tracks = np.zeros((20, TRACK_COUNT), dtype=np.int32)
     tracks[3] = (2, 1, 1, 8)
     tracks[5, TAP_COUNT] = 1

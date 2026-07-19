@@ -52,6 +52,7 @@ class SlideSegment:
     isSlideBreak: bool = False
     isSlideNoHead: bool = False
     starts_new_branch: bool = False
+    isSlideNoStar: bool = False
 
 
 @dataclass

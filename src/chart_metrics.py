@@ -118,6 +118,9 @@ def analyze_level(title: str, level_query: float | None, frames: list[Frame]) ->
             label_starts["hold"][frame_index] += 1
             note_counts["hold"] += 1
         elif note.type is NoteType.SLIDE:
+            # 与训练标签一致：普通头和 @ 头各产生一个 Tap，? / ! 无头不产生。
+            if note.data and not note.data[0].isSlideNoHead:
+                label_starts["tap"][frame_index] += 1
             for segment in note.data:
                 if segment.trace_duration <= 0:
                     continue
@@ -330,6 +333,7 @@ def _self_check() -> None:
     assert metrics.default_wait_segments == 1 and metrics.custom_wait_segments == 1
     assert metrics.slide_frames[1] == 140 and metrics.slide_frames[2] == 160
     assert metrics.note_counts == {"tap": 2, "hold": 2, "slide": 2, "total": 6}
+    assert metrics.label_note_counts == {"tap": 4, "hold": 4}
     assert metrics.type_means["hold"] > 0 and metrics.type_medians["total"] >= 1
     assert metrics.close_start_points == {"tap": 1, "hold": 1}
     assert metrics.close_note_counts == {"tap": 1, "hold": 1}
@@ -356,6 +360,17 @@ def _self_check() -> None:
     ]
     assert _slide_trace_starts(chained, 1.0) == [_index(1.4)]
     assert _slide_intervals(chained, 1.0) == [(_index(1.0), _index(2.0))]
+    head_metrics = analyze_level("heads", 13.5, [Frame((
+        Note(NoteType.SLIDE, [SlideSegment(SlideShape.Line, TapType.LANE1, TapType.LANE2)]),
+        Note(NoteType.SLIDE, [SlideSegment(
+            SlideShape.Line, TapType.LANE2, TapType.LANE3, isSlideNoStar=True,
+        )]),
+        Note(NoteType.SLIDE, [SlideSegment(
+            SlideShape.Line, TapType.LANE3, TapType.LANE4, isSlideNoHead=True,
+        )]),
+        parallel,
+    ), 0.0)])
+    assert head_metrics.label_note_counts["tap"] == 3
     print("[chart-metrics] 自检通过")
 
 

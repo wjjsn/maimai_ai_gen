@@ -447,15 +447,15 @@ class _Parser:
                 i += 1
 
             # optional [wait##trace] for this segment
-            wait_sec = 240.0 / bpm if bpm > 0 else 0.0
+            wait_sec = 60.0 / bpm if bpm > 0 else 0.0
             trace_sec = 0.0
             is_default_wait = True
             if i < n and t[i] == "[":
                 j = t.index("]", i)
                 bracket_content = t[i + 1 : j]
                 wait_sec, trace_sec = self._parse_slide_bracket(bracket_content, bpm)
-                # 默认等待是当前 BPM 的一拍；指定其他 BPM 也会改变等待时长。
-                is_default_wait = abs(wait_sec - 240.0 / bpm) < 1e-6 if bpm > 0 else wait_sec == 0.0
+                # 没有 ``##`` 就是对应 BPM 下的默认等待；``##`` 才显式指定等待。
+                is_default_wait = "##" not in bracket_content
                 i = j + 1
 
             while i < n and t[i] in ("b", "x"):
@@ -475,7 +475,8 @@ class _Parser:
                 isForceStar=is_force_star,
                 isFakeRotate=is_fake_rotate,
                 isSlideBreak=is_slide_break,
-                isSlideNoHead=is_no_star or is_no_head,
+                isSlideNoHead=is_no_head,
+                isSlideNoStar=is_no_star,
                 starts_new_branch=starts_new_branch,
             )
             segments.append(seg)
@@ -512,9 +513,9 @@ class _Parser:
         Parse slide bracket content into (wait_seconds, trace_seconds).
 
         Formats:
-          [8:3]               -> wait=1 beat @ bpm, trace = (240/bpm/8)*3
-          [160#8:3]           -> wait=1 beat @ 160, trace = (240/160/8)*3
-          [160#2]             -> wait=1 beat @ 160, trace = 2 seconds
+          [8:3]               -> wait=60/bpm, trace = (240/bpm/8)*3
+          [160#8:3]           -> wait=60/160, trace = (240/160/8)*3
+          [160#2]             -> wait=60/160, trace = 2 seconds
           [3##1.5]            -> wait=3 sec, trace=1.5 sec
           [3##8:3]            -> wait=3 sec, trace=(240/bpm/8)*3
           [3##160#8:3]        -> wait=3 sec, trace=(240/160/8)*3
@@ -524,21 +525,20 @@ class _Parser:
             wait_sec = float(parts[0]) if parts[0] else 0.0
             trace_rest = parts[1]
         else:
-            # no explicit wait: 1 beat at current or specified BPM
+            # 未显式指定等待时，Slide 固定等待 60/BPM。
             if "#" in content and ":" not in content and content.count("#") == 1:
                 # format: BPM#seconds  e.g. 160#2
                 bp_s, sec_s = content.split("#", 1)
                 trace_bpm = float(bp_s)
-                return 240.0 / trace_bpm, float(sec_s)
+                return 60.0 / trace_bpm, float(sec_s)
 
             if "#" in content:
                 # BPM#divider:mult
                 bp_s, rest = content.split("#", 1)
                 trace_bpm = float(bp_s)
-                return 240.0 / trace_bpm, _length_to_seconds(rest, trace_bpm)
+                return 60.0 / trace_bpm, _length_to_seconds(rest, trace_bpm)
 
-            # plain divider:mult  -> wait = 1 beat at bpm
-            wait_sec = 240.0 / bpm if bpm > 0 else 0.0
+            wait_sec = 60.0 / bpm if bpm > 0 else 0.0
             return wait_sec, _length_to_seconds(content, bpm)
 
         # trace_rest: can be '#seconds', 'BPM#divider:mult', or 'divider:mult'
@@ -563,18 +563,18 @@ class _Parser:
         current_length_divider: float,
         current_per_comma_length: float,
     ) -> tuple[float, float, float]:
-        bpm_match = re.search(r"\(([^)]*)\)", note)
-        length_match = re.search(r"\{([^}]*)\}", note)
+        bpm_matches = re.findall(r"\(([^)]*)\)", note)
+        length_matches = re.findall(r"\{([^}]*)\}", note)
 
         next_bpm = current_bpm
         next_divider = current_length_divider
         next_per_comma = current_per_comma_length
 
-        if bpm_match:
-            next_bpm = float(bpm_match.group(1))
+        if bpm_matches:
+            next_bpm = float(bpm_matches[-1])
 
-        if length_match:
-            raw_value = length_match.group(1).strip()
+        if length_matches:
+            raw_value = length_matches[-1].strip()
             if raw_value.startswith("#"):
                 next_divider = 0.0
                 next_per_comma = float(raw_value[1:])
@@ -582,12 +582,12 @@ class _Parser:
                 next_divider = float(raw_value)
                 if next_bpm > 0:
                     next_per_comma = 240.0 / next_bpm / next_divider
-        elif bpm_match:
+        elif bpm_matches:
             # BPM changed but no length change → recalculate with existing divider
             if next_bpm > 0 and next_divider > 0:
                 next_per_comma = 240.0 / next_bpm / next_divider
 
-        if bpm_match or length_match:
+        if bpm_matches or length_matches:
             return next_bpm, next_divider, next_per_comma
 
         if next_bpm > 0 and next_divider > 0:
@@ -627,7 +627,9 @@ class _Parser:
             if not level_match:
                 continue
 
-            level_content = level_match.group(1)
+            level_content = "\n".join(
+                line.split("||", 1)[0] for line in level_match.group(1).splitlines()
+            )
             chart_content = level_content.split(",")
             chart_content_strip = [item.strip() for item in chart_content]
 
@@ -638,9 +640,6 @@ class _Parser:
             frames_by_time: dict[float, list[Note]] = {}
 
             for slot_idx, raw_note in enumerate(chart_content_strip):
-                # strip comments (|| to end of line)
-                if "||" in raw_note:
-                    raw_note = raw_note[:raw_note.index("||")]
                 raw_note = re.sub(r"\s+", "", raw_note)
                 if not raw_note:
                     self.current_time += current_per_comma_length
@@ -844,6 +843,8 @@ class _Parser:
                     mod += "x"
                 if seg.isSlideNoHead:
                     mod += "?"
+                elif seg.isSlideNoStar:
+                    mod += "@"
                 if seg.isForceStar:
                     mod += "$"
                 if seg.isFakeRotate:
@@ -870,14 +871,15 @@ class _Parser:
             if seg.trace_duration > 0:
                 trace_sec = seg.trace_duration
                 wait_sec = seg.wait_duration
-                default_wait = 240.0 / bpm  # 1 beat at generation BPM
-                if wait_sec <= 0:
-                    ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
-                    parts.append(f"[0##{ts}]")
-                elif abs(wait_sec - default_wait) < 0.005:
-                    # wait = 1 beat at gen BPM, use simple [D:M] notation
+                default_wait = 60.0 / bpm
+                if seg.is_default_wait and wait_sec > 0 and abs(wait_sec - default_wait) < 0.005:
                     trace_str = self._duration_to_notation(trace_sec, bpm)
                     parts.append(f"[{trace_str}]")
+                elif seg.is_default_wait and wait_sec > 0:
+                    wait_bpm = 60.0 / wait_sec
+                    bpm_str = f"{wait_bpm:.6f}".rstrip('0').rstrip('.')
+                    trace_str = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
+                    parts.append(f"[{bpm_str}#{trace_str}]")
                 else:
                     ws = f"{wait_sec:.6f}".rstrip('0').rstrip('.')
                     ts = f"{trace_sec:.6f}".rstrip('0').rstrip('.')
@@ -972,7 +974,7 @@ def _self_check() -> None:
     absolute, beats, self_loop, returned = (frame.notes[0] for frame in slides)
     assert absolute.data[0].wait_duration == 0.3
     assert absolute.data[0].trace_duration == 0.15
-    assert beats.data[0].wait_duration == 2.0
+    assert beats.data[0].wait_duration == 0.5
     assert beats.data[0].trace_duration == 0.25
     assert [segment.starts_new_branch for segment in self_loop.data] == [True, True]
     assert [segment.starts_new_branch for segment in returned.data] == [True, False, True]
@@ -983,6 +985,47 @@ def _self_check() -> None:
     assert "[0.3##0.15]" in regenerated
     assert "4pp4[" in regenerated and "*qq4[" in regenerated
     assert "1-3[" in regenerated and "-1[" in regenerated and "*-5[" in regenerated
+    semantics = parse_maidata(
+        "&title=semantics\n&lv_5=14\n&inote_5=(120){4}"
+        "1-3[8:1],2@-4[8:1],3?-5[8:1],4!-6[8:1],E"
+    )
+    semantic_notes = [frame.notes[0] for frame in semantics.all_levels[5].frames]
+    assert semantic_notes[0].data[0].wait_duration == 0.5
+    assert not semantic_notes[1].data[0].isSlideNoHead and semantic_notes[1].data[0].isSlideNoStar
+    assert semantic_notes[2].data[0].isSlideNoHead and semantic_notes[3].data[0].isSlideNoHead
+    semantic_text = generate_maidata(semantics)
+    assert "2@-4[" in semantic_text and "3?-5[" in semantic_text and "4?-6[" in semantic_text
+    semantic_restored = parse_maidata(semantic_text).all_levels[5].frames
+    assert semantic_restored[1].notes[0].data[0].isSlideNoStar
+    assert not semantic_restored[1].notes[0].data[0].isSlideNoHead
+    specified_bpm = parse_maidata(
+        "&title=specified-bpm\n&lv_5=14\n&inote_5=(120){4}"
+        "1-3[160#8:1],2-4[160#2],3-5[0.5##8:1],E"
+    ).all_levels[5].frames
+    assert specified_bpm[0].notes[0].data[0].is_default_wait
+    assert specified_bpm[1].notes[0].data[0].is_default_wait
+    assert not specified_bpm[2].notes[0].data[0].is_default_wait
+    assert specified_bpm[0].notes[0].data[0].wait_duration == 0.375
+    specified_restored = parse_maidata(generate_maidata(Chart(
+        all_levels=[None] * 5 + [Level("master", 14.0, [
+            Frame(tuple(frame.notes), frame.time_sec) for frame in specified_bpm
+        ])] + [None],
+        title="specified-bpm",
+    ))).all_levels[5].frames
+    assert specified_restored[0].notes[0].data[0].is_default_wait
+    assert specified_restored[1].notes[0].data[0].is_default_wait
+    assert not specified_restored[2].notes[0].data[0].is_default_wait
+    positional = SlideSegment(
+        SlideShape.Line, TapType.LANE1, TapType.LANE2,
+        0.5, 1.0, True, None, None, False, False, False, False, True,
+    )
+    assert positional.starts_new_branch and not positional.isSlideNoStar
+    timing = parse_maidata(
+        "&title=timing\n&lv_5=14\n&inote_5=(120){4}1,"
+        "(180)(240){8}{16}2,|| ,注释中的逗号不能产生槽位\n3,E"
+    ).all_levels[5].frames
+    assert [frame.time_sec for frame in timing] == [0.0, 0.5, 0.5625]
+    assert timing[1].notes[0].data == TapType.LANE2 and timing[2].notes[0].data == TapType.LANE3
     print("[maidata-parser] 自检通过")
 
 
